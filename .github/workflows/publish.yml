@@ -59,7 +59,7 @@ jobs:
         with:
           ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -134,7 +134,7 @@ jobs:
         with:
           ref: ${{ env.RELEASE_SHA }}
       # images.mjs uses only Node built-ins: no install.
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
           package-manager-cache: false
@@ -206,7 +206,7 @@ jobs:
         with:
           ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
           registry-url: https://registry.npmjs.org
