@@ -1,0 +1,395 @@
+#!/usr/bin/env node
+// `nylorun start` smoke under a temporary Host root:
+//
+//   node scripts/smoke-stack.mjs
+//
+// Builds nylorun-runtime:local and nylorun-studio:local from this checkout
+// unless NYLORUN_RUNTIME_IMAGE / NYLORUN_STUDIO_IMAGE name prebuilt images (CI).
+// Needs the CLI and @nylorun/admin built. Starts the Tenant (NYLORUN_TENANT) outside
+// any project (no Project link), checks `nylorun status --json` and the Runtime's /ready
+// (Postgres, Restate, S2), checks that Studio is printed without a login
+// token, that /ready and `nylorun-operate status` report the Host's one open Tenant (no
+// operator port is published), mints a Studio
+// login that lands on it, embeds Studio the way an embedding app does (the origins it
+// sets with --studio-embed-origin, a Tenant-limited token, a bearer session), links a Project with `nylorun
+// start` in its directory (the same Tenant through NYLORUN_TENANT), runs
+// `nylorun down` and `nylorun up` (the Compose files and the Tenant's data are kept),
+// checks that every file in the Host root belongs to this user (the bind
+// mount's UID/GID), and always ends with `nylorun local reset --yes`. The harness
+//: it runs bash for an agent on a stub model, while the runtime container
+// runs no child process. (Remote MCP through the gateway: scripts/smoke-failure.mjs.)
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { mintStudioLoginToken } from "@nylorun/admin";
+import { run } from "./lib/repo.mjs";
+import {
+  ensureImages,
+  eventually,
+  hostTenant,
+  runtimeGet,
+  runtimeHeaders,
+  studioSession,
+  withStack,
+} from "./lib/stack.mjs";
+import { startStubModel } from "./lib/stub-model.mjs";
+
+/** Every entry under `dir`, with its owner. */
+async function walk(dir) {
+  const entries = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    const info = await lstat(path);
+    entries.push({ path, uid: info.uid, gid: info.gid });
+    if (entry.isDirectory()) entries.push(...(await walk(path)));
+  }
+  return entries;
+}
+
+/**
+ * The history once it holds `n` events of `type`. `/items` reads the session's stream, which
+ * the relay feeds from the record after commit, so it can trail the
+ * session view. The relay keeps a session's order: what the record holds before that event is
+ * in the history too.
+ */
+const historyWith = (read, type, n = 1) =>
+  eventually(
+    async () => {
+      const history = await read();
+      const types = history.items.map((item) => item.type);
+      if (types.filter((t) => t === type).length >= n) return history;
+      throw new Error(types.join(", "));
+    },
+    { timeout: 30_000, message: `${n} ${type} in the history` },
+  );
+
+/**
+ * The harness container: status reports it remote and connected; it holds the harness
+ * token and nothing else; Restate's UI is not published. An agent with a sandbox runs its
+ * tools in the harness: the runtime container runs only its own process.
+ */
+async function harnessChecks(stack, images, status) {
+  const { runtimeUrl } = stack;
+  const printenv = async (service, name) =>
+    (await stack.compose(["exec", "-T", service, "printenv", name], { check: false })).trim();
+  const harness = status.services.find((s) => s.service === "harness");
+  assert.equal(harness?.state, "running", "the harness is running");
+  assert.equal(harness.health, "healthy", "the harness is healthy (connected)");
+  assert.equal(status.harness.mode, "remote", "status reports the harness remote");
+  assert.equal(status.harness.connected, 1, "one harness is connected");
+  assert.equal(status.restate.published, false, "Restate's UI is not published");
+  assert.equal(
+    (await run("docker", ["port", `${stack.project}-restate`], { capture: true })).trim(),
+    "",
+    "Restate publishes no port",
+  );
+  const token = await printenv("harness", "NYLORUN_HARNESS_TOKEN");
+  assert.match(token, /^[0-9a-f]{64}$/, "the harness holds its token");
+  assert.equal(await printenv("runtime", "NYLORUN_HARNESS_TOKEN"), token, "the runtime checks the same token");
+  assert.equal(await printenv("gateway", "NYLORUN_HARNESS_TOKEN"), "", "the gateway does not hold it");
+  for (const name of ["NYLORUN_GATES_TOKEN", "NYLORUN_OBJECT_STORE_SECRET_KEY", "NYLORUN_DATABASE_URL", "NYLORUN_KEYS_URL"])
+    assert.equal(await printenv("harness", name), "", `the harness does not hold ${name}`);
+
+  // An agent with a sandbox: a session on an Agent made from a manifest with a virtual runtime
+  // (protocol 16).
+  const tenant = await stack.tenant();
+  const stub = await startStubModel(stack, images.runtime);
+  try {
+    const call = async (path, method, body) => {
+      // `/v1/tenant/*` is the Management API: it takes the management key.
+      const key = path.startsWith("/v1/tenant/") ? tenant.managementKey : tenant.key;
+      const response = await fetch(`${runtimeUrl}${path}`, {
+        method,
+        headers: runtimeHeaders(key, { "content-type": "application/json" }),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      });
+      assert.ok(response.ok, `${method} ${path}: ${response.status} ${await response.text()}`);
+    };
+    await call("/v1/tenant/model", "PUT", { requestId: randomUUID(), idempotencyKey: randomUUID(), ...stub.model });
+    await call("/v1/agent-manifests/plugged", "PUT", {
+      requestId: randomUUID(),
+      manifestSchemaVersion: 8,
+      name: "plugged",
+      harness: {},
+      runtime: { kind: "virtual" },
+    });
+    await call("/v1/agents/plugged", "PUT", { requestId: randomUUID(), manifest: "plugged" });
+    await call("/v1/sessions/plugged", "PUT", {
+      requestId: randomUUID(),
+      agent: "plugged",
+      ownerUserId: "stack-smoke",
+    });
+    const turn = async (n, content) => {
+      await call("/v1/sessions/plugged/commands", "POST", {
+        type: "message",
+        requestId: `p${n}`,
+        idempotencyKey: `p${n}`,
+        content,
+      });
+      return await eventually(
+        async () => {
+          const view = await runtimeGet(runtimeUrl, tenant.key, "/v1/sessions/plugged");
+          return ["completed", "failed", "cancelled", "uncertain"].includes(view.status) ? view : undefined;
+        },
+        { timeout: 120_000, interval: 500, message: `turn ${n} to settle` },
+      );
+    };
+    const bashed = await turn(1, 'call bash {"command":"echo from-the-harness > proof.txt && cat proof.txt"}');
+    assert.equal(bashed.status, "completed", JSON.stringify(bashed));
+    // The turn's `turn.completed`, which follows its `tool.completed` in the history.
+    const history = await historyWith(
+      () => runtimeGet(runtimeUrl, tenant.key, "/v1/sessions/plugged/items"),
+      "turn.completed",
+    );
+    const results = history.items
+      .filter((item) => item.type === "tool.completed")
+      .map((item) => JSON.stringify(item.payload));
+    assert.ok(results.some((r) => r.includes("from-the-harness")), `bash ran: ${results}`);
+
+    // Exit check: the sandbox runs in the harness; the runtime container runs nothing
+    // but its own process. Compose's healthcheck (`node -e fetch(.../health)`) runs in the
+    // container too, every few seconds, so a process with its exact command does not count.
+    const config = JSON.parse(await stack.compose(["config", "--format", "json"]));
+    const [form, ...healthcheck] = config.services.runtime.healthcheck?.test ?? [];
+    assert.equal(form, "CMD", "the runtime's healthcheck is an exec-form command");
+    const top = async (service) =>
+      (await run("docker", ["top", `${stack.project}-${service}`, "-o", "pid,args"], { capture: true }))
+        .trim()
+        .split("\n")
+        .slice(1);
+    const listed = await top("runtime");
+    const inRuntime = listed.filter((line) => line.trim().replace(/^\d+\s+/, "") !== healthcheck.join(" "));
+    assert.equal(
+      inRuntime.length,
+      1,
+      `the runtime container runs one process besides its healthcheck:\n${listed.join("\n")}`,
+    );
+    assert.match(inRuntime[0], /runtime\/server\/dist\/host\/main\.js/);
+    console.log("[stack] the harness runs bash; the runtime runs nothing but itself");
+  } finally {
+    await stub.remove();
+  }
+}
+
+try {
+  const images = await ensureImages();
+  await withStack({ name: "nylorun-smoke-stack", images, start: false }, async (stack) => {
+    const { home } = stack;
+    // Embedding is opt-in: the app that frames Studio names its origins.
+    const embedOrigins = ["app://localhost", "http://localhost:1420"];
+    const { runtimeUrl, studioUrl } = await stack.start(
+      embedOrigins.flatMap((origin) => ["--studio-embed-origin", origin]),
+    );
+    assert.match(studioUrl ?? "", /^http:\/\/localhost:\d+$/, "nylorun start prints Studio without a token");
+
+    const status = JSON.parse((await stack.nylorun(["status", "--json"])).stdout);
+    assert.equal(status.state, "running");
+    assert.equal(status.project, stack.project);
+    assert.equal(status.runtime.healthy, true);
+    assert.equal(status.runtime.ready, true, "status reports the Runtime ready (/ready)");
+    assert.equal(status.runtime.url, runtimeUrl);
+    assert.equal(status.tenant?.state, "open", "status reports the Tenant open (nylorun-operate status)");
+    assert.equal("adminUrl" in status.runtime, false, "no Admin API");
+    assert.doesNotMatch(
+      await readFile(join(home, "docker", ".env"), "utf8"),
+      /NYLORUN_ADMIN_PORT/,
+      "no operator port is published",
+    );
+    for (const service of ["postgres", "restate", "s2-lite", "rustfs", "gateway", "runtime", "harness", "studio"]) {
+      const entry = status.services.find((s) => s.service === service);
+      assert.equal(entry?.state, "running", `${service} is running`);
+      assert.ok(entry.health === "" || entry.health === "healthy", `${service} is healthy`);
+    }
+
+    // The combined packing: model calls cross the gateway (the Model Gate), which sees only
+    // the Tenant directory, and the runtime holds no model credential.
+    assert.equal(status.gateway.healthy, true, "status reports the gateway healthy");
+    const printenv = async (service, name) =>
+      (await stack.compose(["exec", "-T", service, "printenv", name], { check: false })).trim();
+    assert.equal(await printenv("runtime", "NYLORUN_GATES_URL"), "http://gateway:4100");
+    assert.equal(
+      await printenv("runtime", "NYLORUN_GATES_TOKEN"),
+      await printenv("gateway", "NYLORUN_GATES_TOKEN"),
+      "the runtime and the gateway share the gates token",
+    );
+    // The Object store: only the runtime and the gateway hold RustFS's credential.
+    const storeKey = await printenv("runtime", "NYLORUN_OBJECT_STORE_SECRET_KEY");
+    assert.match(storeKey, /^[0-9a-f]{64}$/, "the runtime holds the Object store's secret key");
+    assert.equal(await printenv("gateway", "NYLORUN_OBJECT_STORE_SECRET_KEY"), storeKey);
+    assert.equal(await printenv("studio", "NYLORUN_OBJECT_STORE_SECRET_KEY"), "", "Studio does not");
+    const mounted = (await stack.compose(["exec", "-T", "gateway", "ls", "-A", "/nylorun"])).trim();
+    assert.equal(mounted, "keys\ntenant", "the gateway mounts only the Tenant directory and the vault key");
+
+    // Custody: the vault key and the Host root's secrets are hidden from the runtime
+    // container, and no file it can read holds the key.
+    const vaultKey = (await readFile(join(home, "keys", "vault-kek"), "utf8")).trim();
+    assert.equal(Buffer.from(vaultKey, "base64").length, 32, "nylorun start wrote the vault key");
+    for (const hidden of ["/nylorun/keys", "/nylorun/docker"])
+      assert.equal(
+        (await stack.compose(["exec", "-T", "runtime", "ls", "-A", hidden])).trim(),
+        "",
+        `${hidden} is empty in the runtime container`,
+      );
+    const scan = String.raw`
+const fs = require("node:fs"), path = require("node:path");
+const key = process.argv[1];
+const found = [];
+const walk = (dir) => {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walk(full);
+    else if (entry.isFile() && fs.statSync(full).size < 4 * 1024 * 1024)
+      try { if (fs.readFileSync(full, "utf8").includes(key)) found.push(full); } catch {}
+  }
+};
+walk("/nylorun");
+console.log(JSON.stringify(found));
+`;
+    const holding = JSON.parse(
+      (await stack.compose(["exec", "-T", "runtime", "node", "-e", scan, vaultKey])).trim(),
+    );
+    assert.deepEqual(holding, [], "no file the runtime container reads holds the vault key");
+    assert.equal(await printenv("runtime", "NYLORUN_KEYS_URL"), "http://gateway:4100");
+
+    await harnessChecks(stack, images, status);
+
+    const ready = await fetch(`${runtimeUrl}/ready`);
+    const readyBody = await ready.json();
+    assert.equal(ready.status, 200, JSON.stringify(readyBody));
+    assert.deepEqual(
+      { postgres: readyBody.checks.postgres, restate: readyBody.checks.restate, s2: readyBody.checks.s2 },
+      { postgres: true, restate: true, s2: undefined },
+      "/ready checks Postgres and Restate, never S2",
+    );
+
+    // Restate loaded the key whose public half the Runtime was given.
+    const stackEnv = await readFile(join(home, "docker", ".env"), "utf8");
+    const identityKey = /^NYLORUN_RESTATE_IDENTITY_KEY=(publickeyv1_\w+)$/m.exec(stackEnv)?.[1];
+    assert.ok(identityKey, ".env holds the Restate identity key");
+    const logs = await stack.nylorun(["local", "logs", "restate", "--tail", "100000"], { echo: false });
+    assert.ok(logs.stdout.includes(`kid: "${identityKey}"`), "Restate logs the same key id");
+
+    // The Runtime created the installation's one Tenant on its first start: /ready says it is
+    // open, and nylorun-operate (in the runtime container) names it.
+    assert.equal(readyBody.checks.tenant, true, "/ready reports the Tenant open");
+    const operated = await stack.operateStatus();
+    assert.equal(operated.tenant.state, "open");
+    assert.equal(operated.tenant.id, status.tenant.id, "nylorun status reports nylorun-operate's Tenant");
+    const tenant = await hostTenant(stack);
+    assert.equal(tenant.id, operated.tenant.id);
+    assert.ok(await runtimeGet(runtimeUrl, tenant.key, "/v1/agents"), "an application key put with nylorun tenant keys put reaches the Runtime API");
+    assert.ok(!existsSync(join(home, ".nylorun")), "start outside a project writes no Project link");
+
+    const studio = await studioSession(await stack.studioLogin());
+    assert.equal(studio.location, `/tenants/${tenant.id}`, "the login lands on the Tenant");
+    const hello = await (await studio.get("/_studio/hello")).json();
+    assert.equal(hello.tenant?.id, tenant.id, "Studio serves the Host's Tenant");
+
+    // Embedding: the origins set at start may frame the dashboard, and a
+    // Tenant-limited token becomes a bearer session that reaches that Tenant only.
+    assert.deepEqual(status.studio.embedOrigins, embedOrigins, "status lists the embed origins");
+    const shell = await fetch(`${studio.origin}/tenants/${tenant.id}?embed=1`);
+    assert.equal(shell.status, 200, "the dashboard shell needs no session");
+    assert.equal(shell.headers.get("content-security-policy"), `frame-ancestors ${embedOrigins.join(" ")}`);
+    assert.equal(shell.headers.get("x-frame-options"), null);
+    const { adminKey } = JSON.parse(await readFile(join(home, "host-credentials.json"), "utf8"));
+    const login = await mintStudioLoginToken({
+      studioUrl: studio.origin,
+      adminKey,
+      tenant: tenant.id,
+      subject: "tenant-smoke",
+    });
+    assert.equal(login.tenant, tenant.id);
+    const exchanged = await fetch(`${studio.origin}/_studio/sessions`, {
+      method: "POST",
+      headers: { origin: studio.origin, "content-type": "application/json" },
+      body: JSON.stringify({ token: login.token }),
+    });
+    assert.equal(exchanged.status, 201, await exchanged.clone().text());
+    const bearer = { authorization: `Bearer ${(await exchanged.json()).sessionToken}` };
+    const own = await fetch(`${studio.origin}/_studio/tenants/${tenant.id}/runtime/v1/agents`, { headers: bearer });
+    assert.equal(own.status, 200, `an embedded session reaches its Tenant (${await own.clone().text()})`);
+    const others = await fetch(`${studio.origin}/_studio/tenants/tn_0000000000000000000000000z/runtime/v1/agents`, { headers: bearer });
+    assert.equal(others.status, 404, "an embedded session reaches no other Tenant");
+
+    // `nylorun start` in a project attaches it to the running Tenant (NYLORUN_TENANT)
+    // and links it to that Tenant with the application key `project` and the management
+    // key `project-management`.
+    const project = await mkdtemp(join(tmpdir(), "nylorun-tenant-project-"));
+    let link;
+    let credentials;
+    try {
+      await mkdir(join(project, ".nylorun"), { recursive: true });
+      await writeFile(join(project, "package.json"), '{"name":"tenant-project"}');
+      await stack.start([], { cwd: project });
+      link = JSON.parse(await readFile(join(project, ".nylorun", "link.json"), "utf8"));
+      credentials = JSON.parse(await readFile(join(project, ".nylorun", "credentials.json"), "utf8"));
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+    assert.equal(link.format, 3);
+    assert.equal(link.tenant, stack.env.NYLORUN_TENANT);
+    assert.equal("stack" in link, false, "link format 3 has no stack field");
+    assert.equal(link.hostUrl, runtimeUrl);
+    assert.equal(link.tenantId, tenant.id);
+    assert.equal(credentials.principalId, "project");
+    assert.equal(credentials.managementPrincipalId, "project-management");
+    assert.ok(await runtimeGet(runtimeUrl, credentials.applicationKey, "/v1/agents"), "the project key reaches the Runtime API");
+    assert.ok(
+      await runtimeGet(runtimeUrl, credentials.managementKey, "/v1/tenant"),
+      "the project's management key reaches the Management API",
+    );
+    const refused = await fetch(`${runtimeUrl}/v1/tenant`, {
+      headers: runtimeHeaders(credentials.applicationKey),
+      signal: AbortSignal.timeout(10_000),
+    });
+    assert.equal(refused.status, 403, "the project's application key does not reach the Management API");
+    assert.equal((await refused.json()).code, "key_role_mismatch");
+    assert.ok(
+      (await runtimeGet(runtimeUrl, credentials.managementKey, "/v1/tenant/keys")).keys.some((key) => key.id === "project"),
+      "the Management API lists the project key",
+    );
+
+    // `down` and `up` are the Compose spellings of `stop` and `start`: a second
+    // `up` reuses the Compose files it set up, and the stopped volumes keep the Tenant.
+    const stackFiles = async () => [
+      await readFile(join(home, "docker", "compose.yaml"), "utf8"),
+      await readFile(join(home, "docker", ".env"), "utf8"),
+    ];
+    const before = await stackFiles();
+    await stack.nylorun(["down"]);
+    // `status` exits 3 while the Runtime does not answer, and still reports the state.
+    const stopped = await stack.nylorun(["status", "--json"], { check: false });
+    assert.equal(stopped.code, 3);
+    assert.equal(JSON.parse(stopped.stdout).state, "stopped");
+    const up = await stack.nylorun(["up"]);
+    assert.match(up.stdout, /^Runtime\s+http:\/\/localhost:\d+$/m);
+    assert.deepEqual(await stackFiles(), before, "up reuses the Compose files");
+    assert.equal(JSON.parse((await stack.nylorun(["status", "--json"])).stdout).runtime.healthy, true);
+    assert.equal((await stack.operateStatus()).tenant.id, tenant.id, "the Tenant survives down and up");
+
+    // The Runtime and Studio run as this user, so nothing in the bind-mounted
+    // Host root may belong to anyone else (Linux maps UIDs through unchanged).
+    const uid = process.getuid();
+    const foreign = (await walk(home)).filter((entry) => entry.uid !== uid);
+    assert.deepEqual(foreign, [], `every file in ${home} belongs to uid ${uid}`);
+    assert.ok(
+      (await walk(join(home, "tenant"))).length > 0,
+      "the Runtime wrote the Tenant into the Host root",
+    );
+
+    await stack.nylorun(["local", "reset", "--yes"]);
+    assert.ok(
+      !existsSync(join(home, "tenant")) || (await readdir(join(home, "tenant"))).length === 0,
+      "reset deletes the Tenant's files",
+    );
+  });
+  console.log("nylorun start smoke passed.");
+} catch (error) {
+  console.error(error);
+  process.exitCode = 1;
+}

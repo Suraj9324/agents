@@ -1,0 +1,196 @@
+# The Nylorun Runtime on an Agent Substrate cluster (charts/nylorun-runtime/README.md).
+# Every Agent with a sandbox gets a computer: the loop runs in the harness, and
+# commands and files reach the Agent's actor through the sandbox gateway and atenet-router.
+
+# The Runtime, Studio and sandboxes images. Pin them by digest in production
+# (`ghcr.io/nylorun/runtime@sha256:…`); empty uses the chart's appVersion tag (Studio: its own
+# version, the chart's `nylorun.com/studio-version` annotation).
+images:
+  runtime: ""
+  studio: ""
+  sandboxes: ""
+  # The stores, when bundled; the tags `nylorun start` runs.
+  postgres: postgres:17.11
+  restate: docker.restate.dev/restatedev/restate:1.7.12
+  s2: ghcr.io/s2-streamstore/s2:0.43.0
+  rustfs: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+  # The pre-pull DaemonSet's helpers.
+  golang: golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0
+  pause: registry.k8s.io/pause:3.10@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a
+imagePullSecrets: []
+
+# The Tenant this Runtime serves; it is created on the first start.
+tenant:
+  name: default
+
+# The URL clients reach the Runtime at (webhook URLs, the OAuth resource). Empty: the
+# ingress's host over https, else the in-cluster Service.
+publicUrl: ""
+
+# The runtime's Service, which the ingress or a load balancer in front of it reaches. A
+# load balancer of the cloud's own: type LoadBalancer with its annotations, such as GKE's
+# internal one (networking.gke.io/load-balancer-type: Internal), and the ranges it admits.
+service:
+  type: ClusterIP
+  annotations: {}
+  loadBalancerSourceRanges: []
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  annotations: {}
+  tls: []
+
+# The Runtime's Postgres. External (any managed Postgres with logical replication on; any
+# collation), or a bundled StatefulSet.
+postgres:
+  # postgres://user:password@host:5432/nylorun
+  url: ""
+  # A Secret with key `url`, instead of `url`.
+  existingSecret: ""
+  bundled:
+    enabled: true
+    storage: 10Gi
+    storageClass: ""
+
+# The object store: any S3-compatible endpoint, or the bundled RustFS. One bucket holds
+# the Runtime's objects and, with s2.objectStore, s2-lite's streams under their own prefix.
+objectStore:
+  endpoint: ""
+  bucket: nylorun
+  region: auto
+  # A Secret with keys `accessKey` and `secretKey`; or the values below.
+  existingSecret: ""
+  accessKey: ""
+  secretKey: ""
+  bundled:
+    enabled: true
+    storage: 20Gi
+    storageClass: ""
+
+restate:
+  storage: 10Gi
+  storageClass: ""
+  resources: {}
+  # Partition snapshots to the object store, under `path`: on a new disk
+  # Restate restores from the latest. `interval` writes one each time it passes; empty: none.
+  snapshots:
+    enabled: true
+    path: restate
+    interval: 1h
+
+s2:
+  # Keep s2-lite's streams in the object store (no disk); false keeps them on a disk.
+  objectStore: true
+  path: s2
+  storage: 5Gi
+  storageClass: ""
+
+# Agent Substrate, installed by its own setup (README). The chart adds only the Tenant's
+# atespace and the sandbox gateway's place on the router's allowlist (by the operator).
+substrate:
+  atespace: ""
+  systemNamespace: ate-system
+  apiService: api
+  router: atenet-router.ate-system.svc:8444
+  routerName: atenet-router.ate-system.svc
+  # The worker pool's labels; empty: any.
+  workerSelector: {}
+  # Make the atespace and its editor binding at install (a Job), as one of Substrate's
+  # owners: a Secret with key `token` holding an owner's Substrate token.
+  setup:
+    enabled: false
+    ownerTokenSecret: ""
+
+# The keys provider: Substrate's egress asks it for the header of a keyed
+# request, and it asks the gateway's decide route. It runs in Substrate's namespace, one per
+# cluster, so one release enables it. Install Substrate with
+#   --credential-provider='[{"name":"keys.nylorun.dev","address":"nylorun-keys-provider.<systemNamespace>.svc:50051"}]'
+keysProvider:
+  enabled: false
+  resources: {}
+
+computer:
+  port: 8080
+  # What serves a computer: `go`, the computer agent (one static binary from
+  # `image`, mounted at /nylo), or `engine`, the Runtime's engine in computer mode, for a Runtime
+  # that can't move yet. Moving a Tenant's computers between them gives each a new volume from its
+  # latest disk version: take a disk version of every computer first (MIGRATION.md).
+  agent: go
+  # The computer agent's image (agent go). Pin it by digest in production
+  # (`ghcr.io/nylorun/computer:1.0@sha256:…`, as computer-image.yml prints it); empty uses
+  # ghcr.io/nylorun/computer at the chart's `nylorun.com/computer-version` annotation, which the
+  # sandboxes service pins to its digest.
+  image: ""
+
+# The sandboxes service: `imageMirrors` maps an image repository to the repository that
+# serves the same images, so the nodes pull an Agent's computer image from this cluster's own
+# registry with the digest it pinned, e.g.
+#   imageMirrors:
+#     ghcr.io/nylorun/bot-computer: asia-south1-docker.pkg.dev/<project>/nylorun/bot-computer
+# Copy each digest into the mirror first (`crane copy` keeps it), and pre-pull the mirror's name.
+sandboxes:
+  imageMirrors: {}
+
+sandboxGateway:
+  replicas: 2
+  resources: {}
+
+# Where each component runs (Substrate's recommended layout: README).
+placement:
+  nodeSelector: {}
+  tolerations: []
+
+# Warms atelet's image cache on worker nodes with the image computers mount at /nylo (the computer
+# agent's, or the Runtime's with computer.agent engine) and these computer images, with
+# Substrate's validate-image-cache built from its source at `substrateCommit`.
+prepull:
+  enabled: false
+  substrateCommit: ""
+  images: []
+  nodeSelector: {}
+  tolerations: []
+
+studio:
+  enabled: true
+
+# The runtime's, gateway's and harness's ServiceAccount (`<name>-runtime`), which mounts no
+# Kubernetes API token. Annotate it for a cloud identity, such as GKE Workload Identity's
+# iam.gke.io/gcp-service-account, which a model on the host's identity uses
+# (NYLORUN_MODEL_HOST_IDENTITY in extraEnv.runtime).
+serviceAccount:
+  annotations: {}
+
+# More environment for each engine container, as Kubernetes env entries (a value, or valueFrom a
+# Secret): the Runtime's settings the chart doesn't set (SELF_HOSTING.md's table), such as
+# NYLORUN_MODEL_HOST_IDENTITY, NYLORUN_CREDENTIAL_PROVIDER_URL and _TOKEN (gateway and runtime),
+# NYLORUN_A2A_PUSH_SECRET and _ALLOW_HOSTS, or NYLORUN_TUNING. Don't repeat a name the chart
+# sets. Telemetry (docs/self-hosting/observability.md) is the standard OTEL_* variables, in runtime and
+# gateway alike: OTEL_EXPORTER_OTLP_ENDPOINT (with OTEL_EXPORTER_OTLP_HEADERS from a Secret) to
+# export metrics and spans, OTEL_TRACES_SAMPLER and _ARG, OTEL_RESOURCE_ATTRIBUTES, and
+# OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT (runtime only).
+extraEnv:
+  runtime: []
+  gateway: []
+  harness: []
+
+# Metrics: the runtime and the gateway serve Prometheus /metrics on port 9464, the port
+# named `metrics` on the <name>-runtime-internal and <name>-gateway Services (never the public
+# one). `from` lists the NetworkPolicy peers that may scrape it, such as
+# [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } } }]; empty,
+# any pod may. Studio may always: its Tenant › Traffic reads both.
+metrics:
+  from: []
+
+# Names the runtime, gateway and harness pods resolve to fixed addresses (Kubernetes
+# hostAliases), such as a host the Runtime calls inside a private network whose public name
+# points elsewhere: [{ ip: 10.0.0.10, hostnames: [tools.example.com] }].
+hostAliases: []
+
+resources:
+  runtime: {}
+  gateway: {}
+  harness: {}
+  studio: {}
+  sandboxes: {}

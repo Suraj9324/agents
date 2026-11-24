@@ -1,0 +1,44 @@
+import type { ToolRegistry } from "../../definition/registry.js";
+import type { ModelAdapter } from "@nylorun/core/define";
+import type { InputEvent, TranscriptEntry } from "@nylorun/core/define";
+import type { ToolResult } from "@nylorun/core/define";
+import type { DefinitionPart } from "@nylorun/core/define";
+import type { JsonValue } from "@nylorun/core/define";
+import type { FileContext } from "../model/files.js";
+
+/** Compiled definition pieces plus the per-run model adapter for one step. */
+export interface StepRuntime {
+  readonly parts: readonly DefinitionPart[];
+  readonly invoke: ModelAdapter;
+  readonly registry: ToolRegistry;
+  /** How the step reads and represents the turn's files (`representFiles`); none in a local run. */
+  readonly files?: FileContext;
+  /** Mutable session memory bag shared with tools. */
+  sessionState?: Record<string, JsonValue>;
+}
+
+export interface StepInput {
+  readonly executionId: string;
+  readonly turnId: string;
+  readonly stepId: string;
+  /** One-based position of this turn within the execution. */
+  readonly turnNumber: number;
+  /** One-based position of this Model Step within the Turn. */
+  readonly stepNumber: number;
+  readonly info?: unknown;
+  readonly arrivals: readonly InputEvent[];
+  readonly toolResults: readonly ToolResult[];
+  readonly transcript: readonly TranscriptEntry[];
+  /** Text kept at the head of the conversation (`ExecutionState.pinned`). */
+  readonly pinned?: readonly string[];
+}
+
+/** Internal view consumed by a single model step. */
+export interface ExecutionSnapshot {
+  readonly id: string;
+  readonly status: "running";
+  readonly turnCount: number;
+  readonly revision: number;
+  readonly transcript: readonly TranscriptEntry[];
+  readonly pinned?: readonly string[];
+}

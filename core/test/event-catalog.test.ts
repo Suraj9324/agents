@@ -1,0 +1,123 @@
+import { describe, expect, it } from "vitest";
+import {
+  EVENT_CATALOG,
+  EVENT_LAYERS,
+  EVENT_SCHEMAS,
+  EVENT_TYPES,
+  PLAN_LIMITS,
+  PLAN_STEP_STATES,
+  SessionEventSchema,
+  eventLayer,
+  parseSessionEvent,
+} from "../src/contracts.js";
+
+const envelope = {
+  schema: "nylorun.event/2",
+  eventId: "ev_1",
+  sessionId: "s1",
+  tenantId: "tn_1",
+  runId: null,
+  turnId: "turn_1",
+  incarnation: 0,
+  epoch: 1,
+  seq: 4,
+  cursor: "czE6NA",
+  time: "2026-10-01T00:00:00.000Z",
+  schemaVersion: 1,
+  source: { kind: "loop", id: "runtime" },
+  evidence: "observed",
+  visibility: "public",
+  retention: "full",
+} as const;
+
+describe("event catalog", () => {
+  it("has one schema per type, each typing its own literal", () => {
+    expect(Object.keys(EVENT_SCHEMAS)).toEqual(EVENT_TYPES);
+    for (const type of EVENT_TYPES)
+      expect(EVENT_SCHEMAS[type].shape.type.value).toBe(type);
+    expect(EVENT_TYPES).toContain("environment.exec");
+    expect(EVENT_TYPES).not.toContain("sandbox.exec");
+    expect(EVENT_TYPES).toContain("node.completed");
+    expect(EVENT_TYPES).not.toContain("node.failed");
+  });
+
+  it("types a known event and keeps unknown payload fields", () => {
+    const event = parseSessionEvent({
+      ...envelope,
+      type: "action.delivered",
+      payload: { actionId: "a1", generation: 2, extra: true },
+    });
+    expect(event.type).toBe("action.delivered");
+    expect(event.payload).toEqual({ actionId: "a1", generation: 2, extra: true });
+  });
+
+  it("reads a type it does not know as the bare envelope", () => {
+    const event = parseSessionEvent({ ...envelope, type: "future.thing", payload: { x: 1 } });
+    expect(event).toMatchObject({ type: "future.thing", payload: { x: 1 }, seq: 4 });
+  });
+
+  it("strips envelope fields it does not know, so the envelope can grow", () => {
+    const event = parseSessionEvent({
+      ...envelope,
+      addedLater: "x",
+      type: "turn.completed",
+      payload: { output: 1 },
+    });
+    expect(event).not.toHaveProperty("addedLater");
+  });
+
+  it("rejects a known type whose payload does not match", () => {
+    expect(
+      SessionEventSchema.safeParse({ ...envelope, type: "loop.verified", payload: { n: 1 } })
+        .success
+    ).toBe(false);
+  });
+
+  it("types plan.updated: the whole plan, within its limits", () => {
+    const event = parseSessionEvent({
+      ...envelope,
+      type: "plan.updated",
+      payload: {
+        steps: [
+          { label: "Inspect wikis and toolchain", state: "done", note: "Node 22, pnpm 9" },
+          { label: "Build in parts", state: "active" },
+          { label: "Package zip and write summary", state: "pending" },
+        ],
+      },
+    });
+    expect(event.type).toBe("plan.updated");
+    expect(EVENT_CATALOG["plan.updated"]).toMatchObject({ source: "loop", version: 1 });
+    expect(PLAN_STEP_STATES).toEqual(["pending", "active", "done", "blocked", "skipped"]);
+    expect(PLAN_LIMITS).toEqual({ steps: 20, labelChars: 120, noteChars: 280 });
+    const parse = (payload: unknown) =>
+      SessionEventSchema.safeParse({ ...envelope, type: "plan.updated", payload }).success;
+    expect(parse({ steps: [] })).toBe(true);
+    expect(parse({ steps: [{ label: "a", state: "done", later: 1 }] })).toBe(true);
+    expect(parse({ steps: [{ label: "a", state: "finished" }] })).toBe(false);
+    expect(parse({ steps: [{ label: "a".repeat(121), state: "done" }] })).toBe(false);
+    expect(parse({ steps: [{ label: "a", state: "done", note: "n".repeat(281) }] })).toBe(false);
+    expect(parse({ steps: Array.from({ length: 21 }, () => ({ label: "a", state: "done" })) })).toBe(false);
+  });
+
+  it("names a source and a version for every type", () => {
+    for (const type of EVENT_TYPES) {
+      expect(["loop", "api", "egress-gate"]).toContain(EVENT_CATALOG[type].source);
+      expect(EVENT_CATALOG[type].version).toBeGreaterThan(0);
+    }
+  });
+
+  it("names a layer for every type: the agent's record or the Runtime's", () => {
+    for (const type of EVENT_TYPES) {
+      expect(EVENT_LAYERS).toContain(EVENT_CATALOG[type].layer);
+      expect(eventLayer(type)).toBe(EVENT_CATALOG[type].layer);
+    }
+    // What the agent saw and did.
+    for (const type of ["command.message", "message.assistant", "tool.completed", "context.compacted", "turn.completed"])
+      expect(eventLayer(type)).toBe("agent");
+    // What the Runtime did to the session.
+    for (const type of ["queue.taken", "wake.booked", "session.model", "environment.state", "artifact.created"])
+      expect(eventLayer(type)).toBe("runtime");
+    expect(eventLayer("not.a.type")).toBeUndefined();
+    expect(eventLayer("toString")).toBeUndefined();
+  });
+});

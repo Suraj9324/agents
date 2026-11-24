@@ -1,0 +1,223 @@
+name: Publish reviewed release
+on:
+  # A merged release PR publishes itself: merging is the agent's last step.
+  push:
+    branches: [main]
+    paths: [.release/plan.json]
+  # Reruns and recovery: a later main tip that keeps the plan unchanged.
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full SHA of the merged release commit on main
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: npm-publication
+  cancel-in-progress: false
+env:
+  RELEASE_SHA: ${{ inputs.commit || github.sha }}
+# Order: validate → images (ghcr.io/nylorun/runtime, studio and sandboxes) → publish
+# (npm, beta only). No step waits for approval: moving `latest` is a separate
+# workflow, Promote to latest (promote.yml). nylorun names its image pins
+# (cli/nylorun/package.json nylorun.runtime and nylorun.studio), so both images
+# exist before nylorun reaches npm.
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate commit input
+        shell: bash
+        run: '[[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]'
+      # Require the full suite on this commit instead of re-running it; no
+      # check-run means no publication. A merged release PR changes the release
+      # plan, so the merge queue ran the full suite as `ci` on the exact commit
+      # it lands (ci.yml). A manual run may name a later main tip, which the
+      # queue checked with the fast tier only: require main's post-merge run,
+      # `ci (push)`, instead. It passes only after the full suite passed on the
+      # commit: in that run, or for a release commit in the queue's `ci`.
+      - name: Require the full CI suite on this commit
+        shell: bash
+        env:
+          CHECK: ${{ github.event_name == 'workflow_dispatch' && 'ci (push)' || 'ci' }}
+        run: |
+          conclusion=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/commits/$RELEASE_SHA/check-runs" \
+            -f check_name="$CHECK" -f filter=latest \
+            --jq '[.check_runs[] | select(.app.slug == "github-actions") | .conclusion] | first')
+          echo "$CHECK on $RELEASE_SHA: $conclusion"
+          [[ "$conclusion" == success ]]
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            examples/package-lock.json
+      - run: npm install --global npm@11.15.0
+      - run: npm run setup
+      # check-example-assets (in release:check) needs the examples build.
+      - run: npm run build --prefix examples
+      # release:check smokes the packed starter on the Docker stack. Build its
+      # Runtime and Studio images once, for this runner only (amd64, loaded,
+      # never pushed), from the layer cache CI's images use (cache.yml writes it
+      # on main); the images job builds the published multi-arch images.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the Runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: runtime/Dockerfile
+          tags: nylorun-runtime:release-check
+          load: true
+          cache-from: type=gha,scope=stack-runtime
+      - name: Build the Studio image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: studio/Dockerfile
+          tags: nylorun-studio:release-check
+          load: true
+          cache-from: type=gha,scope=stack-studio
+      # Also checks nylorun's image pins against the plan.
+      - run: npm run release:check -- --built
+        env:
+          NYLORUN_RUNTIME_IMAGE: nylorun-runtime:release-check
+          NYLORUN_STUDIO_IMAGE: nylorun-studio:release-check
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-packages
+          path: .tmp/release-artifacts/
+          include-hidden-files: true
+          if-no-files-found: error
+  # Multi-arch images, tagged with the package version only. An existing tag
+  # is never replaced: its leg skips the build, so reruns are idempotent. A
+  # version this release keeps must already have its image.
+  images:
+    needs: validate
+    runs-on: ubuntu-latest
+    # arm64 builds under QEMU emulation.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: runtime
+            title: Nylorun Runtime
+            description: The Nylorun Runtime (API and Worker roles)
+          - package: studio
+            title: Nylorun Studio
+            description: The Nylorun Studio dashboard and trusted proxy
+          # Versioned with the Runtime (scripts/release/pins.mjs VERSIONED_WITH).
+          - package: sandboxes
+            title: Nylorun Sandboxes
+            description: The Nylorun sandboxes service (agent-sandbox pods for a Tenant)
+    env:
+      PACKAGE: ${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+      # images.mjs uses only Node built-ins: no install.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve the image
+        id: image
+        run: node scripts/release/images.mjs "$PACKAGE"
+      - if: steps.image.outputs.push == 'true'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - if: steps.image.outputs.push == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: steps.image.outputs.push == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.package }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+            org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
+            org.opencontainers.image.licenses=Apache-2.0
+          # GHCR reads a multi-arch image's description from its index.
+          annotations: |
+            index:org.opencontainers.image.description=${{ matrix.description }}
+            index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            index:org.opencontainers.image.version=${{ steps.image.outputs.version }}
+            index:org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
+            index:org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha,scope=release-${{ matrix.package }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.package }}
+      - name: Verify both platforms
+        if: steps.image.outputs.push == 'true'
+        env:
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          platforms=$(docker buildx imagetools inspect "$TAG" --raw \
+            | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"')
+          echo "$platforms"
+          grep -qx linux/amd64 <<<"$platforms"
+          grep -qx linux/arm64 <<<"$platforms"
+  publish:
+    needs: [validate, images]
+    runs-on: ubuntu-latest
+    # Two registry waits (engines, then creator), each bounded at 10 min, then
+    # the public creator smoke, which pulls the published images.
+    timeout-minutes: 60
+    # Bound to npm trusted publishing and holds NPM_BOOTSTRAP_TOKEN; it has no
+    # reviewers. It publishes on beta only (scripts/release/registry.mjs
+    # refuses any other tag).
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install --global npm@11.15.0
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-packages
+          path: .tmp/release-artifacts/
+      - run: node scripts/release/publish.mjs
+        env:
+          # Optional first-publication fallback; npm prefers configured OIDC trust.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}

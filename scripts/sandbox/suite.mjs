@@ -1,0 +1,438 @@
+#!/usr/bin/env node
+// Pod sandboxes end to end (S10) on a real cluster:
+//
+//   npm run test:sandboxes -- --context kind-nylorun --host-address 172.17.0.1
+//   npm run test:sandboxes -- --context docker-desktop
+//
+// Starts a Tenant under a temporary Host root (`nylorun start --no-studio`), points its model at
+// a stub OpenAI-compatible model on the Compose network (it counts calls and can hold them),
+// runs `nylorun sandbox enable`, then through the Tenant API (protocol 16: Agents of kind pod, each
+// made from an agent manifest whose runtime section is a pod):
+//
+// - make a pod Agent → its engine joins (host epoch > 0); a session opened on it runs
+//   a turn whose bash runs in the pod
+//   (hostname is the pod's), and the pod's NetworkPolicy keeps the API server closed to the
+//   command (the engine waited for it: `sandbox_network_policy_in_force` in its log);
+// - stop → suspended (no pod), the next turn resumes it on the same volume;
+// - `docker compose kill -s KILL runtime` mid model call: the turn completes, nothing uncertain,
+//   one upstream call per model effect;
+// - `kubectl delete pod --force` mid model call: a new pod joins (`agent.relaunched`), the
+//   turn completes with one upstream call per model effect;
+// - the runtime's `lifecycle.idle: 20s` → suspended, the next turn resumes it; its
+//   `lifecycle.deleteAfter: 45s` → deleted by the Tenant sweep;
+// - the sandboxes container restarted (`docker restart`) right after a create;
+// - reset → a new, empty volume; PVC and pod deleted → `agent.lost`, turns refused
+//   (`agent_lost`) until a reset;
+// - credentials for skills: an `environment_secret` slot of the runtime, its value written
+//   into the Agent's vault, is `nylorun_managed` in the pod, and a public header-echo host it is
+//   bound to receives the real header through egress-gate;
+// - no pod mounts a host path; `nylorun sandbox disable` → kind pod is `agent_unavailable`.
+//
+// Needs kubectl, a context with agent-sandbox v1.0.10 or none, the workspace builds (`npm run
+// build`), and the images pods use present on the cluster's node (CI: `kind load docker-image`
+// of the runtime image and python:3.13-slim). Images: NYLORUN_RUNTIME_IMAGE and
+// NYLORUN_SANDBOXES_IMAGE when set (CI), else built from this checkout. Only the named context
+// is touched; the namespace this suite creates is deleted.
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import { parseArgs } from "node:util";
+import { run } from "../lib/repo.mjs";
+import { ensureImages, eventually, runtimeHeaders, withStack } from "../lib/stack.mjs";
+
+const { values: options } = parseArgs({
+  options: {
+    context: { type: "string", default: process.env.NYLORUN_SANDBOX_CONTEXT ?? "kind-nylorun" },
+    "host-address": { type: "string", default: process.env.NYLORUN_SANDBOX_HOST_ADDRESS },
+  },
+});
+const context = options.context;
+const started = Date.now();
+const step = (message) => console.log(`\n[pods ${Math.round((Date.now() - started) / 1000)}s] ${message}`);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The stub model, run with `node -e` in the Runtime image on the Compose network. A request that
+ * offers `bash` and whose last message is not a tool result gets a bash call; any other gets
+ * an answer that repeats the last tool result. It counts calls, and holds them while asked to.
+ */
+const STUB_MODEL = String.raw`
+const http = require("node:http");
+let calls = 0;
+let hold = false;
+const held = new Set();
+function stream(res, delta, finish) {
+  const base = { id: "stub", object: "chat.completion.chunk", created: 0, model: "stub" };
+  const chunk = (body) => res.write("data: " + JSON.stringify({ ...base, ...body }) + "\n\n");
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  chunk({ choices: [{ index: 0, delta: { role: "assistant", ...delta }, finish_reason: null }] });
+  chunk({ choices: [{ index: 0, delta: {}, finish_reason: finish }] });
+  chunk({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
+  res.end("data: [DONE]\n\n");
+}
+function answer(res, body) {
+  const last = body.messages?.at(-1);
+  const bash = (body.tools ?? []).map((tool) => tool.function?.name).find((name) => /(^|_)bash$/.test(name ?? ""));
+  if (bash && last?.role !== "tool")
+    return stream(res, { tool_calls: [{ index: 0, id: "call_" + calls, type: "function", function: { name: bash, arguments: JSON.stringify({ command: process.env.COMMAND }) } }] }, "tool_calls");
+  const text = typeof last?.content === "string" ? last.content : JSON.stringify(last?.content ?? "");
+  stream(res, { content: "result: " + text }, "stop");
+}
+http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/calls") {
+    res.setHeader("content-type", "application/json");
+    return res.end(JSON.stringify({ calls, held: held.size }));
+  }
+  if (req.method === "POST" && req.url === "/hold") { hold = true; return res.end("{}"); }
+  if (req.method === "POST" && req.url === "/release") {
+    hold = false;
+    for (const pending of held) pending();
+    held.clear();
+    return res.end("{}");
+  }
+  if (req.method === "POST" && req.url.endsWith("/chat/completions")) {
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      calls += 1;
+      const body = JSON.parse(raw || "{}");
+      if (!hold) return answer(res, body);
+      const done = () => answer(res, body);
+      held.add(done);
+      res.on("close", () => held.delete(done));
+    });
+    return;
+  }
+  res.statusCode = 404;
+  res.end();
+}).listen(8080, "0.0.0.0");
+`;
+const STUB_ALIAS = "pods-model";
+
+/**
+ * Appended to every turn's command; runs only in a session with the probe credential. It
+ * prints the variable the pod sees, then asks a public header-echo service (the first that
+ * answers) what `Authorization` it received, and prints only its sha256: the real value never
+ * reaches the session.
+ */
+const ECHO_HOSTS = ["postman-echo.com", "httpbin.org"];
+const PROBE = String.raw`if [ -n "$PROBE_TOKEN" ]; then echo "PROBE_TOKEN=$PROBE_TOKEN"; python3 -c '
+import hashlib, json, urllib.request
+for url in ("https://postman-echo.com/headers", "https://httpbin.org/headers"):
+    try:
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer nylorun_managed", "User-Agent": "nylorun-suite"})
+        echoed = {k.lower(): v for k, v in json.load(urllib.request.urlopen(request, timeout=20))["headers"].items()}
+        print("ECHO", hashlib.sha256(echoed["authorization"].encode()).hexdigest())
+        break
+    except Exception as error:
+        print("FAILED", url, type(error).__name__, error)
+'; fi`;
+
+/** kubectl on the named context only. */
+async function kubectl(args, { check = true, timeout = 120_000 } = {}) {
+  try {
+    return await run("kubectl", ["--context", context, ...args], { capture: true, timeout });
+  } catch (error) {
+    if (check) throw error;
+    return undefined;
+  }
+}
+
+try {
+  const images = await ensureImages({ only: ["runtime", "sandboxes"] });
+  await withStack({ name: "nylorun-sbx-pods", images, startArgs: ["--no-studio"] }, async (stack) => {
+    const namespace = `nylorun-sbx-${stack.project}`;
+    const stubName = `${stack.project}-${STUB_ALIAS}`;
+    const docker = (args, extra = {}) => run("docker", args, { capture: true, timeout: 120_000, ...extra });
+    let tenant;
+    const api = async (method, path, body, { ok = true } = {}) => {
+      // `/v1/tenant/*` is the Management API: it takes the management key.
+      const key = path.startsWith("/v1/tenant/") ? tenant.managementKey : tenant.key;
+      const response = await fetch(`${stack.runtimeUrl}${path}`, {
+        method,
+        headers: runtimeHeaders(key, body ? { "content-type": "application/json" } : {}),
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const text = await response.text();
+      const parsed = text ? JSON.parse(text) : undefined;
+      if (ok) assert.ok(response.ok, `${method} ${path}: ${response.status} ${text.slice(0, 400)}`);
+      return { status: response.status, body: parsed };
+    };
+    const agentPath = (id) => `/v1/agents/${encodeURIComponent(id)}`;
+    const agent = async (id) => (await api("GET", agentPath(id))).body;
+    const events = async (id) =>
+      (await api("GET", `${agentPath(id)}/events`)).body.events.map((event) => event.type);
+    const until = (what, check, timeout = 180_000) => eventually(check, { timeout, interval: 1000, message: what });
+    const observed = (id, state, timeout) =>
+      until(`${id} ${state}`, async () => (await agent(id)).compute.pod?.observed === state, timeout);
+    /** Saves the agent manifest for Agent `id` (named after it, `/` as `-`), with `runtime`. */
+    const saveManifest = (id, runtime) => {
+      const name = id.replaceAll("/", "-");
+      return api("PUT", `/v1/agent-manifests/${name}`, {
+        requestId: randomUUID(),
+        manifestSchemaVersion: 8,
+        name,
+        harness: {},
+        runtime,
+      }).then(() => name);
+    };
+    /** Saves the manifest, then makes the Agent `id` from it. */
+    const putAgent = async (id, runtime) =>
+      api("PUT", agentPath(id), { requestId: randomUUID(), manifest: await saveManifest(id, runtime) });
+    const podOf = async (name) => {
+      const pods = JSON.parse(await kubectl(["get", "pods", "-n", namespace, "-l", `nylorun.dev/sandbox=${name}`, "-o", "json"]));
+      return pods.items.find((pod) => !pod.metadata.deletionTimestamp);
+    };
+    let stubUrl;
+    const stub = async () => (await fetch(`${stubUrl}/calls`)).json();
+    let messages = 0;
+    const message = (session) => {
+      messages += 1;
+      return api("POST", `/v1/sessions/${session}/commands`, {
+        type: "message",
+        requestId: `m${messages}`,
+        idempotencyKey: `m${messages}`,
+        content: "run it",
+      }, { ok: false });
+    };
+    const settled = async (session) => {
+      let last;
+      await until(`${session} settles`, async () => {
+        last = (await api("GET", `/v1/sessions/${session}`)).body;
+        return ["completed", "failed", "cancelled", "uncertain"].includes(last.status);
+      }, 300_000);
+      return last;
+    };
+    const items = async (session) => (await api("GET", `/v1/sessions/${session}/items`)).body.items;
+    const completed = async (session) => (await items(session)).filter((item) => item.type === "turn.completed").length;
+    /**
+     * The history once it holds `n` `turn.completed`. `/items` reads the session's stream, which
+     * the relay feeds from the record after commit, so it can trail the
+     * session view, most after a restart. The relay keeps a session's order: what the record holds
+     * before that event is in the history too.
+     */
+    const historyWith = (session, n) =>
+      eventually(
+        async () => {
+          const history = await items(session);
+          const types = history.map((item) => item.type);
+          if (types.filter((type) => type === "turn.completed").length >= n) return history;
+          throw new Error(types.join(", "));
+        },
+        { timeout: 30_000, message: `${n} turn.completed in ${session}'s history` },
+      );
+    /** A turn that completes, with exactly `calls` upstream model calls; its last answer. */
+    const turn = async (session, { calls = 2 } = {}) => {
+      const before = (await stub()).calls;
+      const turns = await completed(session);
+      const sent = await message(session);
+      assert.equal(sent.status, 200, JSON.stringify(sent.body));
+      const done = await settled(session);
+      assert.equal(done.status, "completed", JSON.stringify(done));
+      await sleep(2000);
+      assert.equal((await stub()).calls - before, calls, "one upstream call per model effect");
+      const history = await historyWith(session, turns + 1);
+      return JSON.stringify(history.filter((item) => item.type === "message.assistant").at(-1)?.payload ?? {});
+    };
+    const open = (session, agentId) =>
+      api("PUT", `/v1/sessions/${session}`, {
+        requestId: randomUUID(),
+        agent: agentId,
+        ownerUserId: "pods-suite",
+      });
+    const k8sName = (id) => stack.psql(`SELECT k8s_name FROM nylorun.agents WHERE id = '${id}'`);
+
+    try {
+      tenant = await stack.tenant();
+
+      step("stub model on the Compose network");
+      // The API server's service address: the pod's NetworkPolicy must keep commands from it.
+      const blocked = "10.96.0.1/443";
+      const command = `hostname; echo pod > out.txt; (timeout 3 bash -c '</dev/tcp/${blocked}' && echo API-OPEN) || echo API-CLOSED; ${PROBE}`;
+      await docker([
+        "run", "--detach", "--rm", "--name", stubName,
+        "--network", stack.project, "--network-alias", STUB_ALIAS,
+        "--publish", "127.0.0.1::8080",
+        "--entrypoint", "node", images.runtime,
+        "-e", STUB_MODEL.replace("process.env.COMMAND", JSON.stringify(command)),
+      ]);
+      stubUrl = `http://${(await docker(["port", stubName, "8080/tcp"])).split("\n")[0].trim()}`;
+      await until("the stub model", () => stub().then(() => true), 30_000);
+      await api("PUT", "/v1/tenant/model", {
+        requestId: randomUUID(),
+        idempotencyKey: randomUUID(),
+        provider: "custom",
+        model: "stub",
+        baseUrl: `http://${STUB_ALIAS}:8080/v1`,
+        auth: { type: "api_key", key: "stub-model-key" },
+      });
+
+      step(`nylorun sandbox enable --context ${context}`);
+      const enable = ["local", "sandbox", "enable", "--context", context, "--no-pull"];
+      if (options["host-address"]) enable.push("--host-address", options["host-address"]);
+      await stack.nylorun(enable, { timeout: 900_000 });
+      tenant = await stack.tenant();
+      await api("PUT", "/v1/tenant/sandbox", {
+        requestId: randomUUID(),
+        // The echo hosts the credentials step's Agent reaches, in place of the dev preset.
+        limits: { idle: "10m", network: ECHO_HOSTS },
+        lifecycle: { stopGrace: "10s" },
+      });
+      const cluster = (await api("GET", "/v1/tenant/sandbox")).body.cluster;
+      assert.equal(cluster?.namespace, namespace, JSON.stringify(cluster));
+
+      step("create → the engine joins; a bash turn runs in the pod");
+      const created = await putAgent("pods/one", { kind: "pod" });
+      assert.equal(created.body.kind, "pod");
+      assert.equal(created.body.compute.pod.desired, "running");
+      await observed("pods/one", "running", 420_000);
+      await until("the engine joins", async () => (await events("pods/one")).includes("agent.running"), 300_000);
+      const name = await k8sName("pods/one");
+      const firstPod = await podOf(name);
+      assert.ok(firstPod, "the Agent's pod exists");
+      const log = await kubectl(["logs", "-n", namespace, firstPod.metadata.name, "-c", "workload"]);
+      assert.match(log, /sandbox_network_policy_in_force/, "the engine waited for its NetworkPolicy");
+      assert.ok(
+        !(firstPod.spec.volumes ?? []).some((volume) => volume.hostPath),
+        "no host path in the pod",
+      );
+      await open("s1", "pods/one");
+      const first = await turn("s1");
+      assert.match(first, new RegExp(firstPod.metadata.name), "bash ran in the pod");
+      assert.match(first, /API-CLOSED/, "the API server is closed to the pod's commands");
+      const file = await api("POST", "/v1/sessions/s1/sandbox/read", { path: "out.txt" });
+      assert.match(JSON.stringify(file.body), /pod/);
+
+      step("credentials for skills: a sentinel in the pod, the real header at the bound host");
+      const secret = `nylorun-suite-${randomUUID()}`;
+      await putAgent("pods/creds", {
+        kind: "pod",
+        network: { allowedHosts: ECHO_HOSTS },
+        secrets: { PROBE_TOKEN: { type: "environment_secret", allowedHosts: ECHO_HOSTS } },
+      });
+      // The runtime declares the slot: its name is the variable the pod sees, and the
+      // Agent's vault holds only the value.
+      const written = await api("PUT", `${agentPath("pods/creds")}/secrets/PROBE_TOKEN`, {
+        requestId: randomUUID(),
+        value: secret,
+      });
+      assert.ok(!JSON.stringify(written.body).includes(secret), "the secret's view holds no value");
+      await observed("pods/creds", "running", 420_000);
+      await until("its engine joins", async () => (await events("pods/creds")).includes("agent.running"), 300_000);
+      await open("creds", "pods/creds");
+      const probed = await turn("creds");
+      assert.match(probed, /PROBE_TOKEN=nylorun_managed/, "the pod sees the sentinel");
+      const expected = createHash("sha256").update(`Bearer ${secret}`).digest("hex");
+      assert.ok(probed.includes(`ECHO ${expected}`), `the bound host received the real header: ${probed}`);
+      assert.ok(!JSON.stringify(await items("creds")).includes(secret), "no value in the session's history");
+      await api("POST", `${agentPath("pods/creds")}/stop`);
+
+      step("stop → suspended; the next turn resumes it on the same volume");
+      await api("POST", `${agentPath("pods/one")}/stop`);
+      await observed("pods/one", "suspended");
+      await until("no pod while suspended", async () => !(await podOf(name)));
+      await turn("s1");
+      const kept = await api("POST", "/v1/sessions/s1/sandbox/read", { path: "out.txt" });
+      assert.match(JSON.stringify(kept.body), /pod/, "files survive a stop");
+
+      step("kill -9 the runtime mid model call");
+      await fetch(`${stubUrl}/hold`, { method: "POST" });
+      let before = (await stub()).calls;
+      const turns = await completed("s1");
+      assert.equal((await message("s1")).status, 200);
+      await until("a model call held", async () => (await stub()).held === 1);
+      await stack.compose(["kill", "-s", "KILL", "runtime"]);
+      await stack.compose(["start", "runtime"]);
+      await until("the runtime is ready", async () => (await fetch(`${stack.runtimeUrl}/ready`).catch(() => ({ ok: false }))).ok);
+      await fetch(`${stubUrl}/release`, { method: "POST" });
+      let done = await settled("s1");
+      assert.equal(done.status, "completed", JSON.stringify(done));
+      await sleep(3000);
+      assert.equal((await stub()).calls - before, 2, "one upstream call per model effect after kill -9");
+      const recovered = await historyWith("s1", turns + 1);
+      assert.ok(!recovered.some((item) => item.type === "effect.uncertain"), "nothing uncertain");
+
+      step("force-delete the pod mid model call");
+      await fetch(`${stubUrl}/hold`, { method: "POST" });
+      before = (await stub()).calls;
+      assert.equal((await message("s1")).status, 200);
+      await until("a model call held", async () => (await stub()).held === 1);
+      const doomed = await podOf(name);
+      await kubectl(["delete", "pod", "-n", namespace, doomed.metadata.name, "--force", "--grace-period=0"]);
+      await until("a new pod", async () => {
+        const next = await podOf(name);
+        return next && next.metadata.uid !== doomed.metadata.uid;
+      });
+      await until("the new pod joins", async () => (await events("pods/one")).includes("agent.relaunched"), 300_000);
+      await fetch(`${stubUrl}/release`, { method: "POST" });
+      done = await settled("s1");
+      assert.equal(done.status, "completed", JSON.stringify(done));
+      await sleep(3000);
+      assert.equal((await stub()).calls - before, 2, "one upstream call per model effect after a force delete");
+
+      step("lifecycle: idle (20 s) → suspended, deleteAfter (45 s) → deleted; the sandboxes service restarted after a create");
+      await putAgent("pods/idle", { kind: "pod", lifecycle: { idle: "20s" } });
+      await docker(["restart", `${stack.project}-sandboxes`]);
+      await observed("pods/idle", "running", 420_000);
+      await open("s-idle", "pods/idle");
+      await turn("s-idle");
+      await observed("pods/idle", "suspended", 180_000);
+      assert.ok((await events("pods/idle")).includes("agent.suspended"));
+      await turn("s-idle");
+      await putAgent("pods/gone", { kind: "pod", lifecycle: { deleteAfter: "45s" } });
+      await until(
+        "unused for deleteAfter and deleted",
+        async () => (await api("GET", agentPath("pods/gone"), undefined, { ok: false })).status === 404,
+        300_000,
+      );
+
+      step("reset → a new, empty volume");
+      await api("POST", `${agentPath("pods/one")}/reset`);
+      await observed("pods/one", "running", 420_000);
+      await until("the old Sandbox is deleted", async () => !(await kubectl(["get", "sandbox", "-n", namespace, name], { check: false })));
+      // Ready first, then its engine joins: read once the new pod serves the workspace.
+      let empty;
+      await until("the new pod's engine serves the workspace", async () => {
+        empty = await api("POST", "/v1/sessions/s1/sandbox/read", { path: "out.txt" }, { ok: false });
+        return empty.status !== 409;
+      });
+      assert.match(JSON.stringify(empty.body), /not_found|No file/, "a reset starts from an empty volume");
+
+      step("PVC and pod deleted → agent.lost; turns refused until a reset");
+      const resetName = await k8sName("pods/one");
+      await kubectl(["delete", "pvc", "-n", namespace, `data-${resetName}`, "--wait=false"]);
+      const victim = await podOf(resetName);
+      await kubectl(["delete", "pod", "-n", namespace, victim.metadata.name, "--force", "--grace-period=0"]);
+      await observed("pods/one", "lost", 300_000);
+      assert.ok((await events("pods/one")).includes("agent.lost"));
+      const lost = await message("s1");
+      assert.equal(lost.body.code, "agent_lost", JSON.stringify(lost.body));
+      await api("POST", `${agentPath("pods/one")}/reset`);
+      await observed("pods/one", "running", 420_000);
+
+      step("nylorun sandbox disable → kind pod is agent_unavailable");
+      // The manifest is saved while pods are on; making a pod Agent from it needs them.
+      const after = await saveManifest("pods/after", { kind: "pod" });
+      await stack.nylorun(["local", "sandbox", "disable", "--delete-namespace"], { timeout: 600_000 });
+      tenant = await stack.tenant();
+      const unavailable = await api("PUT", agentPath("pods/after"), { requestId: randomUUID(), manifest: after }, { ok: false });
+      assert.equal(unavailable.status, 409);
+      assert.equal(unavailable.body.code, "agent_unavailable");
+      const stopped = await message("s1");
+      assert.equal(stopped.body.code, "agent_unavailable", JSON.stringify(stopped.body));
+    } catch (error) {
+      await kubectl(["get", "sandbox,pod,pvc,secret", "-n", namespace, "-o", "wide"], { check: false }).then((out) => out && console.error(out));
+      await kubectl(["describe", "pods", "-n", namespace], { check: false }).then((out) => out && console.error(out));
+      await kubectl(["logs", "-n", namespace, "-l", "nylorun.dev/role=sandbox", "-c", "workload", "--tail", "100"], { check: false }).then((out) => out && console.error(out));
+      await stack.compose(["logs", "--tail", "150", "runtime", "gateway", "sandboxes"], { check: false }).then(console.error, () => {});
+      throw error;
+    } finally {
+      await docker(["rm", "--force", stubName]).catch(() => undefined);
+      await kubectl(["delete", "namespace", namespace, "--ignore-not-found", "--wait=false"], { check: false });
+    }
+  });
+  console.log(`\n[pods] passed in ${Math.round((Date.now() - started) / 1000)}s`);
+} catch (error) {
+  console.error(error);
+  process.exitCode = 1;
+}

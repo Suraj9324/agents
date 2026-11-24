@@ -1,0 +1,66 @@
+/**
+ * 426 precedes authentication and mutation.
+ */
+import { expect, it } from "vitest";
+import { TENANT_HEADER } from "@nylorun/core/compatibility";
+import { ProtocolRejectedResponseSchema } from "@nylorun/core/contracts";
+import {
+  countTenantRows,
+  getJson,
+  readTenantLog,
+  startSecurityHost,
+  untilTenantSettled,
+} from "./support.js";
+
+it("unsupported protocol returns 426 with no Tenant log or row mutation", async () => {
+  const host = await startSecurityHost({
+    sandboxBackend: "virtual",
+    model: { kind: "scripted", output: "ok" },
+  });
+  const a = host.tenant;
+  await untilTenantSettled(a);
+
+  const logBefore = readTenantLog(a);
+  const definitionsBefore = await countTenantRows(host, "definitions");
+  const sessionsBefore = await countTenantRows(host, "sessions");
+
+  const missing = await getJson(`${host.url}/v1/agents`, {
+    method: "PUT",
+    headers: {
+      [TENANT_HEADER]: a.id,
+      authorization: `Bearer ${a.applicationKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      requestId: "should-not-apply",
+      implementationVersion: "dev",
+      manifest: { id: "nope", name: "Nope", tools: [] },
+    }),
+  });
+  expect(missing.status).toBe(426);
+  expect(ProtocolRejectedResponseSchema.parse(missing.body).code).toBe(
+    "protocol_unsupported",
+  );
+
+  const wrong = await getJson(`${host.url}/v1/sessions/sess-proto`, {
+    method: "PUT",
+    headers: {
+      [TENANT_HEADER]: a.id,
+      "Nylorun-Protocol": "1",
+      authorization: `Bearer ${a.applicationKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      requestId: "should-not-create",
+      agentId: "nope",
+      ownerUserId: "user-1",
+    }),
+  });
+  expect(wrong.status).toBe(426);
+
+  expect(readTenantLog(a)).toBe(logBefore);
+  expect(await countTenantRows(host, "definitions")).toBe(
+    definitionsBefore,
+  );
+  expect(await countTenantRows(host, "sessions")).toBe(sessionsBefore);
+});

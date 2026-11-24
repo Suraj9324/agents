@@ -1,0 +1,339 @@
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { open } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  SKILL_ENTRY,
+  skillFilePathIssue,
+  type SkillFileSource,
+} from "@nylorun/core/define";
+import { ENVIRONMENT_NAME_PATTERN } from "@nylorun/core/contracts";
+import matter from "gray-matter";
+
+const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** Version control and operating system files, never part of a skill. */
+const SKIPPED_DIRECTORIES = new Set([".git", ".hg", ".svn", "node_modules"]);
+const SKIPPED_FILES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+/** Environment files hold secrets: never uploaded (`.env`, `.env.local`, …). */
+const isEnvFile = (name: string) => name === ".env" || name.startsWith(".env.");
+
+export interface SkillDiagnostic {
+  readonly severity: "info" | "warning";
+  readonly code: string;
+  readonly message: string;
+  readonly path?: string;
+}
+
+export class SkillsError extends Error {
+  readonly code: string;
+  readonly diagnostics: readonly SkillDiagnostic[];
+
+  constructor(
+    code: string,
+    message: string,
+    diagnostics: readonly SkillDiagnostic[] = []
+  ) {
+    super(message);
+    this.name = "SkillsError";
+    this.code = code;
+    this.diagnostics = diagnostics;
+  }
+}
+
+/** One skill read from its folder: what the manifest names, and where each file's bytes are. */
+export interface LoadedSkill {
+  readonly name: string;
+  readonly description: string;
+  /**
+   * The `runtime.secrets` slots its scripts read (`environment_secret` or `environment_variable`),
+   * from its SKILL.md's frontmatter `secrets`: sorted, each once.
+   */
+  readonly secrets?: readonly string[];
+  /** Only a person starts it: its SKILL.md's `disable-model-invocation: true`. */
+  readonly disableModelInvocation?: true;
+  /** Every file of the folder by its `/`-separated path, as `sha256:<hex>`. */
+  readonly files: Readonly<Record<string, string>>;
+  /** Each file's bytes, by `sha256:<hex>`, for the client to upload. */
+  readonly sources: Readonly<Record<string, SkillFileSource>>;
+}
+
+/** Resolve a skills catalog directory; throws when missing or not a directory. */
+export function resolveSkillsRoot(directory: string): string {
+  const resolved = resolve(directory);
+  if (!existsSync(resolved))
+    throw new SkillsError(
+      "skills.missing",
+      `Skills directory does not exist: ${directory}`
+    );
+  const real = realpathSync(resolved);
+  if (!statSync(real).isDirectory())
+    throw new SkillsError(
+      "skills.missing",
+      `Skills path is not a directory: ${directory}`
+    );
+  return real;
+}
+
+/**
+ * Load Agent Skills (agentskills.io) from a catalog directory.
+ * Each immediate subdirectory with a valid SKILL.md becomes one skill, with every file of its
+ * folder (text or binary) hashed. Throws `SkillsError` for a path a manifest cannot name. How
+ * much a skill may hold is the Tenant's limit (`/v1/tenant/skills`, default 2 GiB), which the
+ * Runtime checks when the files are uploaded and the agent is saved.
+ */
+export function loadSkillsFromDirectory(
+  directory: string,
+  diagnostics: SkillDiagnostic[],
+  options: { readonly boundary?: string; readonly codePrefix?: string } = {}
+): Readonly<Record<string, LoadedSkill>> {
+  const root = resolveSkillsRoot(directory);
+  const boundary = options.boundary ?? root;
+  const prefix = options.codePrefix ?? "skills";
+  const skills: Record<string, LoadedSkill> = {};
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    if (SKIPPED_DIRECTORIES.has(entry.name)) continue;
+    const skillDir = join(root, entry.name);
+    const directoryReal = realInside(boundary, skillDir);
+    if (!directoryReal) {
+      diagnostics.push({
+        severity: "warning",
+        code: `${prefix}.skill-skipped`,
+        message: `Skipped skill '${entry.name}' because its directory escapes the package`,
+        path: skillDir,
+      });
+      continue;
+    }
+    const skillFile = join(directoryReal, SKILL_ENTRY);
+    if (!existsSync(skillFile)) continue;
+    const skillReal = realInside(boundary, skillFile);
+    if (!skillReal || !statSync(skillReal).isFile()) {
+      diagnostics.push({
+        severity: "warning",
+        code: `${prefix}.skill-skipped`,
+        message: `Skipped skill '${entry.name}' because SKILL.md escapes the package`,
+        path: skillFile,
+      });
+      continue;
+    }
+    const parsed = readSkill(readFileSync(skillReal, "utf8"), entry.name);
+    if (typeof parsed === "string") {
+      diagnostics.push({
+        severity: "warning",
+        code: `${prefix}.skill-skipped`,
+        message: `Skipped skill '${entry.name}' because SKILL.md ${parsed}`,
+        path: skillFile,
+      });
+      continue;
+    }
+    if (skills[parsed.name]) {
+      diagnostics.push({
+        severity: "warning",
+        code: `${prefix}.skill-skipped`,
+        message: `Skipped duplicate skill '${parsed.name}'`,
+        path: skillFile,
+      });
+      continue;
+    }
+    if (parsed.secrets !== undefined)
+      diagnostics.push({
+        severity: "warning",
+        code: `${prefix}.skill-secrets`,
+        message: `Skill '${parsed.name}': secrets in SKILL.md is deprecated, since it is not an Agent Skills key: an agent folder lists a skill's secrets in AGENT.md's skills block, where nylorun migrate folder moves them. It is still read until a later release.`,
+        path: skillFile,
+      });
+    skills[parsed.name] = {
+      name: parsed.name,
+      description: parsed.description,
+      ...(parsed.secrets === undefined ? {} : { secrets: parsed.secrets }),
+      ...(parsed.disableModelInvocation ? { disableModelInvocation: true as const } : {}),
+      ...readFiles(`skill '${parsed.name}'`, boundary, directoryReal, diagnostics, prefix),
+    };
+  }
+  return skills;
+}
+
+/** A SKILL.md's frontmatter and instructions: `secrets` lists the secret slots its scripts read. */
+export interface ParsedSkill {
+  name: string;
+  description: string;
+  secrets?: string[];
+  /** Only a person starts it: `disable-model-invocation: true`. */
+  disableModelInvocation?: true;
+  instructions: string;
+}
+
+export function parseSkill(text: string, directoryName: string): ParsedSkill | undefined {
+  const parsed = readSkill(text, directoryName);
+  return typeof parsed === "string" ? undefined : parsed;
+}
+
+const INVALID_SKILL = "is not a valid Agent Skill";
+
+/** The skill a SKILL.md declares, or why it declares none. */
+function readSkill(text: string, directoryName: string): ParsedSkill | string {
+  let parsed: ReturnType<typeof matter>;
+  try {
+    parsed = matter(text);
+  } catch {
+    return INVALID_SKILL;
+  }
+  const name = asTrimmedString(parsed.data.name);
+  const description = asTrimmedString(parsed.data.description);
+  if (!name || !description || description.length > 1024) return INVALID_SKILL;
+  if (name.length > 64 || !SKILL_NAME.test(name) || name !== directoryName)
+    return INVALID_SKILL;
+  const secrets: unknown = parsed.data.secrets;
+  if (
+    secrets !== undefined &&
+    (!Array.isArray(secrets) ||
+      !secrets.every((item) => typeof item === "string" && ENVIRONMENT_NAME_PATTERN.test(item)))
+  )
+    return "has secrets that are not a list of environment variable names";
+  const personOnly: unknown = parsed.data["disable-model-invocation"];
+  if (personOnly !== undefined && typeof personOnly !== "boolean")
+    return "has a disable-model-invocation that is not true or false";
+  return {
+    name,
+    description,
+    ...(secrets === undefined || secrets.length === 0
+      ? {}
+      : { secrets: [...new Set(secrets as string[])].sort() }),
+    ...(personOnly === true ? { disableModelInvocation: true as const } : {}),
+    instructions: parsed.content.replace(/^\r?\n/, ""),
+  };
+}
+
+function asTrimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * Every file of `directory` (a runtime section's `files` entry with `from`), hashed as a skill's
+ * folder is: each by its `/`-separated path, with where to read its bytes. Version control, OS
+ * and `.env` files are left out; a symbolic link outside `boundary` (default the folder) is
+ * skipped with a diagnostic.
+ */
+export function hashFolder(
+  directory: string,
+  diagnostics: SkillDiagnostic[],
+  options: { readonly boundary?: string; readonly codePrefix?: string } = {}
+): Pick<LoadedSkill, "files" | "sources"> {
+  const root = resolveSkillsRoot(directory);
+  return readFiles(`folder ${directory}`, options.boundary ?? root, root, diagnostics, options.codePrefix ?? "files");
+}
+
+/** Every file of the folder, hashed, and where to read each one's bytes. */
+function readFiles(
+  label: string,
+  boundary: string,
+  directory: string,
+  diagnostics: SkillDiagnostic[],
+  prefix: string
+): Pick<LoadedSkill, "files" | "sources"> {
+  const files: Record<string, string> = {};
+  const sources: Record<string, SkillFileSource> = {};
+  const visited = new Set<string>();
+  // `at` is the folder's path in the skill: symbolic links inside the package are followed.
+  const walk = (current: string, at: string) => {
+    if (visited.has(current)) return;
+    visited.add(current);
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const full = join(current, entry.name);
+      const real = realInside(boundary, full);
+      if (!real) {
+        diagnostics.push({
+          severity: "warning",
+          code: `${prefix}.resource-denied`,
+          message: `Denied a file of ${label} outside the package: ${entry.name}`,
+          path: full,
+        });
+        continue;
+      }
+      const stats = statSync(real);
+      const path = at === "" ? entry.name : `${at}/${entry.name}`;
+      if (stats.isDirectory()) {
+        if (!SKIPPED_DIRECTORIES.has(entry.name)) walk(real, path);
+        continue;
+      }
+      if (!stats.isFile() || SKIPPED_FILES.has(entry.name) || isEnvFile(entry.name)) continue;
+      const issue = skillFilePathIssue(path);
+      if (issue)
+        throw new SkillsError(
+          `${prefix}.invalid-path`,
+          `${label[0]!.toUpperCase()}${label.slice(1)} has a file whose path ${issue}: ${path}`
+        );
+      const hash = hashFile(real);
+      files[path] = hash;
+      sources[hash] = { size: stats.size, read: () => readWhole(real, stats.size) };
+    }
+  };
+  walk(directory, "");
+  return { files: sorted(files), sources };
+}
+
+/** Read in chunks: neither the hash nor the read is bound by `readFile`'s 2 GiB limit. */
+const CHUNK_BYTES = 1024 * 1024;
+
+/** `sha256:<hex>` of the file at `path`, read a chunk at a time. */
+function hashFile(path: string): string {
+  const hash = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(CHUNK_BYTES);
+  const fd = openSync(path, "r");
+  try {
+    for (let read; (read = readSync(fd, chunk, 0, CHUNK_BYTES, null)) > 0; ) hash.update(chunk.subarray(0, read));
+  } finally {
+    closeSync(fd);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+/** The `size` bytes of the file at `path`. */
+async function readWhole(path: string, size: number): Promise<Uint8Array> {
+  const bytes = new Uint8Array(size);
+  const file = await open(path, "r");
+  try {
+    let at = 0;
+    while (at < size) {
+      const { bytesRead } = await file.read(bytes, at, Math.min(CHUNK_BYTES, size - at), at);
+      if (bytesRead === 0) break;
+      at += bytesRead;
+    }
+    if (at !== size) throw new Error(`${path} changed while it was read: ${at} of ${size} bytes`);
+  } finally {
+    await file.close();
+  }
+  return bytes;
+}
+
+function sorted(files: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(files).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  );
+}
+
+function realInside(root: string, candidate: string): string | undefined {
+  if (!existsSync(candidate)) return undefined;
+  try {
+    const real = realpathSync(candidate);
+    return isInside(root, real) ? real : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isInside(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return (
+    rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))
+  );
+}

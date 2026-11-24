@@ -1,0 +1,1277 @@
+/**
+ * The Studio server that runs in the `studio` container of a Tenant's Compose project:
+ * the dashboard and the trusted proxy on one origin, behind a cookie session.
+ *
+ * - Studio on this machine needs no sign-in (AP19): a request on the
+ *   published loopback address (`localhost` or `127.0.0.1` at the published
+ *   port) with no Studio session acts as if signed in, for the whole Tenant
+ *   and no subject. Only that address, which Compose publishes on loopback,
+ *   is served this way; an allowed host and an embedded Studio keep their
+ *   sign-in.
+ * - The CLI mints a single-use login token with the admin key
+ *   (`POST /_studio/login-tokens`) and opens `/login?token=…`, which sets an
+ *   `HttpOnly`, `SameSite=Strict` session cookie for `SESSION_TTL_MS`. The
+ *   cookie is signed with a key derived from the admin key, so it survives
+ *   Studio restarts and ends when the admin key changes (`nylorun local reset`).
+ * - An embedder mints a login token limited to one Tenant and one
+ *   subject, passes it to the framed dashboard, which exchanges it at
+ *   `POST /_studio/sessions` for a one-hour bearer session kept in memory. A
+ *   session limited to a Tenant reaches only that Tenant.
+ * - Every `/_studio/*` request needs a session (cookie, bearer, or the
+ *   loopback address's own), except the two that create one. The dashboard's
+ *   static files carry no data and are served without one; only
+ *   `frameAncestors` may frame them.
+ * - Behind a sign-in proxy (oauth2-proxy), a request with no Studio session
+ *   that carries a JWT (`X-Forwarded-Access-Token`, or an `Authorization`
+ *   bearer that is not a Studio session) signs in when the Runtime's
+ *   `GET /v1/me` verifies it and reports the `studio` scope: Studio sets its
+ *   usual cookie, recording the subject for the write log and ending no later
+ *   than the token. Studio never trusts a header it has not verified.
+ * - `Host` must be the published loopback address, `localhost` or
+ *   `127.0.0.1`, or one of `allowedHosts` (DNS rebinding); requests that
+ *   change state must carry the request's own `Origin`; no CORS headers.
+ * - Studio serves its installation's one Tenant, which it learns from the
+ *   Runtime's `GET /v1/tenant` with its own key: `/` redirects to
+ *   `/tenants/<id>`, and a route or login token naming another Tenant is
+ *   refused. Runtime calls use Studio's key (principal `studio`), derived
+ *   from the admin key in memory (`deriveStudioToken`). No key ever reaches
+ *   the browser.
+ * - Each sign-in is recorded on the Tenant's stream (`studio.signed_in`)
+ *   with Studio's key: a login token used (`token`, by `/login` or
+ *   `POST /_studio/sessions`), a forwarded token admitted (`forwarded`), and
+ *   the loopback address's own session when the dashboard says hello
+ *   (`loopback`, at most once an hour). It is sent in the background: a
+ *   Runtime that does not record it never holds up or refuses a sign-in.
+ *
+ * This module does not read the environment; `server-main.ts` does.
+ */
+import { readMetrics, type MetricsSource } from "./metrics.js";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import {
+  createServer,
+  maxHeaderSize,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import { deriveStudioToken } from "@nylorun/admin";
+import {
+  StudioLoginTokenRequestSchema,
+  StudioSessionRequestSchema,
+  type StudioLoginTokenResponse,
+  type StudioSessionResponse,
+} from "@nylorun/agents/studio-embed";
+import { PROTOCOL_HEADER, PROTOCOL_VERSION } from "@nylorun/agents";
+import { packagedWebRoot, serveDashboard } from "./static.js";
+import { CLIENT_HEADER, proxyRuntime } from "./proxy.js";
+import {
+  STUDIO_VERSION,
+  probeRuntimeCompatibility,
+  type RuntimeCompatibility,
+} from "./runtime-compat.js";
+
+/**
+ * The session cookie's default name. `nylorun` names it per Tenant
+ * (`nylorun_studio_<tenant>`): browsers share cookies across ports on one
+ * host, so two Studios on localhost would overwrite each other's session.
+ */
+export const DEFAULT_SESSION_COOKIE = "nylorun_studio_session";
+export const LOGIN_TOKEN_TTL_MS = 2 * 60 * 1000;
+/** How long a browser stays signed in: 30 days. */
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_VERSION = "v1";
+/** Sessions issued this far in the future (clock skew) are still accepted. */
+const SESSION_SKEW_MS = 60 * 1000;
+/** How long an embedded Studio's bearer session lasts: one hour. */
+export const EMBED_SESSION_TTL_MS = 60 * 60 * 1000;
+const EMBED_SESSION_VERSION = "v2";
+const EMBED_AUDIENCE = "studio";
+/** A cookie session that names its subject and expiry: forwarded sign-in. */
+const SUBJECT_SESSION_VERSION = "v3";
+const SUBJECT_SESSION_AUDIENCE = "studio-cookie";
+/** The scope a forwarded token must carry, as `GET /v1/me` reports it. */
+export const STUDIO_SCOPE = "studio";
+/** A forwarded token is read from a header, which Node refuses past `http.maxHeaderSize`, as the Runtime does. */
+const MAX_FORWARDED_TOKEN = maxHeaderSize;
+const FORWARDED_TOKEN_HEADER = "x-forwarded-access-token";
+const RUNTIME_TIMEOUT_MS = 10_000;
+/** The loopback address signs in on every request: its sign-in is recorded at most this often. */
+export const LOOPBACK_SIGN_IN_INTERVAL_MS = 60 * 60 * 1000;
+/** The longest subject `studio.signed_in` names; a longer one is left out. */
+const SIGN_IN_SUBJECT_MAX = 200;
+
+export type StudioServerOptions = Readonly<{
+  /** Runtime base URL, e.g. `http://runtime:4000`. Non-loopback is allowed. */
+  runtimeUrl: string;
+  /** The Host's admin key. Kept in memory; never sent to the browser. */
+  adminKey: string;
+  /** Listen port. Default 3000; 0 picks a free port. */
+  port?: number;
+  /** Listen address. Default `127.0.0.1`; the container passes `0.0.0.0`. */
+  host?: string;
+  /** Port the browser uses (Docker's published port). Default: the bound port. */
+  publicPort?: number;
+  /**
+   * Extra `Host` values Studio serves, such as `studio.acme.dev` behind a
+   * sign-in proxy (`NYLORUN_STUDIO_ALLOWED_HOSTS`, validated with
+   * `parseAllowedHosts`). Default: none, only the published loopback address.
+   */
+  allowedHosts?: readonly string[];
+  /**
+   * The session cookie's name (`NYLORUN_STUDIO_SESSION_COOKIE`, validated with
+   * `parseSessionCookieName`). Default `DEFAULT_SESSION_COOKIE`.
+   */
+  sessionCookie?: string;
+  /** Built dashboard directory. Default: `dist/web` beside this module. */
+  webRoot?: string;
+  /**
+   * Exact origins that may frame the dashboard (`NYLORUN_STUDIO_FRAME_ANCESTORS`,
+   * validated with `parseFrameAncestors`). Default: none.
+   */
+  frameAncestors?: readonly string[];
+  /**
+   * The Google Analytics measurement id the dashboard reports page views to
+   * (`NYLORUN_STUDIO_ANALYTICS_ID`, validated with `parseAnalyticsId`). `nylorun start`
+   * sets it unless the developer opted out. Default: none, and the dashboard
+   * loads no analytics.
+   */
+  analyticsId?: string;
+  /**
+   * The largest file a message attachment uploads through the proxy (`POST /v1/artifacts`).
+   * Default: none of Studio's own; the Runtime holds it to the Tenant's artifact limits.
+   */
+  maxUploadBytes?: number;
+  /**
+   * The Runtime's `/metrics` sources Tenant › Traffic reads live (`NYLORUN_STUDIO_METRICS_URLS`,
+   * validated with `parseMetricsSources`): the runtime's and the gateway's. Default: none, and
+   * Traffic says where to turn it on. Studio stores none of it.
+   */
+  metricsSources?: readonly MetricsSource[];
+  /** Where Studio logs state changes made by an embedded session. Default: stdout. */
+  log?: (entry: Readonly<Record<string, unknown>>) => void;
+  /** Clock for login-token and session expiry (tests). */
+  now?: () => number;
+}>;
+
+export type StudioServer = Readonly<{
+  port: number;
+  publicPort: number;
+  /** `http://localhost:<publicPort>` */
+  url: string;
+  close(): Promise<void>;
+}>;
+
+/** The installation's one Tenant, as `/_studio/hello` reports it. */
+export type StudioTenantSummary = Readonly<{
+  /** Null until Studio has read it: the Runtime is unreachable, or has not opened its Tenant. */
+  id: string | null;
+  name: string | null;
+  state: "open" | "unavailable";
+  /** Why it is unavailable and how to repair it. */
+  message?: string;
+}>;
+
+export type StudioServerHello = Readonly<{
+  version: string;
+  runtime: RuntimeCompatibility;
+  tenant: StudioTenantSummary;
+}>;
+
+const SAFE_METHODS = new Set(["GET", "HEAD"]);
+const MAX_JSON_BODY = 4096;
+const TENANT_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const TENANT_RUNTIME = /^\/_studio\/tenants\/([^/]+)\/runtime(\/.*)$/;
+/** Tenant › Traffic's read of the Runtime's own metrics. */
+const TENANT_METRICS = /^\/_studio\/tenants\/([^/]+)\/metrics$/;
+
+const ANALYTICS_ID = /^G-[A-Z0-9]{4,20}$/;
+
+/** Validates `NYLORUN_STUDIO_ANALYTICS_ID`: empty (none) or a Google Analytics 4 measurement id. */
+export function parseAnalyticsId(value: string): string | undefined {
+  const id = value.trim();
+  if (id === "") return undefined;
+  if (!ANALYTICS_ID.test(id))
+    throw new Error(`${id} is not a Google Analytics measurement id (G-XXXXXXXXXX).`);
+  return id;
+}
+
+const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+const ALLOWED_HOST = new RegExp(
+  `^(?:${LABEL}(?:\\.${LABEL})*|\\[[0-9a-f:.]+\\])(?::[0-9]{1,5})?$`,
+  "u",
+);
+
+/**
+ * Validates `NYLORUN_STUDIO_ALLOWED_HOSTS`: empty (none) or `Host` values
+ * separated by commas, each a host name or address with an optional port
+ * (`studio.acme.dev`, `studio.acme.dev:8443`). No scheme, path or wildcard.
+ */
+export function parseAllowedHosts(value: string): string[] {
+  const hosts: string[] = [];
+  for (const part of value.split(",")) {
+    const host = part.trim().toLowerCase();
+    if (host === "") continue;
+    const port = /:([0-9]+)$/u.exec(host)?.[1];
+    if (!ALLOWED_HOST.test(host) || (port !== undefined && Number(port) > 65535))
+      throw new Error(
+        `${host} is not a Host value: use a host name with an optional port, such as studio.acme.dev or studio.acme.dev:8443.`,
+      );
+    if (!hosts.includes(host)) hosts.push(host);
+  }
+  return hosts;
+}
+
+const COOKIE_NAME = /^[A-Za-z0-9_-]+$/;
+
+/** Validates `NYLORUN_STUDIO_SESSION_COOKIE`: empty (the default) or a cookie token of `[A-Za-z0-9_-]`. */
+export function parseSessionCookieName(value: string): string {
+  const name = value.trim();
+  if (name === "") return DEFAULT_SESSION_COOKIE;
+  if (!COOKIE_NAME.test(name))
+    throw new Error(`${name} is not a cookie name: use letters, digits, _ and -.`);
+  return name;
+}
+
+/** Validates `NYLORUN_RUNTIME_URL`: absolute http(s), no credentials, query or fragment. */
+export function parseRuntimeUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("NYLORUN_RUNTIME_URL must be an absolute http(s) URL.");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:")
+    throw new Error("NYLORUN_RUNTIME_URL must use http or https.");
+  if (url.username !== "" || url.password !== "")
+    throw new Error("NYLORUN_RUNTIME_URL must not contain credentials.");
+  if (url.search !== "" || url.hash !== "")
+    throw new Error(
+      "NYLORUN_RUNTIME_URL must not contain a query string or fragment.",
+    );
+  return url.href.replace(/\/$/u, "");
+}
+
+/** Reads `{ adminKey }` from a `host-credentials.json` file. */
+export function readAdminKeyFile(path: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Cannot read the admin key file ${path}: ${detail}`);
+  }
+  const adminKey =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as { adminKey?: unknown }).adminKey
+      : undefined;
+  if (typeof adminKey !== "string" || adminKey.trim() === "")
+    throw new Error(`The admin key file ${path} has no adminKey.`);
+  return adminKey.trim();
+}
+
+/**
+ * Where `/login` sends the browser: a same-origin path such as
+ * `/tenants/<id>`, or `/`.
+ */
+export function safeNextPath(next: string | null): string {
+  if (next === null || !/^\/(?![/\\])[^\\\s]*$/u.test(next)) return "/";
+  const base = "http://studio.invalid";
+  let resolved: URL;
+  try {
+    resolved = new URL(next, base);
+  } catch {
+    return "/";
+  }
+  if (resolved.origin !== base) return "/";
+  if (
+    resolved.pathname === "/login" ||
+    resolved.pathname.startsWith("/_studio/")
+  )
+    return "/";
+  return resolved.pathname + resolved.search;
+}
+
+function digest(value: string): Buffer {
+  return createHash("sha256").update(value, "utf8").digest();
+}
+
+/** The key that signs session cookies, derived from the admin key. */
+function sessionKey(adminKey: string): Buffer {
+  return createHmac("sha256", adminKey).update("nylorun/studio-session/v1", "utf8").digest();
+}
+
+function sign(key: Buffer, payload: string): string {
+  return createHmac("sha256", key).update(payload, "utf8").digest("base64url");
+}
+
+/** A session cookie value: `v1.<issued ms>.<nonce>.<signature>`. */
+function issueSession(key: Buffer, issuedAt: number): string {
+  const payload = `${SESSION_VERSION}.${issuedAt}.${randomBytes(16).toString("base64url")}`;
+  return `${payload}.${sign(key, payload)}`;
+}
+
+/** Who a request acts as: the whole Host (cookie, or a Host-wide token) or one Tenant. */
+type StudioSession = Readonly<{
+  kind: "cookie" | "bearer";
+  tenant: string | null;
+  subject: string | null;
+}>;
+
+type EmbedClaims = Readonly<{
+  aud: string;
+  tenant: string | null;
+  sub: string | null;
+  iat: number;
+  exp: number;
+}>;
+
+/** A signed claims token: `<version>.<base64url(claims)>.<signature>`. */
+function issueClaims(key: Buffer, version: string, claims: object): string {
+  const payload = `${version}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}`;
+  return `${payload}.${sign(key, payload)}`;
+}
+
+/** The claims object of a `version` token whose signature `key` made, unchecked otherwise. */
+function verifiedClaims(
+  key: Buffer,
+  version: string,
+  value: string,
+): Record<string, unknown> | undefined {
+  const parts = value.split(".");
+  if (parts.length !== 3 || parts[0] !== version) return undefined;
+  const expected = Buffer.from(sign(key, `${parts[0]}.${parts[1]}`));
+  const provided = Buffer.from(parts[2]!);
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected))
+    return undefined;
+  const claims = base64urlJson(parts[1]!);
+  return claims && typeof claims === "object" ? (claims as Record<string, unknown>) : undefined;
+}
+
+/** A bearer session: `v2.<base64url(claims)>.<signature>`. */
+function issueEmbedSession(key: Buffer, claims: EmbedClaims): string {
+  return issueClaims(key, EMBED_SESSION_VERSION, claims);
+}
+
+function embedSession(key: Buffer, value: string, at: number): EmbedClaims | undefined {
+  const claims = verifiedClaims(key, EMBED_SESSION_VERSION, value);
+  if (!claims) return undefined;
+  const { aud, tenant, sub, iat, exp } = claims;
+  if (aud !== EMBED_AUDIENCE) return undefined;
+  if (tenant !== null && (typeof tenant !== "string" || !TENANT_ID.test(tenant)))
+    return undefined;
+  if (sub !== null && typeof sub !== "string") return undefined;
+  if (typeof iat !== "number" || typeof exp !== "number") return undefined;
+  if (iat > at + SESSION_SKEW_MS || exp <= at) return undefined;
+  if (exp - iat > EMBED_SESSION_TTL_MS) return undefined;
+  return { aud, tenant, sub, iat, exp };
+}
+
+function validSession(key: Buffer, value: string, at: number): boolean {
+  const parts = value.split(".");
+  if (parts.length !== 4 || parts[0] !== SESSION_VERSION) return false;
+  const expected = Buffer.from(sign(key, parts.slice(0, 3).join(".")));
+  const provided = Buffer.from(parts[3]!);
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected))
+    return false;
+  if (!/^\d{1,16}$/u.test(parts[1]!)) return false;
+  const issuedAt = Number(parts[1]);
+  return issuedAt <= at + SESSION_SKEW_MS && at - issuedAt < SESSION_TTL_MS;
+}
+
+type SubjectClaims = Readonly<{ aud: string; sub: string | null; iat: number; exp: number }>;
+
+/** A cookie session from forwarded sign-in: `v3.<base64url(claims)>.<signature>`. */
+function issueSubjectSession(key: Buffer, claims: SubjectClaims): string {
+  return issueClaims(key, SUBJECT_SESSION_VERSION, claims);
+}
+
+function subjectSession(key: Buffer, value: string, at: number): SubjectClaims | undefined {
+  const claims = verifiedClaims(key, SUBJECT_SESSION_VERSION, value);
+  if (!claims) return undefined;
+  const { aud, sub, iat, exp } = claims;
+  if (aud !== SUBJECT_SESSION_AUDIENCE) return undefined;
+  if (sub !== null && typeof sub !== "string") return undefined;
+  if (typeof iat !== "number" || typeof exp !== "number") return undefined;
+  if (iat > at + SESSION_SKEW_MS || exp <= at || exp - iat > SESSION_TTL_MS) return undefined;
+  return { aud, sub, iat, exp };
+}
+
+function base64urlJson(segment: string): unknown {
+  try {
+    return JSON.parse(Buffer.from(segment, "base64url").toString("utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a value has a JWT's shape: three base64url segments and a JSON
+ * header naming an `alg`. Shape only; the Runtime verifies it.
+ */
+function looksLikeJwt(value: string): boolean {
+  if (value.length > MAX_FORWARDED_TOKEN) return false;
+  if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(value)) return false;
+  const header = base64urlJson(value.slice(0, value.indexOf(".")));
+  return (
+    header !== null &&
+    typeof header === "object" &&
+    typeof (header as { alg?: unknown }).alg === "string"
+  );
+}
+
+/** A verified JWT's `exp` in ms, read after the Runtime accepted it; undefined when absent. */
+function jwtExpiry(token: string): number | undefined {
+  const payload = base64urlJson(token.split(".")[1] ?? "");
+  const exp =
+    payload !== null && typeof payload === "object"
+      ? (payload as { exp?: unknown }).exp
+      : undefined;
+  return typeof exp === "number" && Number.isFinite(exp) ? exp * 1000 : undefined;
+}
+
+/** A response body's `message`, when it is JSON that has one. */
+async function runtimeMessage(reply: Response): Promise<string | undefined> {
+  try {
+    const body = (await reply.json()) as { message?: unknown };
+    return typeof body?.message === "string" ? body.message : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function forwardedHeader(request: IncomingMessage): string | undefined {
+  const value = request.headers[FORWARDED_TOKEN_HEADER];
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+function bearer(request: IncomingMessage): string | undefined {
+  const header = request.headers.authorization;
+  if (typeof header !== "string" || !header.startsWith("Bearer "))
+    return undefined;
+  return header.slice("Bearer ".length);
+}
+
+function cookieValues(request: IncomingMessage, name: string): string[] {
+  const header = request.headers.cookie;
+  if (typeof header !== "string") return [];
+  const values: string[] = [];
+  for (const part of header.split(";")) {
+    const index = part.indexOf("=");
+    if (index < 0) continue;
+    if (part.slice(0, index).trim() === name)
+      values.push(part.slice(index + 1).trim());
+  }
+  return values;
+}
+
+function hostPort(host: string): string | undefined {
+  const index = host.lastIndexOf(":");
+  if (index < 0 || host.endsWith("]")) return undefined;
+  return host.slice(index + 1);
+}
+
+function json(
+  response: ServerResponse,
+  status: number,
+  value: unknown,
+  method = "GET",
+): void {
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  response.end(method === "HEAD" ? undefined : `${JSON.stringify(value)}\n`);
+}
+
+function fail(response: ServerResponse, status: number, message: string): void {
+  json(response, status, { message });
+}
+
+const INVALID_BODY = Symbol("invalid body");
+
+/**
+ * A JSON body when the request declares one: undefined for no body or a
+ * non-JSON content type, `INVALID_BODY` for malformed or oversized JSON.
+ */
+async function readOptionalJson(
+  request: IncomingMessage,
+): Promise<unknown | typeof INVALID_BODY> {
+  const type = request.headers["content-type"] ?? "";
+  if (!/^application\/json(;|$)/iu.test(type)) {
+    request.resume();
+    return undefined;
+  }
+  let size = 0;
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_JSON_BODY) return INVALID_BODY;
+    chunks.push(chunk as Buffer);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (text.trim() === "") return undefined;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return INVALID_BODY;
+  }
+}
+
+function page(
+  response: ServerResponse,
+  status: number,
+  title: string,
+  message: string,
+  method = "GET",
+): void {
+  response.writeHead(status, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "content-security-policy":
+      "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+  });
+  response.end(
+    method === "HEAD"
+      ? undefined
+      : `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Nylorun Studio</title>
+<style>body{font:16px system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem;color:#18181b}code{background:#f4f4f5;padding:.1rem .3rem;border-radius:.25rem}</style>
+</head>
+<body><h1>${title}</h1><p>${message}</p></body>
+</html>
+`,
+  );
+}
+
+const SIGN_IN =
+  "Run <code>npx nylorun studio</code> in a terminal. It opens Studio in your browser, signed in for 30 days.";
+/** The published loopback address needs no sign-in (AP19). */
+const LOCAL_SIGN_IN = 'Studio on this machine needs no sign-in: <a href="/">open Studio</a>.';
+
+const STATUS_HINT = "Run npx nylorun status to see why.";
+
+/** A session on the published loopback address with no other (AP19): the whole Tenant, no subject. */
+const LOCAL_SESSION: StudioSession = Object.freeze({
+  kind: "cookie",
+  tenant: null,
+  subject: null,
+});
+
+/** Starts the Studio server. The container entry is `server-main.ts`. */
+/** `frame-ancestors` sources for the allowlist; `'none'` when it is empty. */
+function frameAncestorSources(origins: readonly string[]): string {
+  return origins.length === 0 ? "'none'" : origins.join(" ");
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+/**
+ * Adds the frame allowlist to `index.html`, so the embed bridge knows its
+ * parents, and the analytics measurement id when there is one.
+ */
+function injectIndexMeta(
+  html: string,
+  origins: readonly string[],
+  analyticsId: string | undefined,
+): string {
+  let meta = `<meta name="nylorun-frame-ancestors" content="${escapeHtml(origins.join(" "))}">`;
+  if (analyticsId !== undefined)
+    meta += `<meta name="nylorun-analytics" content="${escapeHtml(analyticsId)}">`;
+  return html.includes("</head>")
+    ? html.replace("</head>", `${meta}</head>`)
+    : `${meta}${html}`;
+}
+
+export async function startStudioServer(
+  options: StudioServerOptions,
+): Promise<StudioServer> {
+  const runtimeUrl = parseRuntimeUrl(options.runtimeUrl);
+  const adminKey = options.adminKey;
+  if (typeof adminKey !== "string" || adminKey === "")
+    throw new Error("Studio requires the admin key.");
+  const adminKeyDigest = digest(adminKey);
+  const signingKey = sessionKey(adminKey);
+  const webRoot = options.webRoot ?? packagedWebRoot();
+  const now = options.now ?? Date.now;
+  /** Studio's key (principal `studio`), derived from the admin key; in memory only. */
+  const studioKey = deriveStudioToken(adminKey);
+  const frameAncestors = [...(options.frameAncestors ?? [])];
+  const analyticsId = parseAnalyticsId(options.analyticsId ?? "");
+  const sessionCookie = parseSessionCookieName(options.sessionCookie ?? "");
+  const allowedHosts: ReadonlySet<string> = new Set(
+    parseAllowedHosts((options.allowedHosts ?? []).join(",")),
+  );
+  const dashboard = {
+    frameAncestors: frameAncestorSources(frameAncestors),
+    transformIndex: (html: string) => injectIndexMeta(html, frameAncestors, analyticsId),
+  };
+  const log =
+    options.log ??
+    ((entry: Readonly<Record<string, unknown>>) =>
+      console.log(JSON.stringify(entry)));
+
+  /** Login token → expiry (ms) and what it is limited to. Single use. */
+  const loginTokens = new Map<
+    string,
+    Readonly<{ expiresAt: number; tenant: string | null; subject: string | null }>
+  >();
+  /**
+   * The Host's Tenant id, once Studio has read it: an installation's Tenant
+   * keeps its id. A failure to read it is not remembered, so a later request
+   * asks the Runtime again.
+   */
+  let knownTenantId: string | undefined;
+  /** When the loopback address's sign-in was last recorded. */
+  let loopbackRecordedAt = -Infinity;
+
+  /**
+   * Records a sign-in on the Tenant's stream with Studio's key, in the
+   * background: a failure is logged, and never blocks or refuses the sign-in.
+   */
+  const recordSignIn = (method: "loopback" | "token" | "forwarded", subject: string | null): void => {
+    const named = subject !== null && subject.length <= SIGN_IN_SUBJECT_MAX ? { subject } : {};
+    void fetch(`${runtimeUrl}/v1/tenant/audit/studio-sign-in`, {
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(RUNTIME_TIMEOUT_MS),
+      headers: {
+        authorization: `Bearer ${studioKey}`,
+        [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
+        [CLIENT_HEADER]: "studio",
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({ method, ...named }),
+    })
+      .then(async (reply) => {
+        await reply.body?.cancel().catch(() => {});
+        if (!reply.ok) log({ msg: "studio sign-in not recorded", method, status: reply.status });
+      })
+      .catch(() => log({ msg: "studio sign-in not recorded", method, status: null }));
+  };
+
+  let boundPort = 0;
+  let publicPort = 0;
+  let publicHosts: ReadonlySet<string> = new Set();
+
+  /**
+   * The Host's one Tenant, read from the Runtime's `GET /v1/tenant` with
+   * Studio's key. The Runtime answers the opaque 404 while its Tenant is not
+   * open, so the cause is `nylorun status`'s to report.
+   */
+  const hostTenant = async (): Promise<StudioTenantSummary> => {
+    const unavailable = (message: string): StudioTenantSummary => ({
+      id: knownTenantId ?? null,
+      name: null,
+      state: "unavailable",
+      message,
+    });
+    let reply: Response;
+    try {
+      reply = await fetch(`${runtimeUrl}/v1/tenant`, {
+        redirect: "error",
+        signal: AbortSignal.timeout(RUNTIME_TIMEOUT_MS),
+        headers: {
+          authorization: `Bearer ${studioKey}`,
+          [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
+          [CLIENT_HEADER]: "studio",
+          accept: "application/json",
+        },
+      });
+    } catch {
+      return unavailable(`Studio cannot reach the Runtime. ${STATUS_HINT}`);
+    }
+    let body: unknown;
+    try {
+      body = reply.ok ? await reply.json() : undefined;
+    } catch {
+      body = undefined;
+    }
+    const tenant = (body as { tenant?: { id?: unknown; name?: unknown } } | undefined)?.tenant;
+    if (typeof tenant?.id !== "string" || !TENANT_ID.test(tenant.id))
+      return unavailable(
+        `The Runtime did not open its Tenant to Studio (HTTP ${reply.status}). ${STATUS_HINT}`,
+      );
+    knownTenantId = tenant.id;
+    return {
+      id: tenant.id,
+      name: typeof tenant.name === "string" ? tenant.name : null,
+      state: "open",
+    };
+  };
+
+  /** The Tenant id routes and login tokens must name: remembered, or read now. */
+  const tenantIdOrCause = async (): Promise<
+    Readonly<{ id: string } | { id: null; message: string }>
+  > => {
+    if (knownTenantId !== undefined) return { id: knownTenantId };
+    const tenant = await hostTenant();
+    return tenant.id !== null
+      ? { id: tenant.id }
+      : { id: null, message: tenant.message ?? "The Tenant is unavailable." };
+  };
+
+  /**
+   * `GET /`: the dashboard of the installation's one Tenant. Like the
+   * dashboard's files it needs no session; the Tenant id is not a secret.
+   */
+  const redirectToTenant = async (
+    url: URL,
+    response: ServerResponse,
+    method: string,
+  ): Promise<void> => {
+    const tenant = await hostTenant();
+    if (tenant.state !== "open" || tenant.id === null) {
+      page(
+        response,
+        503,
+        "Tenant unavailable",
+        `${escapeHtml(tenant.message ?? "The Tenant is unavailable.")} Reload this page to try again.`,
+        method,
+      );
+      return;
+    }
+    // Framed like the dashboard it leads to.
+    response.removeHeader("x-frame-options");
+    response.writeHead(302, {
+      location: `/tenants/${encodeURIComponent(tenant.id)}${url.search}`,
+      "cache-control": "no-store",
+      "content-security-policy": `frame-ancestors ${dashboard.frameAncestors}`,
+    });
+    response.end();
+  };
+
+  /**
+   * The request's session, `refused` for a bearer Studio must not look past.
+   * A bearer is checked first and never falls back to the cookie: a framed
+   * Studio with a bad token must not act Host-wide. The exception is a JWT,
+   * which is not a Studio credential but a sign-in proxy's forwarded token: the
+   * cookie it signed in serves, or forwarded sign-in verifies the token.
+   * Another `Authorization` scheme (oauth2-proxy's Basic) is not Studio's and
+   * is ignored.
+   */
+  const sessionOf = (request: IncomingMessage): StudioSession | "refused" | undefined => {
+    const at = now();
+    const token = bearer(request);
+    if (token !== undefined) {
+      const claims = embedSession(signingKey, token, at);
+      if (claims) return { kind: "bearer", tenant: claims.tenant, subject: claims.sub };
+      if (!looksLikeJwt(token)) return "refused";
+    }
+    let session: StudioSession | undefined;
+    for (const value of cookieValues(request, sessionCookie)) {
+      const claims = subjectSession(signingKey, value, at);
+      if (claims) return { kind: "cookie", tenant: null, subject: claims.sub };
+      if (validSession(signingKey, value, at))
+        session = { kind: "cookie", tenant: null, subject: null };
+    }
+    return session;
+  };
+
+  /**
+   * Forwarded sign-in: the Runtime's `GET /v1/me` verifies the token (Studio
+   * never trusts it unverified), and a token with the `studio` scope becomes a
+   * cookie session for its subject, ending no later than the token. Nothing
+   * else is kept. Undefined when the token is refused; the reply is sent.
+   */
+  const forwardedSignIn = async (
+    token: string,
+    response: ServerResponse,
+    secure: boolean,
+  ): Promise<StudioSession | undefined> => {
+    if (!looksLikeJwt(token)) {
+      fail(
+        response,
+        401,
+        "The forwarded access token is not a JWT. Studio admits only tokens from an issuer in the Runtime's identity file.",
+      );
+      return undefined;
+    }
+    let reply: Response;
+    try {
+      reply = await fetch(`${runtimeUrl}/v1/me`, {
+        redirect: "error",
+        signal: AbortSignal.timeout(RUNTIME_TIMEOUT_MS),
+        headers: {
+          authorization: `Bearer ${token}`,
+          [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
+          [CLIENT_HEADER]: "studio",
+          accept: "application/json",
+        },
+      });
+    } catch {
+      fail(response, 502, "Studio cannot reach the Runtime to check the forwarded token.");
+      return undefined;
+    }
+    if (reply.status === 401 || reply.status === 403 || reply.status === 404) {
+      const detail = await runtimeMessage(reply);
+      const status = reply.status === 403 ? 403 : 401;
+      if (status === 401) response.setHeader("www-authenticate", 'Bearer error="invalid_token"');
+      fail(
+        response,
+        status,
+        `The Runtime refused the forwarded token${detail ? `: ${detail}` : ""}. Studio admits only valid tokens from an issuer in the Runtime's identity file.`,
+      );
+      return undefined;
+    }
+    let me: unknown;
+    try {
+      me = reply.ok ? await reply.json() : undefined;
+    } catch {
+      me = undefined;
+    }
+    if (me === null || typeof me !== "object") {
+      fail(response, 502, `The Runtime could not check the forwarded token (HTTP ${reply.status}).`);
+      return undefined;
+    }
+    const { scopes, subject } = me as { scopes?: unknown; subject?: unknown };
+    if (!Array.isArray(scopes) || !scopes.includes(STUDIO_SCOPE)) {
+      fail(
+        response,
+        403,
+        `This token does not carry the ${STUDIO_SCOPE} scope. Studio admits people whose token has it: add ${STUDIO_SCOPE} to the issuer's allowedScopes in the Runtime's identity file, and to the token's scopes.`,
+      );
+      return undefined;
+    }
+    const at = now();
+    const sub = typeof subject === "string" ? subject : null;
+    // The token's own expiry, read once the Runtime has verified its signature;
+    // without one, the usual cookie lifetime.
+    const exp = Math.min(at + SESSION_TTL_MS, jwtExpiry(token) ?? Infinity);
+    const value = issueSubjectSession(signingKey, {
+      aud: SUBJECT_SESSION_AUDIENCE,
+      sub,
+      iat: at,
+      exp,
+    });
+    const maxAge = Math.max(1, Math.ceil((exp - at) / 1000));
+    response.setHeader("set-cookie", sessionCookieHeader(value, maxAge, secure));
+    recordSignIn("forwarded", sub);
+    return { kind: "cookie", tenant: null, subject: sub };
+  };
+
+  const sessionCookieHeader = (value: string, maxAge: number, secure: boolean): string =>
+    `${sessionCookie}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
+
+  /** Takes a login token out of the map: single use, even when it has expired. */
+  const takeLoginToken = (token: string) => {
+    const entry = loginTokens.get(token);
+    loginTokens.delete(token);
+    return entry !== undefined && entry.expiresAt > now() ? entry : undefined;
+  };
+
+  /** `origin` is the request's own, which passed the Host check: the login URL opens there. */
+  const mintLoginToken = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    origin: string,
+  ): Promise<void> => {
+    const provided = bearer(request);
+    if (
+      provided === undefined ||
+      !timingSafeEqual(digest(provided), adminKeyDigest)
+    ) {
+      request.resume();
+      response.setHeader("www-authenticate", "Bearer");
+      fail(response, 401, "The admin key is required to mint a login token.");
+      return;
+    }
+    // No body, or a body that is not JSON, is the CLI's Host-wide token.
+    const body = await readOptionalJson(request);
+    if (body === INVALID_BODY)
+      return fail(response, 400, "Send a JSON object no larger than 4 KiB.");
+    const parsed = StudioLoginTokenRequestSchema.safeParse(body ?? {});
+    if (!parsed.success)
+      return fail(
+        response,
+        400,
+        `Send JSON { "tenant"?: "<Tenant id>", "subject"?: "<1–200 visible ASCII characters>" }: ${parsed.error.issues[0]?.message ?? "invalid"}.`,
+      );
+    const tenant = parsed.data.tenant ?? null;
+    // The embed contract keeps the `tenant` claim; it must name this
+    // installation's Tenant.
+    if (tenant !== null) {
+      const host = await tenantIdOrCause();
+      if (host.id === null)
+        return fail(
+          response,
+          503,
+          `Studio cannot read this installation's Tenant: ${host.message}`,
+        );
+      if (tenant !== host.id)
+        return fail(
+          response,
+          404,
+          `Unknown Tenant: this Studio serves only Tenant ${host.id}.`,
+        );
+    }
+    const at = now();
+    for (const [token, entry] of loginTokens)
+      if (entry.expiresAt <= at) loginTokens.delete(token);
+    const token = randomBytes(32).toString("base64url");
+    const expiresAt = at + LOGIN_TOKEN_TTL_MS;
+    const subject = parsed.data.subject ?? null;
+    loginTokens.set(token, { expiresAt, tenant, subject });
+    const reply: StudioLoginTokenResponse = {
+      token,
+      url: `${origin}/login?token=${token}`,
+      expiresAt: new Date(expiresAt).toISOString(),
+      tenant,
+      subject,
+    };
+    json(response, 201, reply);
+  };
+
+  /** `POST /_studio/sessions`: a login token becomes a bearer session. */
+  const createSession = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> => {
+    const body = await readOptionalJson(request);
+    const parsed = StudioSessionRequestSchema.safeParse(
+      body === INVALID_BODY ? undefined : body,
+    );
+    if (!parsed.success)
+      return fail(response, 400, 'Send JSON { "token": "<login token>" }.');
+    const entry = takeLoginToken(parsed.data.token);
+    if (entry === undefined)
+      return json(response, 401, {
+        code: "token_invalid",
+        message: "This login token is invalid, expired or already used.",
+      });
+    const at = now();
+    const exp = at + EMBED_SESSION_TTL_MS;
+    const reply: StudioSessionResponse = {
+      sessionToken: issueEmbedSession(signingKey, {
+        aud: EMBED_AUDIENCE,
+        tenant: entry.tenant,
+        sub: entry.subject,
+        iat: at,
+        exp,
+      }),
+      tenant: entry.tenant,
+      subject: entry.subject,
+      expiresAt: new Date(exp).toISOString(),
+    };
+    recordSignIn("token", entry.subject);
+    json(response, 201, reply);
+  };
+
+  const login = (url: URL, response: ServerResponse, secure: boolean, proxied: boolean): void => {
+    const entry = takeLoginToken(url.searchParams.get("token") ?? "");
+    const at = now();
+    // A token limited to a Tenant never becomes a Host-wide cookie.
+    if (entry === undefined || entry.tenant !== null) {
+      page(
+        response,
+        401,
+        "Login link expired",
+        `This login link is invalid, expired or already used. ${proxied ? SIGN_IN : LOCAL_SIGN_IN}`,
+      );
+      return;
+    }
+    const session = issueSession(signingKey, at);
+    recordSignIn("token", entry.subject);
+    response.writeHead(303, {
+      location: safeNextPath(url.searchParams.get("next")),
+      "set-cookie": sessionCookieHeader(session, SESSION_TTL_MS / 1000, secure),
+      "cache-control": "no-store",
+    });
+    response.end();
+  };
+
+  const handle = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> => {
+    response.setHeader("x-content-type-options", "nosniff");
+    response.setHeader("x-frame-options", "DENY");
+    response.setHeader("referrer-policy", "no-referrer");
+    response.setHeader("cross-origin-resource-policy", "same-origin");
+    const method = (request.method ?? "GET").toUpperCase();
+    const host = (request.headers.host ?? "").toLowerCase();
+    const url = new URL(request.url ?? "/", "http://studio.invalid");
+    const pathname = url.pathname;
+
+    if (pathname === "/healthz") {
+      // Container-internal names (compose service, container id) reach the
+      // listen port; `/healthz` carries no data and sets no cookie.
+      if (!publicHosts.has(host) && hostPort(host) !== String(boundPort)) {
+        request.resume();
+        return fail(response, 421, "Studio does not serve this Host.");
+      }
+      request.resume();
+      if (!SAFE_METHODS.has(method))
+        return fail(response, 405, "Method not allowed");
+      return json(response, 200, { status: "ok" }, method);
+    }
+
+    if (!publicHosts.has(host)) {
+      request.resume();
+      return fail(
+        response,
+        421,
+        allowedHosts.size === 0
+          ? `Studio only serves http://localhost:${publicPort} and http://127.0.0.1:${publicPort}.`
+          : `Studio only serves http://localhost:${publicPort}, http://127.0.0.1:${publicPort} and the hosts in NYLORUN_STUDIO_ALLOWED_HOSTS.`,
+      );
+    }
+    // The request's own origin: the login URL opens there. Loopback is plain
+    // http; an allowed host sits behind a proxy that may end TLS, so both of
+    // its schemes are this origin, and the proxy's X-Forwarded-Proto picks the
+    // one the login URL and cookie use.
+    const proxied = allowedHosts.has(host);
+    const secure = proxied && request.headers["x-forwarded-proto"] === "https";
+    const origin = `${secure ? "https" : "http"}://${host}`;
+    const sameOrigins: ReadonlySet<string> = proxied
+      ? new Set([`https://${host}`, `http://${host}`])
+      : new Set([origin]);
+
+    if (!SAFE_METHODS.has(method)) {
+      const requestOrigin = request.headers.origin;
+      if (requestOrigin !== undefined && !sameOrigins.has(requestOrigin)) {
+        request.resume();
+        return fail(response, 403, "Cross-origin requests are not allowed.");
+      }
+      // Minting is authorized by the admin key; the CLI sends no Origin.
+      if (pathname === "/_studio/login-tokens" && method === "POST")
+        return await mintLoginToken(request, response, origin);
+      if (requestOrigin === undefined) {
+        request.resume();
+        return fail(
+          response,
+          403,
+          "Requests that change state need a same-origin Origin header.",
+        );
+      }
+    }
+
+    if (pathname === "/login") {
+      request.resume();
+      if (method !== "GET") return fail(response, 405, "Method not allowed");
+      return login(url, response, secure, proxied);
+    }
+    if (pathname === "/_studio/login-tokens") {
+      request.resume();
+      return fail(response, 405, "Method not allowed");
+    }
+    if (pathname === "/_studio/sessions") {
+      if (method !== "POST") {
+        request.resume();
+        return fail(response, 405, "Method not allowed");
+      }
+      return await createSession(request, response);
+    }
+
+    if (pathname === "/") {
+      request.resume();
+      if (!SAFE_METHODS.has(method))
+        return fail(response, 405, "Studio only serves static assets here.");
+      return await redirectToTenant(url, response, method);
+    }
+
+    // The dashboard's files carry no data: served without a session, framed
+    // only by the allowlist. Its sign-in page is part of the dashboard.
+    if (!pathname.startsWith("/_studio/")) {
+      request.resume();
+      if (!SAFE_METHODS.has(method))
+        return fail(response, 405, "Studio only serves static assets here.");
+      return await serveDashboard(
+        response,
+        method,
+        pathname,
+        webRoot,
+        (status, message) => {
+          response.setHeader("x-frame-options", "DENY");
+          fail(response, status, message);
+        },
+        dashboard,
+      );
+    }
+
+    // The existing public Runtime capability is the credential for a native
+    // download, including an embed whose bearer cannot be put on an <a>.
+    // Runtime verifies its signature, version, expiry and resource on every read.
+    const download = /^\/_studio\/tenants\/([^/]+)\/runtime\/v1\/artifact-links\/[^/]+$/.exec(pathname);
+    if (method === "GET" && download) {
+      const tenant = await tenantIdOrCause();
+      if (tenant.id === null) return fail(response, 503, tenant.message);
+      if (download[1] !== encodeURIComponent(tenant.id)) return fail(response, 404, "Unknown Tenant");
+      return proxyRuntime(request, response, {
+        origin, runtimeUrl, serverKey: studioKey,
+        prefix: `/_studio/tenants/${download[1]}/runtime`, allowedOrigins: sameOrigins,
+      });
+    }
+
+    let session = sessionOf(request);
+    if (session === undefined) {
+      // No Studio session: a sign-in proxy's forwarded token may sign in.
+      const authorization = bearer(request);
+      const forwarded = forwardedHeader(request) ?? authorization;
+      if (forwarded !== undefined) {
+        session = await forwardedSignIn(forwarded, response, secure);
+        if (session === undefined) return void request.resume();
+      }
+      // The published loopback address needs no sign-in (AP19).
+      else if (!proxied) session = LOCAL_SESSION;
+    }
+    if (session === undefined || session === "refused") {
+      request.resume();
+      if (request.headers.authorization !== undefined)
+        response.setHeader("www-authenticate", 'Bearer error="invalid_token"');
+      return fail(
+        response,
+        401,
+        proxied
+          ? "Studio session required. Sign in through this Studio's sign-in proxy, or run npx nylorun studio."
+          : "This Studio session is invalid or has expired.",
+      );
+    }
+
+    if (pathname === "/_studio/hello") {
+      request.resume();
+      if (!SAFE_METHODS.has(method))
+        return fail(response, 405, "Method not allowed");
+      // The loopback address's own session: recorded when the dashboard opens, at most hourly.
+      if (session === LOCAL_SESSION && now() - loopbackRecordedAt >= LOOPBACK_SIGN_IN_INTERVAL_MS) {
+        loopbackRecordedAt = now();
+        recordSignIn("loopback", null);
+      }
+      const [runtime, tenant] = await Promise.all([
+        probeRuntimeCompatibility(runtimeUrl),
+        hostTenant(),
+      ]);
+      const hello: StudioServerHello = { version: STUDIO_VERSION, runtime, tenant };
+      return json(response, 200, hello, method);
+    }
+
+    const metricsRoute = TENANT_METRICS.exec(pathname);
+    if (metricsRoute) {
+      request.resume();
+      if (!SAFE_METHODS.has(method)) return fail(response, 405, "Method not allowed");
+      let tenantId = "";
+      try {
+        tenantId = decodeURIComponent(metricsRoute[1]!);
+      } catch {
+        tenantId = "";
+      }
+      const host = await tenantIdOrCause();
+      if (host.id === null) return fail(response, 503, host.message);
+      if (
+        !TENANT_ID.test(tenantId) ||
+        tenantId !== host.id ||
+        (session.tenant !== null && session.tenant !== tenantId)
+      )
+        return fail(response, 404, "Unknown Tenant");
+      const sources = options.metricsSources ?? [];
+      if (sources.length === 0) return json(response, 200, { at: new Date().toISOString(), sources: [] }, method);
+      return json(response, 200, await readMetrics(sources), method);
+    }
+
+    const tenantRoute = TENANT_RUNTIME.exec(pathname);
+    if (tenantRoute) {
+      const segment = tenantRoute[1]!;
+      let tenantId: string;
+      try {
+        tenantId = decodeURIComponent(segment);
+      } catch {
+        tenantId = "";
+      }
+      if (!TENANT_ID.test(tenantId)) {
+        request.resume();
+        return fail(response, 404, "Unknown Tenant");
+      }
+      const host = await tenantIdOrCause();
+      if (host.id === null) {
+        request.resume();
+        return fail(response, 503, host.message);
+      }
+      // Another Tenant, and a session limited to another Tenant, get the same
+      // answer as a Tenant that does not exist.
+      if (
+        tenantId !== host.id ||
+        (session.tenant !== null && session.tenant !== tenantId)
+      ) {
+        request.resume();
+        return fail(response, 404, "Unknown Tenant");
+      }
+      // Logged with the subject: an embedded session, and a person admitted by
+      // forwarded sign-in.
+      if (
+        (session.kind === "bearer" || session.subject !== null) &&
+        !SAFE_METHODS.has(method)
+      ) {
+        const path = pathname.slice(`/_studio/tenants/${segment}/runtime`.length);
+        response.once("finish", () =>
+          log({
+            msg: "studio proxy",
+            subject: session.subject,
+            tenant: tenantId,
+            method,
+            path,
+            status: response.statusCode,
+          }),
+        );
+      }
+      return proxyRuntime(request, response, {
+        origin,
+        runtimeUrl,
+        serverKey: studioKey,
+        prefix: `/_studio/tenants/${segment}/runtime`,
+        allowedOrigins: sameOrigins,
+        ...(options.maxUploadBytes === undefined
+          ? {}
+          : { maxUploadBytes: options.maxUploadBytes }),
+      });
+    }
+
+    request.resume();
+    return fail(response, 404, "Unknown Studio route");
+  };
+
+  const server = createServer((request, response) => {
+    handle(request, response).catch(() => {
+      if (!response.headersSent) fail(response, 500, "Studio request failed");
+      else response.end();
+    });
+  });
+  await new Promise<void>((ready, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(options.port ?? 3000, options.host ?? "127.0.0.1", () => {
+      server.off("error", rejectListen);
+      ready();
+    });
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    server.close();
+    throw new Error("Studio did not report a TCP address.");
+  }
+  boundPort = address.port;
+  publicPort = options.publicPort ?? boundPort;
+  publicHosts = new Set([
+    `localhost:${publicPort}`,
+    `127.0.0.1:${publicPort}`,
+    ...allowedHosts,
+  ]);
+
+  return Object.freeze({
+    port: boundPort,
+    publicPort,
+    url: `http://localhost:${publicPort}`,
+    close: () =>
+      new Promise<void>((done, rejectClose) => {
+        server.closeAllConnections();
+        server.close((error) =>
+          error === undefined ? done() : rejectClose(error),
+        );
+      }),
+  });
+}

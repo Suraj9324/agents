@@ -1,0 +1,165 @@
+/**
+ * Signing keys, for a management key, and the public keys, for any caller that reached the
+ * Tenant: the Runtime signs capability links, run and host tokens with them (protocol 7 has no
+ * subject tokens, access policy, browser keys or revocations). A rotation and a revocation are on
+ * the Tenant's stream (`signing_key.rotated`, `signing_key.revoked`).
+ */
+import type { OpenAPIHono } from "@hono/zod-openapi";
+import { z } from "zod";
+import {
+  RevokeSigningKeyRequestSchema,
+  RotateSigningKeysRequestSchema,
+} from "@nylorun/core/contracts";
+import {
+  Jwks,
+  RevokeSigningKeyRequest,
+  RotateSigningKeysRequest,
+  SigningKeyList,
+  SigningKeyView,
+} from "../../components.js";
+import { apiActor } from "../../../tenant/audit.js";
+import { publicJwk, signingKeyView } from "../../../tenant/signing-keys.js";
+import type { TenantEnv } from "../app.js";
+import { readJson } from "../body.js";
+import { tenantRoute, type RouteAccess } from "../define.js";
+import { jsonResponse } from "../respond.js";
+import { hostTuning } from "../../../tuning.js";
+
+/** The Management API's signing-key routes: a management key. */
+const MANAGEMENT: RouteAccess = { credentials: ["management"], scopes: "never" };
+
+const json = (schema: z.ZodType, description: string) => ({
+  description,
+  content: { "application/json": { schema } },
+});
+const body = (schema: z.ZodType) => ({
+  required: true,
+  content: { "application/json": { schema } },
+});
+
+export function accessRoutes(api: OpenAPIHono<TenantEnv>): void {
+  tenantRoute(
+    api,
+    {
+      credentials: ["application", "subject", "management", "token"],
+      scopes: "any",
+      // Public keys: a verifier of the Runtime's tokens holds no key.
+      anonymous: true,
+    },
+    {
+      method: "get",
+      path: "/v1/access/jwks",
+      tags: ["Access"],
+      summary: "Get the public keys the Runtime's tokens are signed with",
+      description:
+        "A JSON Web Key Set, to verify a token the Runtime signed without calling it. No " +
+        "credential is needed.",
+      responses: { 200: json(Jwks, "The public keys") },
+    },
+    async (c) => {
+      // Anonymous: reads the public keys. Only when the current or standby key is missing does
+      // it ask the keys service to create it, so a verifier never caches a set without them.
+      const ctx = c.env.tenant;
+      const read = () => ctx.store.tx((t) => t.signingKeys(["standby", "current", "previous"]));
+      let rows = await read();
+      if (!complete(rows)) {
+        await ctx.keys.ensureSigningKeys();
+        rows = await read();
+      }
+      return jsonResponse(200, { keys: rows.map(publicJwk) });
+    },
+  );
+
+  signingKeyRoutesAt(api, "/v1/tenant/signing-keys", MANAGEMENT);
+}
+
+/** The signing-key routes under `base` (`/v1/tenant/signing-keys`). */
+function signingKeyRoutesAt(api: OpenAPIHono<TenantEnv>, base: string, access: RouteAccess): void {
+  tenantRoute(
+    api,
+    access,
+    {
+      method: "get",
+      path: `${base}`,
+      tags: ["Access"],
+      summary: "List signing keys",
+      responses: { 200: json(SigningKeyList, "Standby, current, previous and revoked keys") },
+    },
+    async (c) => {
+      const ctx = c.env.tenant;
+      const read = () => ctx.store.tx((t) => t.signingKeys());
+      let rows = await read();
+      if (!complete(rows)) {
+        await ctx.keys.ensureSigningKeys();
+        rows = await read();
+      }
+      return jsonResponse(200, { keys: rows.map(signingKeyView) });
+    },
+  );
+
+  tenantRoute(
+    api,
+    access,
+    {
+      method: "post",
+      path: `${base}/rotate`,
+      tags: ["Access"],
+      summary: "Rotate the signing keys",
+      description:
+        "The standby key signs from now on; the current one still verifies tokens it signed. `force` also ends every outstanding capability link and run token.",
+      request: { body: body(RotateSigningKeysRequest) },
+      responses: {
+        200: json(SigningKeyList, "The keys after rotation"),
+        409: { description: "The previous key may still verify outstanding tokens" },
+      },
+    },
+    async (c) => {
+      const ctx = c.env.tenant;
+      const request = RotateSigningKeysRequestSchema.parse(await readJson(c));
+      // The longest any token the Runtime signs lives (capability links, run tokens).
+      const keys = await ctx.keys.rotateSigningKeys({
+        maxTtlSeconds: hostTuning().keys.tokenTtlMaxSeconds,
+        force: request.force === true,
+        by: apiActor(c.get("scope")),
+      });
+      ctx.config.logger.info("signing keys rotated", { force: request.force === true });
+      return jsonResponse(200, { keys });
+    },
+  );
+
+  tenantRoute(
+    api,
+    access,
+    {
+      method: "post",
+      path: `${base}/{kid}/revoke`,
+      tags: ["Access"],
+      summary: "Revoke a signing key",
+      request: { params: z.object({ kid: z.string() }), body: body(RevokeSigningKeyRequest) },
+      responses: {
+        200: json(SigningKeyView, "The key, revoked"),
+        409: { description: "Rotate before revoking the current key" },
+      },
+    },
+    async (c) => {
+      const ctx = c.env.tenant;
+      RevokeSigningKeyRequestSchema.parse(await readJson(c));
+      const row = await ctx.store.tx(async (t) => {
+        const kid = c.req.param("kid")!;
+        const before = await t.signingKey(kid);
+        const revoked = await ctx.signingKeys.revoke(t, kid);
+        // Revoking a revoked key changes nothing, and records nothing.
+        if (before?.state === "previous" || before?.state === "standby")
+          await t.tenantEvent("signing_key.revoked", { keyId: revoked.id, state: before.state }, apiActor(c.get("scope")));
+        return revoked;
+      });
+      ctx.config.logger.info("signing key revoked", { kid: row.id });
+      return jsonResponse(200, signingKeyView(row));
+    },
+  );
+}
+
+/** True when the Tenant has a current and a standby signing key. */
+function complete(rows: readonly { state: string }[]): boolean {
+  return rows.some((row) => row.state === "current") && rows.some((row) => row.state === "standby");
+}

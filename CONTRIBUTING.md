@@ -1,0 +1,222 @@
+# Contributing
+
+## Repository map
+
+Directories follow the Docker images: `runtime/` builds `ghcr.io/nylorun/runtime`,
+`studio/` builds `ghcr.io/nylorun/studio` and `sandboxes/` builds `ghcr.io/nylorun/sandboxes`.
+`sdks/` and `cli/` hold the npm packages that ship no image.
+
+| Directory           | Responsibility                                                                 |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `core/`             | Shared definitions and contracts                                               |
+| `runtime/`          | The runtime image (`runtime/Dockerfile`): the `runtime`, `gateway` and `harness` containers |
+| `runtime/server/`   | `@nylorun/runtime`: Runtime Host, execution and persistence                    |
+| `runtime/harness/`  | `@nylorun/harness`: agent execution engine                                     |
+| `studio/`           | Studio server and dashboard (the `studio` image)                               |
+| `sandboxes/`        | The sandboxes service (Go, the `sandboxes` image)                              |
+| `sdks/agents/`      | `@nylorun/agents`: agent definitions and the session client                    |
+| `sdks/admin/`       | `@nylorun/admin`: the Management API client                                    |
+| `cli/nylorun/`      | `nylorun`: sets up and runs local Tenants (Docker), and the client of their APIs (`src/client/`) |
+| `cli/create-agent/` | Starter, renderer, compatibility pins, and smoke tests                         |
+| `cli/legacy/`       | `@nylorun/cli`: nylorun under another name; its `nylorun` runs nylorun's       |
+| `examples/`         | Generated application shell and authored demonstrations                        |
+| `scripts/`          | Repository development, validation, and release tooling                        |
+| `docs/`             | Self-hosting, upgrading and reference docs ([index](./docs/README.md))         |
+
+What each package publishes: [docs/reference/packages.md](./docs/reference/packages.md).
+
+Harness and Runtime must not depend on each other. Studio depends on neither.
+Cross-package contracts are tested in the creator. Examples remains a separate
+npm project with its own lockfile.
+
+## First run
+
+Use **Node 24 and npm 11** (CI pins 24.15.0 and 11.15.0; matching majors is enough) on macOS or Linux, and **Docker with Compose v2** (Docker Desktop, OrbStack, Colima or another engine). On Windows, clone and work inside [WSL2](https://learn.microsoft.com/windows/wsl/install). With nvm:
+
+```sh
+nvm install
+nvm use
+npm install --global npm@11.15.0
+npm run setup
+npm run dev
+```
+
+Setup installs both lockfiles and builds packages. The packages compile with the TypeScript 7 native compiler; `typescript` is aliased to the TypeScript 6 bridge for scripts that use the compiler API. It does not configure models,
+regenerate examples, or change local credentials/data. Package consumer Node
+support remains separate from the pinned contributor toolchain.
+
+`npm run dev` is the contributor loop on a local Tenant:
+
+1. It builds the host packages, then the Runtime and Studio images from your
+   checkout (`nylorun-runtime:dev`, `nylorun-studio:dev`; unchanged layers come
+   from Docker's cache).
+2. It runs `nylorun start` in `examples/` on those images. That creates the
+   examples' own Tenant `examples` (Host root `~/.nylorun/tenants/examples/`,
+   Compose project `nylorun-examples`), writes the Project link in the
+   git-ignored `examples/.nylorun/`, and outlives `npm run dev`.
+3. It signs the browser in to Studio on that Tenant (`nylorun studio`; `--no-open` prints a single-use login URL
+   instead), and
+   runs the examples' own `npm run dev` (`tsx watch`), which saves their agents.
+4. It watches `core`, `harness`, `agents`, `admin`, `runtime`, `nylorun`, `cli`
+   and `studio`. An edit rebuilds that package and the packages that depend on it,
+   rebuilds the images built from them (Compose then recreates only those
+   containers), and restarts the examples runner. A compile error keeps the
+   Tenant and the runner as they were; fixing it resumes rebuilds.
+
+Agent edits in `examples/` restart the application through `tsx watch`; start a
+new session after definition changes. Stop development before changing
+dependencies, then rerun setup. The examples model provider lives in the
+Tenant's vault: run `npm run configure` (or replace it from Studio).
+
+To run the examples on another Tenant, set `NYLORUN_TENANT` (its Host root is
+`~/.nylorun/tenants/<name>/`), or `NYLORUN_HOME` (and `NYLORUN_COMPOSE_PROJECT`
+for the Compose project name) for a Host root elsewhere. Set
+`NYLORUN_RUNTIME_IMAGE` or `NYLORUN_STUDIO_IMAGE` to run an image you built
+yourself; `npm run dev` then neither builds nor rebuilds that image.
+
+## Development
+
+| Command                                     | Use                                                                        |
+| ------------------------------------------- | -------------------------------------------------------------------------- |
+| `npm run dev`                               | The examples on their Tenant, with package and image rebuilds              |
+| `npm run dev -- --no-open`                  | Keep the browser closed                                                    |
+| `npm run dev -- --no-studio`                | Start the Tenant without Studio                                            |
+| `npm run dev -- --no-watch`                 | Build and start once; no rebuilds                                          |
+| `npm run dev:starter`                       | The same loop on a fresh starter preview under `.tmp/`                     |
+| `npx nylorun studio` (in `examples/`)       | A fresh Studio login on the examples Tenant                                |
+| `npx nylorun status` / `npx nylorun local logs`   | The Tenant's services, endpoints and health; logs (`-f`, `<service>`)      |
+| `npx nylorun down` / `npx nylorun local reset`    | Stop the Tenant (volumes kept) / delete its containers, volumes and data   |
+| `npm run build`                             | Build all packages                                                         |
+| `npm test`                                  | Run package, tooling, and examples tests after setup (needs Docker)        |
+| `npm run check`                             | Build and run the standard repository checks                               |
+| `npm run check:stack`                       | Check generated starter contracts and built example assets                 |
+| `npm run test:docs`                         | Check the README and guide snippets marked `<!-- doc-test: … -->` (part of `check`) |
+| `npm run test:stack`                        | Smoke `nylorun up`/`down` on a temporary Tenant                            |
+| `npm run test:starter`                      | Smoke the packed starter (`nylorun start` in the project, `npm run dev`, the Tenant reset to the fixture model) on a temporary Tenant |
+| `npm run test:dev`                          | Smoke `npm run dev` on a temporary Tenant and a clean copy of `examples/`  |
+| `npm run test:acceptance [-- --only I1,I2]` | Installation acceptance (I1–I9) on a temporary Tenant                      |
+
+The Docker smokes (`scripts/lib/stack.mjs`) build `nylorun-runtime:local`
+and `nylorun-studio:local` from the checkout, or reuse the images
+`NYLORUN_RUNTIME_IMAGE` and `NYLORUN_STUDIO_IMAGE` name. Each runs under a
+temporary `NYLORUN_HOME` with its own Compose project and always ends with
+`nylorun local reset --yes`, so it never touches `~/.nylorun` or a running dev Tenant.
+
+Starter preview prints a retained directory under `.tmp/`. It has its own
+Project link and configuration. Rerun to preview template changes; existing
+preview agents and credentials are never overwritten.
+
+For focused checks: `npm run check --workspace @nylorun/runtime` (substitute another
+package). CI uses `-- --built` on root checks after setup to avoid rebuilding.
+
+Doc tests check a README's or guide's code block when an HTML comment on the line before it says
+how (`scripts/doc-tests.mjs`, against the built packages, with no Runtime):
+`<!-- doc-test: folder <name> <path> -->` writes the block as `<path>` of the agent folder
+`<name>` and compiles the folder as `nylorun check` does; `<!-- doc-test: tool-policy -->` checks
+each rule against the Runtime's tool policy schema (`tool-policy refused` for a rule shown as
+wrong); `<!-- doc-test: typescript -->` typechecks a self-contained block. Mark a snippet a reader
+would copy; a block without a marker is not checked.
+
+The Runtime's tests keep every Tenant in Postgres: each test file gets its own database,
+cloned from a template the run migrates, on the Docker test stack
+(`runtime/server/test/stack/compose.yaml`: Postgres, Restate, s2-lite). `npm test` in `runtime/server/`
+starts that stack when its Postgres does not answer, and leaves it running for the next
+run; the examples' tests use it too. Manage it yourself with
+`npm run test:stack:up --workspace @nylorun/runtime` and `npm run test:stack:down
+--workspace @nylorun/runtime`; set `NYLORUN_TEST_STACK_EXTERNAL=1` to make the tests fail
+instead of starting it, and the `NYLORUN_TEST_*_PORT` variables to move its ports.
+
+### Adding a migration
+
+Drizzle defines the Session Store's tables in `runtime/server/src/store/postgres/schema.ts`, and
+drizzle-kit generates the migrations from it into `runtime/server/src/store/postgres/drizzle/`
+(SQL files, `meta/_journal.json`, and the snapshots drizzle-kit diffs against). The build
+copies the SQL files and the journal into `dist/`; the Host applies the missing ones at
+startup and refuses a database holding one it does not ship.
+
+1. Edit `schema.ts`.
+2. Run `npm run db:generate --workspace @nylorun/runtime` and review the SQL it writes. A
+   migration is forward-only: never edit, reorder or delete one that has been released.
+3. For SQL drizzle-kit does not model (functions, publications, grants, data changes), add
+   a custom migration with `npm run db:generate --workspace @nylorun/runtime --
+   --custom --name=<name>` and write the SQL into the empty file it creates; separate
+   statements with `--> statement-breakpoint`.
+4. Run the Runtime's tests: the template database every test file clones is migrated
+   with the new files.
+
+`npm run db:studio --workspace @nylorun/runtime` opens Drizzle Studio on the database in
+`NYLORUN_DATABASE_URL` (a local Tenant's, or a test database on the test stack). drizzle-kit and
+`runtime/server/drizzle.config.ts` are for development only and are not published.
+
+The Runtime and Studio ship as the images `ghcr.io/nylorun/runtime` and
+`ghcr.io/nylorun/studio`, built from the repository root. To run your changes
+under `nylorun up` without `npm run dev`, build them and point `nylorun` at the
+local tags:
+
+```sh
+docker build --file runtime/Dockerfile --tag nylorun-runtime:dev .
+docker build --file studio/Dockerfile --tag nylorun-studio:dev .
+NYLORUN_RUNTIME_IMAGE=nylorun-runtime:dev NYLORUN_STUDIO_IMAGE=nylorun-studio:dev npx nylorun start
+```
+
+CI's full tier (see [Pull requests](#pull-requests)) builds both images from the
+commit for the `stack`, `smoke-starter`, `smoke-dev` and `acceptance` jobs. `check` and `consumers` start the Docker test stack before
+their tests, and `integration` runs the Runtime's integration tests against it
+(`npm run test:stack:up --workspace @nylorun/runtime`, then
+`NYLORUN_TEST_STACK=1 npm run test:integration --workspace @nylorun/runtime`).
+Releases publish both images.
+
+## Generated examples and dependencies
+
+Edit starter files or the examples recipe, then:
+
+```sh
+npm run examples:sync
+npm install --prefix examples
+npm run examples:check
+```
+
+Review the generated diff and lockfile. Never hand-edit files owned by
+`examples/.scaffold-manifest.json`. Agent demonstrations, tests, scripts, and local
+state are authored or local; synchronization does not overwrite them.
+Use `npm install` explicitly when changing dependencies, committing the affected
+lockfile. Routine setup uses `npm ci` and never refreshes lockfiles.
+
+## Pull requests
+
+Keep changes focused and test observable behavior. For a package release, add a
+short change description with `npm run changeset`; select the affected packages
+and version impact. Repository-only changes do not require package releases.
+Run `npm run check`; run `npm run check:stack` for packaging or cross-package changes.
+
+CI runs in two tiers (`.github/workflows/ci.yml`). The fast tier, `check` and
+the Runtime's unit tests in two shards (`runtime-unit`), runs on every PR and
+merge-queue entry, and the merge queue merges on it. The full tier (the Docker
+smokes, acceptance, integration, sandboxes on kind, macOS and the newest Node)
+runs after the merge on `main`, and for release PRs, whose `ci` waits for the
+full suite on the PR and again in the queue; a merged release does not run it a
+third time on `main`. Queue a PR as soon as
+you open it with `gh pr merge --auto --squash`: its required `ci` passes at once
+and the merge queue runs the checks; `ci (pull_request)` on the PR is feedback.
+To run the full tier on a branch before merging, use
+`gh workflow run ci.yml --ref <branch>`. A full-tier failure on `main` is
+reverted or fixed forward before the next release, which needs the full suite
+to pass.
+
+See the [Docker Compose reference](./docs/self-hosting/docker-compose.md) for application hosting.
+
+| Problem                         | Action                                                                                                                                                                          |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Toolchain mismatch              | Use Node 24 and npm 11; setup prints the detected versions                                                                                                                      |
+| Docker missing or not running   | Start Docker Desktop, OrbStack or Colima; `npx nylorun doctor` reports what is missing                                                                                          |
+| Missing/stale package build     | Stop development and run `npm run setup`                                                                                                                                        |
+| Occupied port                   | The first `nylorun start` picks free loopback ports and keeps them in `~/.nylorun/tenants/<name>/docker/.env`; edit that file, or free the port, if another service takes one later         |
+| Protocol `426`                  | Upgrade `nylorun` and run `nylorun up` (nylorun pins the Runtime image), or pin `@nylorun/agents` within the Runtime's protocol range                                          |
+| Quarantined Tenant              | `npx nylorun status` shows `code` and `repair` (`kek-missing`, `corrupt`, `schema-too-new`, `migration-failed`, `envelope-invalid`, `open-timeout`, `open-failed`)              |
+| Model setup error               | Run `npx nylorun up`, then `npm run configure` (`nylorun tenant models set`), or replace the vault credential from Studio                                                                 |
+| Need Runtime / Studio logs      | `npx nylorun local logs -f` (or `npx nylorun local logs runtime`)                                                                                                                           |
+| Generated-file conflict         | Move the intended change into the template/recipe, then sync                                                                                                                    |
+| Interrupted release preparation | Inspect the diff; do not blindly rerun or discard it                                                                                                                            |
+
+Contributions are licensed under [Apache-2.0](./LICENSE); no CLA is required.
+Report vulnerabilities through [SECURITY.md](./.github/SECURITY.md), not public issues.

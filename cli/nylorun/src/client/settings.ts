@@ -1,0 +1,173 @@
+/**
+ * `nylorun tenant budgets | tool-policy | settings | coverage`: the Tenant's documents, through
+ * the Management API. Each document is files in, files out: `get` prints it as JSON, `put` reads
+ * the request body from a file or stdin (`-`), checks it against its schema before anything is
+ * sent, and replaces the whole document.
+ */
+import type { ManagementClient } from "@nylorun/admin";
+import {
+  PutModelBudgetsRequestSchema,
+  PutTenantArtifactsRequestSchema,
+  PutTenantEnvironmentsRequestSchema,
+  PutTenantLimitsRequestSchema,
+  PutTenantSkillsRequestSchema,
+  PutToolPolicyRequestSchema,
+} from "@nylorun/core/contracts";
+import { CliError, HelpRequest, isHelp } from "../errors.js";
+import { parseStackFlags, usageLinesOf, type StackDeps } from "../stack/commands.js";
+import { printJson, printTable, readBody, type BodySchema } from "./io.js";
+import { connect, managementClient } from "./target.js";
+
+export const settingsUsage = `  budgets [get | put <file|->] [--tenant <name>]
+                                      the model spend caps (scope tenant, manifest with id an
+                                      agent manifest's name, or turn); put replaces them all
+  tool-policy [get | put <file|->] [--tenant <name>]
+                                      the Tool Gate's rules; put replaces them all
+  settings sandbox [get | put <file|->] [--tenant <name>]
+                                      the Agents' environments: limits, stop grace, engine
+                                      images, placement; put takes get's output back
+  settings artifacts [get | put <file|->] [--tenant <name>]
+                                      the artifact store's limits
+  settings skills [get | put <file|->] [--tenant <name>]
+                                      the most bytes one skill may hold
+  settings limits [get | put <file|->] [--tenant <name>]
+                                      the Runtime limits: sizes, counts and deadlines (record
+                                      entries, request bodies, Agents, model calls, tools)
+  coverage --agent <id> [--tenant <name>] [--json]
+                                      which secret of Agent <id>'s vault each MCP server and
+                                      HTTP tool of its manifest would get`;
+
+const usageError = (message = `Usage:\n${settingsUsage}`) => new CliError(message, 2);
+
+/** One document `get` reads and `put` replaces. */
+interface Document<T> {
+  /** As the command names it: `budgets`, `settings sandbox`. */
+  name: string;
+  schema: BodySchema<T>;
+  /** Fields of what `get` prints that a `put` drops, so the output can be edited and put back. */
+  readOnly?: readonly string[];
+  /** The field of what `get` prints that holds the body, for a view that wraps it (`config`). */
+  bodyField?: string;
+  get(admin: ManagementClient): Promise<unknown>;
+  put(admin: ManagementClient, body: T): Promise<unknown>;
+}
+
+/* The bodies' `requestId` is optional in the contracts; the client adds one when it is absent. */
+const budgets: Document<Parameters<ManagementClient["models"]["budgets"]["put"]>[0]> = {
+  name: "budgets",
+  schema: PutModelBudgetsRequestSchema,
+  get: (admin) => admin.models.budgets.get(),
+  put: (admin, body) => admin.models.budgets.put(body),
+};
+const toolPolicy: Document<Parameters<ManagementClient["toolPolicy"]["put"]>[0]> = {
+  name: "tool-policy",
+  schema: PutToolPolicyRequestSchema,
+  readOnly: ["updatedAt"],
+  get: (admin) => admin.toolPolicy.get(),
+  put: (admin, body) => admin.toolPolicy.put(body),
+};
+const sandbox: Document<Parameters<ManagementClient["settings"]["sandbox"]["put"]>[0]> = {
+  name: "settings sandbox",
+  schema: PutTenantEnvironmentsRequestSchema,
+  // `get` prints the backend report, the stored settings (`config`) and those in force
+  // (`effective`); `put` of that output puts its `config` back, so no default becomes an override.
+  bodyField: "config",
+  get: (admin) => admin.settings.sandbox.get(),
+  put: (admin, body) => admin.settings.sandbox.put(body),
+};
+const artifacts: Document<Parameters<ManagementClient["settings"]["artifacts"]["put"]>[0]> = {
+  name: "settings artifacts",
+  schema: PutTenantArtifactsRequestSchema,
+  readOnly: ["usedBytes"],
+  get: (admin) => admin.settings.artifacts.get(),
+  put: (admin, body) => admin.settings.artifacts.put(body),
+};
+
+const skillSettings: Document<Parameters<ManagementClient["settings"]["skills"]["put"]>[0]> = {
+  name: "settings skills",
+  schema: PutTenantSkillsRequestSchema,
+  get: (admin) => admin.settings.skills.get(),
+  put: (admin, body) => admin.settings.skills.put(body),
+};
+
+const limitSettings: Document<Parameters<ManagementClient["settings"]["limits"]["put"]>[0]> = {
+  name: "settings limits",
+  schema: PutTenantLimitsRequestSchema,
+  get: (admin) => admin.settings.limits.get(),
+  put: (admin, body) => admin.settings.limits.put(body),
+};
+
+/** `<document> [get | put <file|->]`: `get` when no verb is given. */
+async function documentCommand<T>(
+  deps: StackDeps,
+  document: Document<T>,
+  args: readonly string[],
+): Promise<number> {
+  const usage = `nylorun tenant ${document.name} [get | put <file|->] [--tenant <name>]`;
+  const flags = parseStackFlags(args, { values: ["--tenant"] }, usage);
+  const [verb = "get", ...operands] = flags.rest;
+  if (!((verb === "get" && !operands.length) || (verb === "put" && operands.length === 1)))
+    throw usageError(`Usage: ${usage}`);
+  const body =
+    verb === "put"
+      ? await readBody(deps, operands[0]!, document.schema, document.readOnly, document.bodyField)
+      : undefined;
+  const admin = managementClient(deps, await connect(deps, "management", flags.values.get("--tenant")));
+  printJson(deps, body === undefined ? await document.get(admin) : await document.put(admin, body));
+  return 0;
+}
+
+export const budgetsCommand = (deps: StackDeps, args: readonly string[]) =>
+  documentCommand(deps, budgets, args);
+export const toolPolicyCommand = (deps: StackDeps, args: readonly string[]) =>
+  documentCommand(deps, toolPolicy, args);
+
+/** `nylorun tenant settings sandbox | artifacts | skills | limits ...` */
+export async function settingsCommand(deps: StackDeps, args: readonly string[]): Promise<number> {
+  const [which, ...rest] = args;
+  if (isHelp(which)) throw new HelpRequest(usageLinesOf(settingsUsage, "settings"));
+  if (which === "sandbox") return documentCommand(deps, sandbox, rest);
+  if (which === "artifacts") return documentCommand(deps, artifacts, rest);
+  if (which === "skills") return documentCommand(deps, skillSettings, rest);
+  if (which === "limits") return documentCommand(deps, limitSettings, rest);
+  throw usageError(usageLinesOf(settingsUsage, "settings"));
+}
+
+const COVERAGE_USAGE = "nylorun tenant coverage --agent <id> [--tenant <name>] [--json]";
+
+/**
+ * `nylorun tenant coverage`: which secret of Agent `--agent`'s vault each remote MCP server and
+ * HTTP tool of the manifest version it runs would get in its sessions. It reads no secret and
+ * calls no server.
+ */
+export async function coverageCommand(deps: StackDeps, args: readonly string[]): Promise<number> {
+  if (args.includes("--environment"))
+    throw usageError("--environment was removed in protocol 16: pass the Agent, --agent <id>, whose vault its sessions use.");
+  const flags = parseStackFlags(args, { booleans: ["--json"], values: ["--tenant", "--agent"] }, COVERAGE_USAGE);
+  const agentId = flags.values.get("--agent");
+  if (flags.rest.length || agentId === undefined) throw usageError(`Usage: ${COVERAGE_USAGE}`);
+  const admin = managementClient(deps, await connect(deps, "management", flags.values.get("--tenant")));
+  const coverage = await admin.coverage({ agentId });
+  if (flags.booleans.has("--json")) {
+    printJson(deps, coverage);
+    return 0;
+  }
+  const missing = coverage.entries.filter((entry) => entry.status === "missing").length;
+  deps.out(
+    `Agent ${coverage.agentId}: ${
+      coverage.complete ? "every credential is covered" : `${missing} of ${coverage.entries.length} missing`
+    }`,
+  );
+  if (coverage.entries.length)
+    printTable(deps, [
+      ["STATUS", "KIND", "NAME", "URL", "SECRET"],
+      ...coverage.entries.map((entry) => [
+        entry.status,
+        entry.kind,
+        entry.agentId ? `${entry.agentId}/${entry.name}` : entry.name,
+        entry.url,
+        entry.credential?.name ?? (entry.required ? "(required)" : ""),
+      ]),
+    ]);
+  return 0;
+}

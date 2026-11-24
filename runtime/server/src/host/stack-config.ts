@@ -1,0 +1,1441 @@
+/**
+ * Stack configuration for the Runtime process, parsed from an environment
+ * snapshot and argv. Pure: `host/main.ts` passes the process environment and
+ * arguments; nothing here reads ambient state.
+ *
+ * `--service core,loop` names the Runtime services the process runs: one image runs every service, and a container may pack several.
+ * Without the flag a process runs core and loop. `--role api|worker|all` is
+ * the deprecated name of the same choice (core, loop, or both). `gates` (the
+ * Model Gate) never shares a process with core or loop: it holds the
+ * credentials they must not. Only a process that runs core or loop parses the
+ * API listener (`NYLORUN_LISTEN_*`); only one that runs gates parses its
+ * listener (`NYLORUN_GATES_LISTEN_*`), and only one that runs loop parses
+ * where to reach the gate (`NYLORUN_GATES_URL`). Both read
+ * `NYLORUN_GATES_TOKEN`. In a container, loop requires the gate: the loop
+ * process must never hold a model credential. `egress` (egress-gate) joins gates and keys
+ * in the gateway and parses its listener (`NYLORUN_EGRESS_LISTEN_*`, default `0.0.0.0:4200`).
+ * The credential resolver is gone (protocol 10): its `NYLORUN_RESOLVER_*` variables are ignored,
+ * and the Host logs `resolver_removed` when one is set.
+ *
+ * `harness` runs alone: it holds the harness credential and nothing else. It connects to
+ * core's Harness API listener (`NYLORUN_HARNESS_URL`, `NYLORUN_HARNESS_TOKEN`), calls models and
+ * remote MCP servers through the gates service (`NYLORUN_GATES_URL`, with run tokens only), and
+ * keeps its workspaces under `NYLORUN_HARNESS_ROOT`. It refuses to start with a database, the
+ * gates' or keys' credential, or Restate settings. A process running core starts the Harness API
+ * listener when `NYLORUN_HARNESS=remote` (`NYLORUN_HARNESS_LISTEN_*`, `NYLORUN_HARNESS_TOKEN`).
+ *
+ * Two listen modes:
+ * - **local** (no `NYLORUN_LISTEN_*` / `NYLORUN_ALLOWED_HOSTS`): the Host binds
+ *   what `host.json` names, loopback only unless `allowNonLoopback`.
+ * - **container**: the Host binds `NYLORUN_LISTEN_HOST:NYLORUN_LISTEN_PORT`
+ *   (default `0.0.0.0:4000`) and accepts only the `Host` headers in
+ *   `NYLORUN_ALLOWED_HOSTS`, plus the loopback forms of the listen port for
+ *   probes from inside the container.
+ *
+ * The Postgres, Restate and S2 endpoints are parsed and validated here;
+ * `infra/*` builds the clients from them. So is the Object store (`NYLORUN_OBJECT_STORE_*`),
+ * which every service may read; `host/main.ts` builds the `BlobStore` from it. So is who the Host's Tenant is when its database
+ * holds none yet (`NYLORUN_TENANT_ID`, `NYLORUN_TENANT_NAME`). So are traces, for a
+ * process running core: where they go (`OTEL_EXPORTER_OTLP_ENDPOINT`, or
+ * `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, with `OTEL_EXPORTER_OTLP_HEADERS`), what they say of
+ * their source (`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`) and which content they carry
+ * (`OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT`; for one release still `NYLORUN_TRACE_CONTENT` and
+ * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`, with a deprecation warning). So is the
+ * live telemetry of every process that runs core, loop or the gateway's services
+ * (`telemetry/`): its metric exporters (`OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_PROMETHEUS_*`), its
+ * OTLP endpoints, its sampler (`OTEL_TRACES_SAMPLER`, `_ARG`) and its `service.name`.
+ * So is the Host tuning (`NYLORUN_TUNING`, `tuning.ts`), for every service: its timings,
+ * retries and internal sizes. So is the outside credential provider
+ * (`NYLORUN_CREDENTIAL_PROVIDER_URL`, `NYLORUN_CREDENTIAL_PROVIDER_TOKEN`), for egress-gate and
+ * a process running core or loop (`gates/credential-provider.ts`).
+ */
+import { DEFAULT_SERVICE_NAME, GATEWAY_SERVICE_NAME, type TraceResource } from "../traces/otlp.js";
+import { TRACE_SAMPLERS, type SettingWarning, type TelemetryConfig, type TraceSamplerName } from "../telemetry/config.js";
+import { TRACE_CONTENT_KINDS, type TraceContentKind } from "../traces/map.js";
+import { isTenantId } from "@nylorun/core/compatibility";
+import { LOOPBACK_HOSTS } from "@nylorun/core/contracts";
+import { blockedAddresses, type BlockedAddress } from "../sandbox/pods/network-gate.js";
+import { HostTuningError, parseHostTuning, type HostTuning } from "../tuning.js";
+import { HOST_IDENTITY_PROVIDERS } from "../vault/host-identity.js";
+import type { ComputerServiceConfig } from "../harness/computer.js";
+import { readFileSync } from "node:fs";
+import { restateIdentityKeyOf } from "./restate-identity.js";
+
+/** A Runtime service this release has. */
+export type RuntimeService = "core" | "loop" | "gates" | "keys" | "egress" | "harness" | "computer";
+
+export type RuntimeServices = ReadonlySet<RuntimeService>;
+
+export const RUNTIME_SERVICES: readonly RuntimeService[] = ["core", "loop", "gates", "keys", "egress", "harness", "computer"];
+
+/**
+ * Services that may share a process: they hold the same secrets and parse the same
+ * trust class of input. keys joins gates, and egress joins them. The harness
+ * runs agent code's neighbours and holds only its own credential: it shares with nothing.
+ */
+const SERVICE_GROUPS: readonly (readonly RuntimeService[])[] = [
+  ["core", "loop"],
+  ["gates", "keys", "egress"],
+  ["harness"],
+  ["computer"],
+];
+
+/** Where the gates service listens by default. */
+export const DEFAULT_GATES_LISTEN_PORT = 4100;
+
+/** Where egress-gate listens by default. */
+export const DEFAULT_EGRESS_LISTEN_PORT = 4200;
+
+/** Where core's Harness API listener listens by default. */
+export const DEFAULT_HARNESS_LISTEN_PORT = 4200;
+
+/** Where a harness process answers `/health` (loopback only). */
+export const DEFAULT_HARNESS_HEALTH_PORT = 4300;
+
+/** What a process runs without `--service`: core and loop, as `--role all` did. */
+export const DEFAULT_SERVICES: RuntimeServices = new Set<RuntimeService>([
+  "core",
+  "loop",
+]);
+
+/** Service names this release doesn't have yet. */
+const LATER_SERVICES: readonly string[] = [
+  "sandboxes",
+];
+
+/** The deprecated `--role` values, and the services each stands for. */
+export type RuntimeRole = "api" | "worker" | "all";
+
+const ROLE_SERVICES: Readonly<Record<RuntimeRole, readonly RuntimeService[]>> = {
+  api: ["core"],
+  worker: ["loop"],
+  all: ["core", "loop"],
+};
+
+/** `services` as the `--service` value that selects them, e.g. `core,loop`. */
+export function describeServices(services: RuntimeServices): string {
+  return RUNTIME_SERVICES.filter((service) => services.has(service)).join(",");
+}
+
+export interface ServiceSelection {
+  services: RuntimeServices;
+  /** Set when the process was started with the deprecated `--role`. */
+  deprecatedRole?: RuntimeRole;
+}
+
+export const DEFAULT_CONTAINER_LISTEN_HOST = "0.0.0.0";
+export const DEFAULT_CONTAINER_LISTEN_PORT = 4000;
+
+export interface ContainerListen {
+  /** Bind address, e.g. `0.0.0.0`. */
+  host: string;
+  port: number;
+  /**
+   * Exact `Host` header values accepted (lowercase `name:port`). Replaces the
+   * loopback-only rule.
+   */
+  allowedHosts: readonly string[];
+}
+
+export interface StackEndpoints {
+  databaseUrl?: string;
+  restateIngressUrl?: string;
+  restateAdminUrl?: string;
+  workerUrl?: string;
+  /**
+   * The Worker deployment's version, from `NYLORUN_WORKER_VERSION` (default: the Runtime's
+   * version): the Worker registers `<NYLORUN_WORKER_URL>/nylorun/<version>` with Restate
+   * (`infra/execution.ts`, `workerDeployment`).
+   */
+  workerVersion?: string;
+  s2Endpoint?: string;
+  s2Token?: string;
+  workspaceStoreUrl?: string;
+  /**
+   * Restate request-identity public keys (`publickeyv1_...`) the Worker
+   * endpoint accepts, from `NYLORUN_RESTATE_IDENTITY_KEY` (comma-separated
+   * during a rotation). Unset means the endpoint accepts unsigned requests.
+   */
+  restateIdentityKeys?: string[];
+}
+
+/** The gates service's listener and the token callers must present (`NYLORUN_GATES_*`). */
+export interface GatesConfig {
+  listen: ContainerListen;
+  /** `NYLORUN_GATES_TOKEN`: the bearer the loop presents; at least 32 bytes as hex. */
+  token: string;
+}
+
+/** egress-gate's listener (`NYLORUN_EGRESS_LISTEN_HOST`, `NYLORUN_EGRESS_LISTEN_PORT`). */
+export interface EgressConfig {
+  listen: { host: string; port: number };
+  /**
+   * NYLORUN_EGRESS_KEYS_TOKEN: the token Agent Substrate's keys provider presents to the decide
+   * route on this listener; none: the route is off. 32 bytes or more as hex.
+   */
+  keysToken?: string;
+}
+
+/** Where the loop reaches the gates service (`NYLORUN_GATES_URL`, `NYLORUN_GATES_TOKEN`). */
+export interface ModelGateEndpoint {
+  url: string;
+  token: string;
+}
+
+/**
+ * Core's Harness API listener (`NYLORUN_HARNESS=remote`, or sandbox pods): where harnesses
+ * connect, and the credential they present (`NYLORUN_HARNESS_TOKEN`), which nothing else
+ * accepts. With sandbox pods and no harness container there is no token: only pods' host tokens
+ * are accepted.
+ */
+export interface HarnessListenConfig {
+  listen: ContainerListen;
+  token?: string;
+}
+
+/**
+ * Sandbox pods (`NYLORUN_SANDBOXES_URL`): the sandboxes service core drives them with, its
+ * token, and the Runtime image pods copy the engine from.
+ */
+export interface SandboxesConfig {
+  url: string;
+  token: string;
+  /** `NYLORUN_SANDBOX_HARNESS_IMAGE` (the stack sets it to the Runtime image). */
+  harnessImage: string;
+  /**
+   * Computers: `NYLORUN_SANDBOX_GATEWAY_URL`, the sandbox gateway, and
+   * `NYLORUN_COMPUTER_TICKET_KEY_FILE`, the key core signs tickets with. With them, every pod
+   * Agent is a computer: its runs go to the harness container.
+   */
+  computer?: { gatewayUrl: string; ticketKeyFile: string };
+}
+
+/**
+ * The engine in a pod sandbox (`--service harness` with `NYLORUN_SANDBOX_KIND=pod`): no
+ * harness token; it joins with the join token mounted in the pod.
+ */
+export interface PodHostConfig {
+  /** `NYLORUN_SANDBOX_ID`. */
+  sandboxId: string;
+  /** `NYLORUN_POD_UID` (the downward API's `metadata.uid`). */
+  podUid: string;
+  /** `NYLORUN_SANDBOX_JOIN_FILE`. */
+  joinFile: string;
+  /** The Harness API listener's HTTP base, for `host/join` and `host/renew`. */
+  httpUrl: string;
+  /** `NYLORUN_EGRESS_PROXY`: egress-gate's address, or undefined while it is not published. */
+  egressProxy?: string;
+  /**
+   * `NYLORUN_SANDBOX_EGRESS_CA_FILE`: Agent Substrate's egress CA, which commands trust
+   * for the hosts whose keys Substrate's egress adds.
+   */
+  egressCaFile?: string;
+  /**
+   * `NYLORUN_SANDBOX_SUBSTRATE=1`: the pod is an Agent Substrate actor. A stopping worker sends
+   * it SIGTERM and gives it 30 minutes to be suspended, which the sandboxes service does; the
+   * engine stays up instead of exiting (suspend before drain).
+   */
+  substrate?: boolean;
+  /** Addresses the pod's NetworkPolicy must block, probed before the engine starts. */
+  blocked: BlockedAddress[];
+}
+
+/** A harness process (`--service harness`). */
+export interface HarnessServiceConfig {
+  /** `NYLORUN_HARNESS_URL`: core's Harness API, e.g. `ws://runtime:4200/nylorun/harness/v1`. */
+  url: string;
+  /** `NYLORUN_HARNESS_TOKEN`; absent for a pod's engine, which joins (`pod`). */
+  token?: string;
+  /** Present for the engine in a pod sandbox. */
+  pod?: PodHostConfig;
+  /** `NYLORUN_GATES_URL`: the gates service its model and MCP calls cross, with run tokens. */
+  gatesUrl: string;
+  /** `NYLORUN_HARNESS_ROOT`: its sandboxes. Default `/harness`. */
+  root: string;
+  /** `/health` on `127.0.0.1:<NYLORUN_HARNESS_HEALTH_PORT>` (default 4300). */
+  healthPort: number;
+}
+
+export interface StackConfig {
+  /** The Runtime services this process runs. */
+  services: RuntimeServices;
+  /**
+   * `NYLORUN_WORKLOAD_TOKEN_FILE`, the file of the Runtime's workload token, which a platform
+   * rotates and the Runtime reads at each use, and `NYLORUN_WORKLOAD_TOKEN_ORIGINS`, the
+   * comma-separated origins a `workload` credential's `via` may send it to (#496,
+   * `vault/workload-token.ts`). Absent: no workload token.
+   */
+  workloadToken?: { file?: string; origins?: string[] };
+  /**
+   * `NYLORUN_MODEL_HOST_IDENTITY`: the comma-separated providers whose models may use the Host's
+   * own identity (`vault/host-identity.ts`). Absent: none.
+   */
+  modelHostIdentity?: string[];
+  /**
+   * `NYLORUN_CREDENTIAL_PROVIDER_URL` and `NYLORUN_CREDENTIAL_PROVIDER_TOKEN`, for a process running
+   * egress, core or loop (Host feature `credential-provider`): the outside service egress-gate
+   * hands an Agent owner's connected hosts to, and core asks for their variables. Absent: none.
+   */
+  credentialProvider?: { url: string; token: string };
+  /** Present when the process runs gates. */
+  gates?: GatesConfig;
+  /** Present when the process runs egress. */
+  egress?: EgressConfig;
+  /** Present when the process runs the harness service (`--service harness`). */
+  harness?: HarnessServiceConfig;
+  /** `--service computer`: the engine in a computer. */
+  computer?: ComputerServiceConfig;
+  /**
+   * `NYLORUN_HARNESS` (`in-process` or `remote`; absent means `in-process`), for a process running
+   * core or loop: whether the Tenant runs its own harness, or harnesses connect to
+   * `harnessListener`.
+   */
+  harnessMode?: "in-process" | "remote";
+  /** Present when `harnessMode` is `remote`, or with `sandboxes`: core's Harness API listener. */
+  harnessListener?: HarnessListenConfig;
+  /** Present when the process runs core or loop and `NYLORUN_SANDBOXES_URL` is set. */
+  sandboxes?: SandboxesConfig;
+  /**
+   * Present when the process runs core or loop and `NYLORUN_GATES_URL` is set: its model calls,
+   * remote MCP calls and HTTP tool calls cross the gates service. Required for loop in
+   * container mode; outside a container (a development Host, tests) the loop may make them in
+   * its own process.
+   */
+  modelGate?: ModelGateEndpoint;
+  /**
+   * Present when the process runs core or loop and `NYLORUN_KEYS_URL`, or else
+   * `NYLORUN_GATES_URL`, is set: its vault writes and token signing cross the gateway's
+   * keys service, with `NYLORUN_GATES_TOKEN`, and it never reads the vault key. A loop in a
+   * container always has it, since it requires `NYLORUN_GATES_URL`.
+   */
+  keys?: ModelGateEndpoint;
+  /**
+   * How the stack packs services into containers (`NYLORUN_PACKING`), for the startup log:
+   * `combined` (the local stack: runtime and gateway) or `split` (one container per service).
+   */
+  packing?: "combined" | "split";
+  /** Set when the process was started with the deprecated `--role` (logged at startup). */
+  deprecatedRole?: RuntimeRole;
+  /**
+   * The removed credential resolver's variables (`NYLORUN_RESOLVER_*`, protocol 10) the
+   * environment still sets: ignored, and logged at startup as `resolver_removed`.
+   */
+  removedResolverVariables?: string[];
+  /** Present in container mode; absent means bind what host.json names. */
+  listen?: ContainerListen;
+  endpoints: StackEndpoints;
+  /**
+   * The URL clients use to reach this Host (`NYLORUN_PUBLIC_URL`). In container mode the bind
+   * address (`0.0.0.0:4000`) means nothing outside the container.
+   */
+  publicUrl?: string;
+  /**
+   * How the Runtime may call MCP servers and HTTP tools: `NYLORUN_ENDPOINT_LOOPBACK=docker-host`
+   * (the local stack: `localhost` means the machine that runs Docker), `NYLORUN_ENDPOINT_PRIVATE`
+   * (`allow` or `refuse`) and `NYLORUN_ENDPOINT_HTTP` (`allow` or `refuse`).
+   */
+  delivery?: {
+    loopback?: "docker-host";
+    privateAddresses?: "allow" | "refuse";
+    allowHttp?: boolean;
+  };
+  /**
+   * The A2A server's push notifications (Runtime config `a2a`): `NYLORUN_A2A_PUSH_SECRET`
+   * (`a2a.push.secret`, `whsec_<base64>`) signs them, and `NYLORUN_A2A_PUSH_ALLOW_HOSTS`
+   * (`a2a.push.allowHosts`, comma-separated `host:port`s) names the private hosts they may reach.
+   */
+  a2a?: { push?: { secret?: string; allowHosts?: string[] } };
+  /** Present when the process runs core or loop: who its Tenant is on first start. */
+  tenant?: TenantSettings;
+  /**
+   * The Object store behind the `BlobStore` seam's `s3` adapter, from
+   * `NYLORUN_OBJECT_STORE_*`; the local stack's RustFS. Absent: the Tenant keeps blobs on disk
+   * (the `fs` adapter, `TenantPaths.blobs`).
+   */
+  objectStore?: ObjectStoreConfig;
+  /**
+   * Present when the process runs core and an `OTEL_*` or `NYLORUN_TRACE_CONTENT` variable is set:
+   * how spans are made, for the trace projector and the trace route. `export` is
+   * present only with an endpoint: without one there is no replication slot and no cost.
+   */
+  traces?: TraceConfig;
+  /**
+   * Present when the process runs core, loop or the gateway's services (gates, keys, egress): its
+   * live telemetry, which `host/main.ts` starts. Always present for those: metrics are
+   * served on `/metrics` by default.
+   */
+  telemetry?: TelemetryConfig;
+  /**
+   * Settings read with a warning (an unknown or deprecated value): `host/main.ts` logs each once.
+   * Telemetry fails open, so none of them stops a start.
+   */
+  warnings?: SettingWarning[];
+  /**
+   * Present when `NYLORUN_TUNING` is set: the Host tuning (`tuning.ts`) over its defaults,
+   * and the overrides as written, which core hands a pod sandbox's engine. Every service reads it.
+   */
+  tuning?: { values: HostTuning; overrides: Record<string, unknown> };
+}
+
+/** Traces, from the standard `OTEL_*` variables. */
+export interface TraceConfig {
+  /** `OTEL_SERVICE_NAME` (default `nylorun-runtime`) and `OTEL_RESOURCE_ATTRIBUTES`. */
+  resource: TraceResource;
+  /**
+   * The content kinds spans carry: none by default, all of them with
+   * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT=SPAN_ONLY` (`parseTraceContent`).
+   */
+  content: TraceContentKind[];
+  /** Where the projector posts: the traces URL and `OTEL_EXPORTER_OTLP_HEADERS`. */
+  export?: { url: string; headers: Record<string, string> };
+}
+
+/** Where the Object store is and the credential for it (`NYLORUN_OBJECT_STORE_*`). */
+export interface ObjectStoreConfig {
+  /** `NYLORUN_OBJECT_STORE_ENDPOINT`: the S3 endpoint, e.g. `http://rustfs:9000`. */
+  endpoint: string;
+  /** `NYLORUN_OBJECT_STORE_BUCKET`. Default `nylorun`. */
+  bucket: string;
+  /** `NYLORUN_OBJECT_STORE_REGION`. Default `us-east-1`. */
+  region: string;
+  /** `NYLORUN_OBJECT_STORE_ACCESS_KEY`. */
+  accessKeyId: string;
+  /** `NYLORUN_OBJECT_STORE_SECRET_KEY`. */
+  secretAccessKey: string;
+}
+
+/**
+ * The Tenant a Host creates when its database holds none. Later starts open the
+ * Tenant the database holds; only principals missing from it are added.
+ */
+export interface TenantSettings {
+  /** `NYLORUN_TENANT_ID`: the new Tenant's id. Default: a new id. */
+  id?: string;
+  /** `NYLORUN_TENANT_NAME`. Default `default`. */
+  name: string;
+  /**
+   * `NYLORUN_IDENTITY_FILE`: the identity file listing the trusted issuers (Host feature
+   * `trusted-issuers`), read once at boot (`host/main.ts`). Absent: no issuer is trusted.
+   */
+  identityFile?: string;
+  /**
+   * `NYLORUN_MANAGEMENT_KEY_FILE`: a file holding a management key (64 hex characters), which
+   * the Host registers as the principal `bootstrap` at every start, replacing its key when the
+   * file changed (protocol 8). For installations where no one can run `nylorun-operate`.
+   */
+  managementKeyFile?: string;
+}
+
+export class StackConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StackConfigError";
+  }
+}
+
+type EnvSnapshot = Readonly<Record<string, string | undefined>>;
+
+function read(env: EnvSnapshot, name: string): string | undefined {
+  const value = env[name];
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+const USAGE = "Usage: main.js [--service core,loop|gates,keys,egress|harness]";
+
+/** Parses `--service a,b` (or the deprecated `--role`); throws `StackConfigError`. */
+export function parseServices(argv: readonly string[]): ServiceSelection {
+  let service: string | undefined;
+  let role: string | undefined;
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
+    const flag = arg.startsWith("--service")
+      ? "--service"
+      : arg.startsWith("--role")
+        ? "--role"
+        : undefined;
+    let value: string | undefined;
+    if (flag && arg === flag) {
+      value = argv[index + 1];
+      index += 1;
+      if (value === undefined || value.startsWith("-"))
+        throw new StackConfigError(
+          flag === "--service"
+            ? "--service requires a value, e.g. core,loop"
+            : "--role requires a value: api, worker or all",
+        );
+    } else if (flag && arg.startsWith(`${flag}=`)) {
+      value = arg.slice(flag.length + 1);
+    } else {
+      throw new StackConfigError(`Unknown argument ${arg}. ${USAGE}`);
+    }
+    if ((flag === "--service" ? service : role) !== undefined)
+      throw new StackConfigError(`${flag} may only be supplied once`);
+    if (flag === "--service") service = value;
+    else role = value;
+  }
+  if (service !== undefined && role !== undefined)
+    throw new StackConfigError(
+      "--role is the deprecated name of --service; supply only --service",
+    );
+  if (role !== undefined) {
+    if (!Object.hasOwn(ROLE_SERVICES, role))
+      throw new StackConfigError(
+        `Invalid --role ${role}; expected api, worker or all (deprecated: use --service core, loop or core,loop)`,
+      );
+    const deprecatedRole = role as RuntimeRole;
+    return { services: new Set(ROLE_SERVICES[deprecatedRole]), deprecatedRole };
+  }
+  if (service === undefined) return { services: DEFAULT_SERVICES };
+  const names = service.split(",").map((name) => name.trim());
+  const services = new Set<RuntimeService>();
+  for (const name of names) {
+    if (name === "")
+      throw new StackConfigError(`--service ${service} has an empty entry. ${USAGE}`);
+    if (name === "all")
+      throw new StackConfigError("--service all is not a service; use --service core,loop");
+    if (LATER_SERVICES.includes(name))
+      throw new StackConfigError(`The ${name} service is not in this release of the Runtime`);
+    if (!(RUNTIME_SERVICES as readonly string[]).includes(name))
+      throw new StackConfigError(
+        `Unknown service ${name}; expected ${RUNTIME_SERVICES.join(" or ")}`,
+      );
+    if (services.has(name as RuntimeService))
+      throw new StackConfigError(`--service names ${name} twice`);
+    services.add(name as RuntimeService);
+  }
+  const groups = SERVICE_GROUPS.filter((group) => group.some((name) => services.has(name)));
+  if (groups.length > 1)
+    throw new StackConfigError(
+      `--service ${service}: ${groups.map((group) => group.join(" and ")).join(" may not share a process with ")}; run them as separate processes`,
+    );
+  return { services };
+}
+
+function parsePort(name: string, raw: string): number {
+  if (!/^\d+$/.test(raw))
+    throw new StackConfigError(`${name} must be a port number; got ${raw}`);
+  const port = Number(raw);
+  if (port < 1 || port > 65535)
+    throw new StackConfigError(`${name} must be between 1 and 65535; got ${raw}`);
+  return port;
+}
+
+/**
+ * Normalize one `Host` header allowlist entry to lowercase `name:port`.
+ * IPv6 literals must be bracketed (`[::1]:4000`).
+ */
+export function normalizeAllowedHost(name: string, entry: string): string {
+  const value = entry.trim().toLowerCase();
+  const match = /^(\[[0-9a-f:.]+\]|[a-z0-9]([a-z0-9.-]*[a-z0-9])?):(\d+)$/.exec(
+    value,
+  );
+  if (!match)
+    throw new StackConfigError(
+      `${name} entry "${entry}" must be host:port (IPv6 in brackets)`,
+    );
+  parsePort(name, match[3]!);
+  return value;
+}
+
+function loopbackForms(port: number): string[] {
+  return [`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`];
+}
+
+/** A loopback bind address: `127.0.0.1`, `::1` or `localhost`. */
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+function parseUrl(
+  env: EnvSnapshot,
+  name: string,
+  protocols: readonly string[],
+): string | undefined {
+  const raw = read(env, name);
+  if (raw === undefined) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new StackConfigError(`${name} is not a valid URL`);
+  }
+  if (!protocols.includes(url.protocol))
+    throw new StackConfigError(
+      `${name} must use ${protocols.map((p) => p.replace(/:$/, "")).join(" or ")}; got ${url.protocol.replace(/:$/, "")}`,
+    );
+  return raw;
+}
+
+/** Who sends a listener's `Host` headers, for the error when its allowlist is missing. */
+interface AllowedHostsRule {
+  /** e.g. `clients send`. */
+  senders: string;
+  /** An allowlist for the listener's port, e.g. `runtime:4000`. */
+  example: (port: number) => string;
+}
+
+/**
+ * A listener from `<prefix>LISTEN_HOST` (default `0.0.0.0`) and `<prefix>LISTEN_PORT`, and with
+ * `hosts`, the `Host` headers it accepts from `<prefix>ALLOWED_HOSTS`: required unless the
+ * address is loopback, and always with the loopback forms of the port.
+ */
+function parseListener(env: EnvSnapshot, prefix: string, defaultPort: number): { host: string; port: number };
+function parseListener(
+  env: EnvSnapshot,
+  prefix: string,
+  defaultPort: number,
+  hosts: AllowedHostsRule,
+): ContainerListen;
+function parseListener(
+  env: EnvSnapshot,
+  prefix: string,
+  defaultPort: number,
+  hosts?: AllowedHostsRule,
+): { host: string; port: number; allowedHosts?: readonly string[] } {
+  const hostName = `${prefix}LISTEN_HOST`;
+  const host = read(env, hostName) ?? DEFAULT_CONTAINER_LISTEN_HOST;
+  if (/\s|\//.test(host))
+    throw new StackConfigError(`${hostName} is not an address: ${host}`);
+  const portName = `${prefix}LISTEN_PORT`;
+  const rawPort = read(env, portName);
+  const port = rawPort === undefined ? defaultPort : parsePort(portName, rawPort);
+  if (!hosts) return { host, port };
+  const allowedName = `${prefix}ALLOWED_HOSTS`;
+  const explicit = (read(env, allowedName) ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "")
+    .map((entry) => normalizeAllowedHost(allowedName, entry));
+  if (explicit.length === 0 && !isLoopbackHost(host))
+    throw new StackConfigError(
+      `${allowedName} is required when ${hostName} is ${host}: list the Host headers ${hosts.senders}, e.g. ${hosts.example(port)}`,
+    );
+  // Loopback forms of the listen port serve probes from inside the container
+  // (health checks). A browser on the Docker host never sends them: it sends
+  // the published port.
+  return { host, port, allowedHosts: [...new Set([...explicit, ...loopbackForms(port)])] };
+}
+
+/** The API's listener (`NYLORUN_LISTEN_*`, `NYLORUN_ALLOWED_HOSTS`): none when none is set. */
+function parseListen(env: EnvSnapshot): ContainerListen | undefined {
+  if (
+    ["NYLORUN_LISTEN_HOST", "NYLORUN_LISTEN_PORT", "NYLORUN_ALLOWED_HOSTS"].every(
+      (name) => read(env, name) === undefined,
+    )
+  )
+    return undefined;
+  return parseListener(env, "NYLORUN_", DEFAULT_CONTAINER_LISTEN_PORT, {
+    senders: "clients send",
+    example: (port) => `runtime:${port},localhost:<published port>`,
+  });
+}
+
+const IDENTITY_KEY = /^publickeyv1_[1-9A-HJ-NP-Za-km-z]{32,64}$/;
+
+/**
+ * The keys Restate signs with: NYLORUN_RESTATE_IDENTITY_KEY (`publickeyv1_…`, comma-separated),
+ * and NYLORUN_RESTATE_IDENTITY_KEY_FILE, a PEM of the key (Restate's private key as the Helm chart
+ * mounts it, or the public key) whose `publickeyv1_…` the Runtime computes.
+ */
+function parseIdentityKeys(env: EnvSnapshot): string[] | undefined {
+  const raw = read(env, "NYLORUN_RESTATE_IDENTITY_KEY");
+  const file = read(env, "NYLORUN_RESTATE_IDENTITY_KEY_FILE");
+  if (raw === undefined && file === undefined) return undefined;
+  const keys = (raw ?? "")
+    .split(",")
+    .map((key) => key.trim())
+    .filter((key) => key !== "");
+  if (file !== undefined) {
+    try {
+      keys.push(restateIdentityKeyOf(readFileSync(file, "utf8")));
+    } catch (error) {
+      throw new StackConfigError(
+        `NYLORUN_RESTATE_IDENTITY_KEY_FILE ${file} is not an Ed25519 PEM: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  for (const key of keys)
+    if (!IDENTITY_KEY.test(key))
+      throw new StackConfigError(
+        "NYLORUN_RESTATE_IDENTITY_KEY must be publickeyv1_<base58 Ed25519 public key>, comma-separated",
+      );
+  return keys.length > 0 ? keys : undefined;
+}
+
+/** Parse the stack configuration; throws `StackConfigError` naming the variable. */
+export function parseStackConfig(
+  env: EnvSnapshot,
+  argv: readonly string[],
+): StackConfig {
+  const { services, deprecatedRole } = parseServices(argv);
+  const tuning = parseTuning(env);
+  if (services.has("harness"))
+    return { services, harness: parseHarnessService(env), endpoints: {}, ...(tuning ? { tuning } : {}) };
+  if (services.has("computer"))
+    return { services, computer: parseComputerService(env), endpoints: {}, ...(tuning ? { tuning } : {}) };
+  // The image sets NYLORUN_LISTEN_*: only the API's processes read them.
+  const servesApi = services.has("core") || services.has("loop");
+  const listen = servesApi ? parseListen(env) : undefined;
+  const gates = services.has("gates") || services.has("keys") ? parseGates(env) : undefined;
+  const egress = services.has("egress") ? parseEgress(env) : undefined;
+  // The gates service's clients: the loop's model and tool calls.
+  const modelGate = servesApi ? parseModelGate(env) : undefined;
+  // The keys service is the gateway's unless NYLORUN_KEYS_URL names another listener.
+  const keys = servesApi ? (parseKeysEndpoint(env) ?? modelGate) : undefined;
+  if (services.has("loop") && listen && !modelGate)
+    throw new StackConfigError(
+      "NYLORUN_GATES_URL is required for the loop service in a container: model calls go through the gates service (the gateway container), so the loop never holds a model credential. Set NYLORUN_GATES_URL and NYLORUN_GATES_TOKEN (`nylorun start` sets both)",
+    );
+  const rawPacking = read(env, "NYLORUN_PACKING");
+  if (rawPacking !== undefined && rawPacking !== "combined" && rawPacking !== "split")
+    throw new StackConfigError(`NYLORUN_PACKING must be combined or split, not ${rawPacking}`);
+  const http = ["http:", "https:"] as const;
+  const endpoints: StackEndpoints = {};
+  const databaseUrl = parseUrl(env, "NYLORUN_DATABASE_URL", [
+    "postgres:",
+    "postgresql:",
+  ]);
+  if (databaseUrl) endpoints.databaseUrl = databaseUrl;
+  const restateIngressUrl = parseUrl(env, "NYLORUN_RESTATE_INGRESS_URL", http);
+  if (restateIngressUrl) endpoints.restateIngressUrl = restateIngressUrl;
+  const restateAdminUrl = parseUrl(env, "NYLORUN_RESTATE_ADMIN_URL", http);
+  if (restateAdminUrl) endpoints.restateAdminUrl = restateAdminUrl;
+  const workerUrl = parseUrl(env, "NYLORUN_WORKER_URL", http);
+  if (workerUrl) endpoints.workerUrl = workerUrl;
+  const workerVersion = read(env, "NYLORUN_WORKER_VERSION");
+  if (workerVersion !== undefined) {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(workerVersion))
+      throw new StackConfigError(
+        "NYLORUN_WORKER_VERSION must be 1 to 64 letters, digits, `.`, `_` or `-` (it is a URL path segment)",
+      );
+    endpoints.workerVersion = workerVersion;
+  }
+  const s2Endpoint = parseUrl(env, "NYLORUN_S2_ENDPOINT", http);
+  if (s2Endpoint) endpoints.s2Endpoint = s2Endpoint;
+  const s2Token = read(env, "NYLORUN_S2_TOKEN");
+  if (s2Token) endpoints.s2Token = s2Token;
+  const workspaceStoreUrl = parseUrl(env, "NYLORUN_WORKSPACE_STORE_URL", [
+    "file:",
+    "s3:",
+    "http:",
+    "https:",
+  ]);
+  if (workspaceStoreUrl) endpoints.workspaceStoreUrl = workspaceStoreUrl;
+  const restateIdentityKeys = parseIdentityKeys(env);
+  if (restateIdentityKeys) endpoints.restateIdentityKeys = restateIdentityKeys;
+  const publicUrl = parseUrl(env, "NYLORUN_PUBLIC_URL", http)?.replace(/\/+$/, "");
+  const harnessMode = servesApi ? parseHarnessMode(env) : undefined;
+  const sandboxes = servesApi ? parseSandboxes(env) : undefined;
+  // Pods connect to the Harness API listener even when the Tenant runs its own harness.
+  const harnessListener =
+    harnessMode === "remote" || sandboxes
+      ? parseHarnessListener(env, harnessMode === "remote")
+      : undefined;
+  if (harnessListener && listen?.port === harnessListener.listen.port)
+    throw new StackConfigError("NYLORUN_HARNESS_LISTEN_PORT must differ from NYLORUN_LISTEN_PORT");
+  const delivery = parseDelivery(env);
+  const a2a = parseA2a(env);
+  const tenant = servesApi ? parseTenant(env) : undefined;
+  const workloadToken = parseWorkloadToken(env);
+  const modelHostIdentity = parseModelHostIdentity(env);
+  const credentialProvider = servesApi || services.has("egress") ? parseCredentialProvider(env) : undefined;
+  const objectStore = parseObjectStore(env);
+  const warnings: SettingWarning[] = [];
+  const traces = services.has("core") ? parseTraces(env, warnings) : undefined;
+  const gateway = services.has("gates") || services.has("keys") || services.has("egress");
+  const telemetry =
+    servesApi || gateway
+      ? parseTelemetry(env, warnings, {
+          serviceName: gateway ? GATEWAY_SERVICE_NAME : DEFAULT_SERVICE_NAME,
+          // A local Host (no NYLORUN_LISTEN_*) serves /metrics on loopback, as it does its API.
+          prometheusHost: servesApi && !listen ? "127.0.0.1" : "0.0.0.0",
+        })
+      : undefined;
+  const removedResolverVariables = Object.keys(env)
+    .filter((name) => name.startsWith(REMOVED_RESOLVER_PREFIX) && read(env, name) !== undefined)
+    .sort();
+  return {
+    services,
+    ...(deprecatedRole ? { deprecatedRole } : {}),
+    ...(removedResolverVariables.length ? { removedResolverVariables } : {}),
+    ...(gates ? { gates } : {}),
+    ...(egress ? { egress } : {}),
+    ...(modelGate ? { modelGate } : {}),
+    ...(keys ? { keys } : {}),
+    ...(rawPacking ? { packing: rawPacking } : {}),
+    ...(listen ? { listen } : {}),
+    endpoints,
+    ...(publicUrl ? { publicUrl } : {}),
+    ...(harnessMode ? { harnessMode } : {}),
+    ...(harnessListener ? { harnessListener } : {}),
+    ...(sandboxes ? { sandboxes } : {}),
+    ...(delivery ? { delivery } : {}),
+    ...(a2a ? { a2a } : {}),
+    ...(tenant ? { tenant } : {}),
+    ...(workloadToken ? { workloadToken } : {}),
+    ...(modelHostIdentity ? { modelHostIdentity } : {}),
+    ...(credentialProvider ? { credentialProvider } : {}),
+    ...(objectStore ? { objectStore } : {}),
+    ...(traces ? { traces } : {}),
+    ...(telemetry ? { telemetry } : {}),
+    ...(warnings.length ? { warnings } : {}),
+    ...(tuning ? { tuning } : {}),
+  };
+}
+
+/** `StackConfig.tuning` from `NYLORUN_TUNING`, or undefined when it is unset. */
+function parseTuning(env: EnvSnapshot): StackConfig["tuning"] {
+  const raw = read(env, "NYLORUN_TUNING");
+  if (raw === undefined) return undefined;
+  try {
+    const { tuning, overrides } = parseHostTuning(raw);
+    return { values: tuning, overrides: overrides ?? {} };
+  } catch (error) {
+    if (error instanceof HostTuningError) throw new StackConfigError(error.message);
+    throw error;
+  }
+}
+
+/**
+ * `StackConfig.traces`. The OTLP endpoint is the collector's base URL, to which
+ * `/v1/traces` is added; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is the full URL and wins. Headers
+ * and resource attributes are `key=value` lists separated by commas, values percent-encoded (the
+ * OTel SDK environment specification).
+ */
+function parseTraces(env: EnvSnapshot, warnings: SettingWarning[]): TraceConfig | undefined {
+  const target = otlpTarget(env, "traces");
+  const resource = keyValues(env, "OTEL_RESOURCE_ATTRIBUTES");
+  const { content, set } = parseTraceContent(env, warnings);
+  const serviceName = read(env, "OTEL_SERVICE_NAME") ?? resource["service.name"];
+  // Nothing set: the defaults (`service.name` nylorun-runtime, no content, no export).
+  if (target === undefined && serviceName === undefined && Object.keys(resource).length === 0 && !set)
+    return undefined;
+  return {
+    resource: {
+      serviceName: serviceName ?? DEFAULT_SERVICE_NAME,
+      attributes: resource,
+    },
+    content,
+    ...(target ? { export: { url: target.url, headers: { ...target.headers } } } : {}),
+  };
+}
+
+/** The values of `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` (the GenAI conventions). */
+export const CAPTURE_CONTENT_VALUES = ["NO_CONTENT", "SPAN_ONLY", "EVENT_ONLY", "SPAN_AND_EVENT"] as const;
+
+/**
+ * The content spans carry, from `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT`, read
+ * without regard to case: `NO_CONTENT` (the default) none, `SPAN_ONLY` every kind. The event forms
+ * wait for OTLP logs: `EVENT_ONLY` acts as `NO_CONTENT` and `SPAN_AND_EVENT` as `SPAN_ONLY`, with a
+ * warning; an unknown value is `NO_CONTENT`, with a warning, never a failed start.
+ *
+ * For one release the old variables still work when the new one is unset, each with a deprecation
+ * warning: `NYLORUN_TRACE_CONTENT`'s kinds (an unknown kind still stops the start, as before) and
+ * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`, every kind. Set beside the new one,
+ * they are ignored. `set` says whether any of them is set.
+ */
+export function parseTraceContent(
+  env: EnvSnapshot,
+  warnings: SettingWarning[] = [],
+): { content: TraceContentKind[]; set: boolean } {
+  const NEW = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT";
+  const KINDS = "NYLORUN_TRACE_CONTENT";
+  const MESSAGES = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
+  const raw = read(env, NEW);
+  const kinds = read(env, KINDS);
+  const messages = read(env, MESSAGES);
+  const old = [kinds === undefined ? undefined : KINDS, messages === undefined ? undefined : MESSAGES].filter(
+    (name): name is string => name !== undefined,
+  );
+  const all = [...TRACE_CONTENT_KINDS];
+  if (raw !== undefined) {
+    for (const variable of old)
+      warnings.push({
+        event: "trace_content_deprecated",
+        variable,
+        message: `${variable} is deprecated and ignored beside ${NEW}; remove it`,
+      });
+    const value = raw.toUpperCase();
+    switch (value) {
+      case "NO_CONTENT":
+        return { content: [], set: true };
+      case "SPAN_ONLY":
+        return { content: all, set: true };
+      case "EVENT_ONLY":
+      case "SPAN_AND_EVENT":
+        warnings.push({
+          event: "trace_content_events_unsupported",
+          variable: NEW,
+          message: `${NEW}=${value}: the Runtime does not emit content as events yet, so this acts as ${value === "EVENT_ONLY" ? "NO_CONTENT" : "SPAN_ONLY"}`,
+        });
+        return { content: value === "EVENT_ONLY" ? [] : all, set: true };
+      default:
+        warnings.push({
+          event: "trace_content_unknown",
+          variable: NEW,
+          message: `${NEW} is one of ${CAPTURE_CONTENT_VALUES.join(", ")}, not ${raw}: spans carry no content`,
+        });
+        return { content: [], set: true };
+    }
+  }
+  const content = new Set<TraceContentKind>(messages?.toLowerCase() === "true" ? all : []);
+  for (const kind of (kinds ?? "").split(",").map((part) => part.trim())) {
+    if (kind === "") continue;
+    if (!(TRACE_CONTENT_KINDS as readonly string[]).includes(kind))
+      throw new StackConfigError(
+        `NYLORUN_TRACE_CONTENT lists ${TRACE_CONTENT_KINDS.join(", ")}, not ${kind}`,
+      );
+    content.add(kind as TraceContentKind);
+  }
+  for (const variable of old)
+    warnings.push({
+      event: "trace_content_deprecated",
+      variable,
+      message: `${variable} is deprecated and goes in the next release: set ${NEW}=SPAN_ONLY for content on spans, or NO_CONTENT`,
+    });
+  return { content: TRACE_CONTENT_KINDS.filter((kind) => content.has(kind)), set: old.length > 0 };
+}
+
+/**
+ * Where a signal's OTLP/HTTP exporter posts: `OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT` as the full
+ * URL, else `OTEL_EXPORTER_OTLP_ENDPOINT` plus `/v1/<signal>`; with `OTEL_EXPORTER_OTLP_HEADERS`
+ * and the signal's own headers over them. Undefined without an endpoint.
+ */
+function otlpTarget(env: EnvSnapshot, signal: "traces" | "metrics"): { url: string; headers: Record<string, string> } | undefined {
+  const upper = signal.toUpperCase();
+  const own = parseUrl(env, `OTEL_EXPORTER_OTLP_${upper}_ENDPOINT`, ["http:", "https:"]);
+  const base = parseUrl(env, "OTEL_EXPORTER_OTLP_ENDPOINT", ["http:", "https:"]);
+  const url = own ?? (base === undefined ? undefined : `${base.replace(/\/+$/, "")}/v1/${signal}`);
+  if (url === undefined) return undefined;
+  return {
+    url,
+    headers: { ...keyValues(env, "OTEL_EXPORTER_OTLP_HEADERS"), ...keyValues(env, `OTEL_EXPORTER_OTLP_${upper}_HEADERS`) },
+  };
+}
+
+/** The OTLP/HTTP endpoint the OTel SDK uses when none is set, for an exporter named explicitly. */
+const DEFAULT_OTLP_ENDPOINT = "http://localhost:4318";
+
+/**
+ * `StackConfig.telemetry`. Metrics: `OTEL_METRICS_EXPORTER`, a comma list of
+ * `prometheus`, `otlp` and `none` (default `prometheus`, and `otlp` too when an OTLP endpoint is
+ * set; an unknown name is skipped with a warning). Prometheus listens on
+ * `OTEL_EXPORTER_PROMETHEUS_HOST`:`OTEL_EXPORTER_PROMETHEUS_PORT` (default `0.0.0.0:9464`). Spans:
+ * only with an OTLP endpoint, sampled by `OTEL_TRACES_SAMPLER` (default `parentbased_always_on`)
+ * and its `_ARG`; an unknown sampler or ratio is the default, with a warning. `service.name`:
+ * `OTEL_SERVICE_NAME`, then `OTEL_RESOURCE_ATTRIBUTES`' own, then the process's.
+ */
+function parseTelemetry(
+  env: EnvSnapshot,
+  warnings: SettingWarning[],
+  defaults: { serviceName: string; prometheusHost: string },
+): TelemetryConfig {
+  const attributes = keyValues(env, "OTEL_RESOURCE_ATTRIBUTES");
+  const serviceName = read(env, "OTEL_SERVICE_NAME") ?? attributes["service.name"] ?? defaults.serviceName;
+  delete attributes["service.name"];
+  const metricsTarget = otlpTarget(env, "metrics");
+  const named = read(env, "OTEL_METRICS_EXPORTER");
+  const exporters = new Set<string>();
+  if (named === undefined) {
+    exporters.add("prometheus");
+    if (metricsTarget) exporters.add("otlp");
+  } else
+    for (const name of named.split(",").map((part) => part.trim().toLowerCase())) {
+      if (name === "" || name === "none") continue;
+      if (name === "prometheus" || name === "otlp") exporters.add(name);
+      else
+        warnings.push({
+          event: "telemetry_setting_ignored",
+          variable: "OTEL_METRICS_EXPORTER",
+          message: `OTEL_METRICS_EXPORTER lists prometheus, otlp or none, not ${name}: it is skipped`,
+        });
+    }
+  const metrics: { -readonly [K in keyof TelemetryConfig["metrics"]]: TelemetryConfig["metrics"][K] } = {};
+  if (exporters.has("prometheus")) {
+    const rawPort = read(env, "OTEL_EXPORTER_PROMETHEUS_PORT");
+    const port = rawPort === undefined ? 9464 : Number(rawPort);
+    if (!Number.isInteger(port) || port < 0 || port > 65535)
+      throw new StackConfigError(`OTEL_EXPORTER_PROMETHEUS_PORT must be a port (0 to 65535), not ${rawPort}`);
+    metrics.prometheus = { host: read(env, "OTEL_EXPORTER_PROMETHEUS_HOST") ?? defaults.prometheusHost, port };
+  }
+  if (exporters.has("otlp"))
+    metrics.otlp = metricsTarget ?? { url: `${DEFAULT_OTLP_ENDPOINT}/v1/metrics`, headers: keyValues(env, "OTEL_EXPORTER_OTLP_HEADERS") };
+  const tracesTarget = otlpTarget(env, "traces");
+  return {
+    resource: { serviceName, attributes },
+    metrics,
+    ...(tracesTarget ? { traces: { ...tracesTarget, sampler: parseSampler(env, warnings) } } : {}),
+  };
+}
+
+/** `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`; the default for anything else. */
+function parseSampler(env: EnvSnapshot, warnings: SettingWarning[]): { name: TraceSamplerName; ratio: number } {
+  const raw = read(env, "OTEL_TRACES_SAMPLER")?.toLowerCase();
+  let name: TraceSamplerName = "parentbased_always_on";
+  if (raw !== undefined) {
+    if ((TRACE_SAMPLERS as readonly string[]).includes(raw)) name = raw as TraceSamplerName;
+    else
+      warnings.push({
+        event: "telemetry_setting_ignored",
+        variable: "OTEL_TRACES_SAMPLER",
+        message: `OTEL_TRACES_SAMPLER is one of ${TRACE_SAMPLERS.join(", ")}, not ${raw}: parentbased_always_on is used`,
+      });
+  }
+  const arg = read(env, "OTEL_TRACES_SAMPLER_ARG");
+  let ratio = 1;
+  if (arg !== undefined && name.endsWith("traceidratio")) {
+    const parsed = Number(arg);
+    if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1) ratio = parsed;
+    else
+      warnings.push({
+        event: "telemetry_setting_ignored",
+        variable: "OTEL_TRACES_SAMPLER_ARG",
+        message: `OTEL_TRACES_SAMPLER_ARG is a ratio from 0 to 1, not ${arg}: 1 is used`,
+      });
+  }
+  return { name, ratio };
+}
+
+/** A `key=value,key=value` variable, values percent-decoded; a malformed one is refused. */
+function keyValues(env: EnvSnapshot, name: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of (read(env, name) ?? "").split(",")) {
+    if (pair.trim() === "") continue;
+    const at = pair.indexOf("=");
+    const key = at < 0 ? "" : pair.slice(0, at).trim();
+    if (key === "") throw new StackConfigError(`${name} must be key=value pairs separated by commas`);
+    try {
+      out[key] = decodeURIComponent(pair.slice(at + 1).trim());
+    } catch {
+      throw new StackConfigError(`${name} has a value that is not percent-encoded: ${key}`);
+    }
+  }
+  return out;
+}
+
+/** S3 bucket names: 3 to 63 lowercase letters, digits, dots and hyphens. */
+const BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+
+/** `StackConfig.objectStore` from `NYLORUN_OBJECT_STORE_*`, or `undefined` without an endpoint. */
+function parseObjectStore(env: EnvSnapshot): ObjectStoreConfig | undefined {
+  const endpoint = parseUrl(env, "NYLORUN_OBJECT_STORE_ENDPOINT", ["http:", "https:"]);
+  const accessKeyId = read(env, "NYLORUN_OBJECT_STORE_ACCESS_KEY");
+  const secretAccessKey = read(env, "NYLORUN_OBJECT_STORE_SECRET_KEY");
+  if (endpoint === undefined) {
+    if (accessKeyId !== undefined || secretAccessKey !== undefined)
+      throw new StackConfigError(
+        "NYLORUN_OBJECT_STORE_ACCESS_KEY or _SECRET_KEY is set without NYLORUN_OBJECT_STORE_ENDPOINT: set the S3 endpoint, e.g. http://rustfs:9000",
+      );
+    return undefined;
+  }
+  if (accessKeyId === undefined || secretAccessKey === undefined)
+    throw new StackConfigError(
+      "NYLORUN_OBJECT_STORE_ACCESS_KEY and NYLORUN_OBJECT_STORE_SECRET_KEY are required with NYLORUN_OBJECT_STORE_ENDPOINT (`nylorun start` sets them)",
+    );
+  const bucket = read(env, "NYLORUN_OBJECT_STORE_BUCKET") ?? "nylorun";
+  if (!BUCKET.test(bucket))
+    throw new StackConfigError(
+      `NYLORUN_OBJECT_STORE_BUCKET must be an S3 bucket name (3 to 63 of a-z 0-9 . -), not ${bucket}`,
+    );
+  const region = read(env, "NYLORUN_OBJECT_STORE_REGION") ?? "us-east-1";
+  if (!/^[a-z0-9-]+$/.test(region))
+    throw new StackConfigError(`NYLORUN_OBJECT_STORE_REGION is not a region: ${region}`);
+  return { endpoint: endpoint.replace(/\/+$/, ""), bucket, region, accessKeyId, secretAccessKey };
+}
+
+function parseTenant(env: EnvSnapshot): TenantSettings {
+  const id = read(env, "NYLORUN_TENANT_ID");
+  if (id !== undefined && !isTenantId(id))
+    throw new StackConfigError(
+      `NYLORUN_TENANT_ID must be a Tenant id (tn_ and 26 Crockford characters), not ${id}`,
+    );
+  const identityFile = read(env, "NYLORUN_IDENTITY_FILE");
+  const managementKeyFile = read(env, "NYLORUN_MANAGEMENT_KEY_FILE");
+  return {
+    ...(id ? { id } : {}),
+    name: read(env, "NYLORUN_TENANT_NAME") ?? "default",
+    ...(identityFile ? { identityFile } : {}),
+    ...(managementKeyFile ? { managementKeyFile } : {}),
+  };
+}
+
+/**
+ * `StackConfig.workloadToken` (#496): the Runtime's workload token, which the gates read for a
+ * custom model and for `workload` credentials, and the in-process Tenant does without them.
+ */
+function parseWorkloadToken(env: EnvSnapshot): StackConfig["workloadToken"] {
+  const file = read(env, "NYLORUN_WORKLOAD_TOKEN_FILE");
+  const origins = parseOrigins(read(env, "NYLORUN_WORKLOAD_TOKEN_ORIGINS"));
+  if (file === undefined && origins === undefined) return undefined;
+  return { ...(file ? { file } : {}), ...(origins ? { origins } : {}) };
+}
+
+/** `StackConfig.modelHostIdentity`: each a provider that can use the Host's identity. */
+function parseModelHostIdentity(env: EnvSnapshot): StackConfig["modelHostIdentity"] {
+  const raw = read(env, "NYLORUN_MODEL_HOST_IDENTITY");
+  if (raw === undefined) return undefined;
+  const providers = [...new Set(raw.split(",").map((item) => item.trim()).filter((item) => item !== ""))];
+  for (const provider of providers) {
+    if (!(HOST_IDENTITY_PROVIDERS as readonly string[]).includes(provider))
+      throw new StackConfigError(
+        `NYLORUN_MODEL_HOST_IDENTITY: ${provider} can't use the Host's identity (only ${HOST_IDENTITY_PROVIDERS.join(", ")})`,
+      );
+  }
+  return providers.length ? providers : undefined;
+}
+
+/**
+ * `StackConfig.credentialProvider`: the provider's `http` or `https` base URL (no credentials,
+ * query or fragment; `http` is for a provider on the Docker bridge or the machine itself) and its
+ * token, each required with the other.
+ */
+function parseCredentialProvider(env: EnvSnapshot): StackConfig["credentialProvider"] {
+  const raw = read(env, "NYLORUN_CREDENTIAL_PROVIDER_URL");
+  const token = read(env, "NYLORUN_CREDENTIAL_PROVIDER_TOKEN");
+  if (raw === undefined && token === undefined) return undefined;
+  if (raw === undefined)
+    throw new StackConfigError(
+      "NYLORUN_CREDENTIAL_PROVIDER_TOKEN is set without NYLORUN_CREDENTIAL_PROVIDER_URL: set the provider's base URL, such as http://172.17.0.1:18793/edge/provider",
+    );
+  if (token === undefined)
+    throw new StackConfigError(
+      "NYLORUN_CREDENTIAL_PROVIDER_TOKEN is required with NYLORUN_CREDENTIAL_PROVIDER_URL: the bearer the provider accepts",
+    );
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new StackConfigError(`NYLORUN_CREDENTIAL_PROVIDER_URL is not a URL: ${raw}`);
+  }
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || url.search || url.hash)
+    throw new StackConfigError(
+      "NYLORUN_CREDENTIAL_PROVIDER_URL must be an http or https base URL with no credentials, query or fragment, such as http://172.17.0.1:18793/edge/provider",
+    );
+  if (token.length < 16 || !/^[\x21-\x7e]+$/.test(token))
+    throw new StackConfigError(
+      "NYLORUN_CREDENTIAL_PROVIDER_TOKEN must be at least 16 printable characters with no spaces",
+    );
+  return { url: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), token };
+}
+
+/** `NYLORUN_WORKLOAD_TOKEN_ORIGINS`: each an `https` origin (`http` only to a loopback host). */
+function parseOrigins(raw: string | undefined): string[] | undefined {
+  if (raw === undefined) return undefined;
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item !== "")
+    .map((item) => {
+      let url: URL;
+      try {
+        url = new URL(item);
+      } catch {
+        throw new StackConfigError(`NYLORUN_WORKLOAD_TOKEN_ORIGINS: ${item} is not a URL`);
+      }
+      const loopback = url.protocol === "http:" && LOOPBACK_HOSTS.test(url.hostname);
+      if ((url.protocol !== "https:" && !loopback) || url.origin !== item.replace(/\/$/, ""))
+        throw new StackConfigError(
+          `NYLORUN_WORKLOAD_TOKEN_ORIGINS: ${item} must be an https origin, such as https://gateway.example.com`,
+        );
+      return url.origin;
+    });
+}
+
+const GATES_TOKEN = /^[0-9a-f]{64,}$/i;
+
+/** `NYLORUN_HARNESS`: `in-process` (the default when unset) or `remote`. */
+function parseHarnessMode(env: EnvSnapshot): "in-process" | "remote" | undefined {
+  const raw = read(env, "NYLORUN_HARNESS");
+  if (raw === undefined) return undefined;
+  if (raw !== "in-process" && raw !== "remote")
+    throw new StackConfigError(`NYLORUN_HARNESS must be in-process or remote, not ${raw}`);
+  return raw;
+}
+
+function parseHarnessToken(env: EnvSnapshot, why: string): string {
+  const token = read(env, "NYLORUN_HARNESS_TOKEN");
+  if (token === undefined)
+    throw new StackConfigError(`NYLORUN_HARNESS_TOKEN is required ${why} (\`nylorun start\` sets it)`);
+  if (!GATES_TOKEN.test(token))
+    throw new StackConfigError("NYLORUN_HARNESS_TOKEN must be at least 32 bytes as hex");
+  return token;
+}
+
+/** `StackConfig.sandboxes` from `NYLORUN_SANDBOXES_*`, or undefined without a URL. */
+function parseSandboxes(env: EnvSnapshot): SandboxesConfig | undefined {
+  const url = parseUrl(env, "NYLORUN_SANDBOXES_URL", ["http:", "https:"]);
+  if (url === undefined) return undefined;
+  const token = read(env, "NYLORUN_SANDBOXES_TOKEN");
+  if (token === undefined || token.length < 32)
+    throw new StackConfigError(
+      "NYLORUN_SANDBOXES_TOKEN (at least 32 characters) is required with NYLORUN_SANDBOXES_URL (`nylorun local sandbox enable` sets both)",
+    );
+  const harnessImage = read(env, "NYLORUN_SANDBOX_HARNESS_IMAGE");
+  if (harnessImage === undefined || /\s/.test(harnessImage))
+    throw new StackConfigError(
+      "NYLORUN_SANDBOX_HARNESS_IMAGE is required with NYLORUN_SANDBOXES_URL: the Runtime image sandbox pods copy the engine from (`nylorun start` sets it)",
+    );
+  const gatewayUrl = parseUrl(env, "NYLORUN_SANDBOX_GATEWAY_URL", ["http:", "https:"]);
+  const ticketKeyFile = read(env, "NYLORUN_COMPUTER_TICKET_KEY_FILE");
+  if ((gatewayUrl === undefined) !== (ticketKeyFile === undefined))
+    throw new StackConfigError(
+      "NYLORUN_SANDBOX_GATEWAY_URL and NYLORUN_COMPUTER_TICKET_KEY_FILE go together: computers need the sandbox gateway and the key core signs their tickets with",
+    );
+  return {
+    url: url.replace(/\/+$/, ""),
+    token,
+    harnessImage,
+    ...(gatewayUrl && ticketKeyFile ? { computer: { gatewayUrl: gatewayUrl.replace(/\/+$/, ""), ticketKeyFile } } : {}),
+  };
+}
+
+/**
+ * `StackConfig.harnessListener` from `NYLORUN_HARNESS_LISTEN_*` and `NYLORUN_HARNESS_TOKEN`
+ * (required with `NYLORUN_HARNESS=remote`; optional when only sandbox pods connect).
+ */
+function parseHarnessListener(env: EnvSnapshot, tokenRequired = true): HarnessListenConfig {
+  const listen = parseListener(env, "NYLORUN_HARNESS_", DEFAULT_HARNESS_LISTEN_PORT, {
+    senders: "harnesses send",
+    example: (port) => `runtime:${port}`,
+  });
+  const token =
+    tokenRequired || read(env, "NYLORUN_HARNESS_TOKEN") !== undefined
+      ? parseHarnessToken(env, "with NYLORUN_HARNESS=remote: the credential harnesses present")
+      : undefined;
+  return { listen, ...(token ? { token } : {}) };
+}
+
+/** What a harness process must not hold: it runs next to agent code. */
+const HARNESS_REFUSED = ["NYLORUN_DATABASE_URL", "NYLORUN_GATES_TOKEN", "NYLORUN_KEYS_URL"];
+
+/**
+ * The engine in a computer, from the variables its template carries: the port, the
+ * ticket key's public half and the file with the actor's name. It holds no Runtime credential.
+ */
+function parseComputerService(env: EnvSnapshot): ComputerServiceConfig {
+  const held = [...HARNESS_REFUSED, "NYLORUN_HARNESS_TOKEN", "NYLORUN_JOIN_TOKEN"].filter((name) => read(env, name) !== undefined);
+  if (held.length > 0)
+    throw new StackConfigError(`--service computer refuses to start with ${held.join(", ")} set: a computer holds no Runtime credential`);
+  const ticketKey = read(env, "NYLORUN_COMPUTER_TICKET_KEY");
+  if (ticketKey === undefined || !ticketKey.includes("PUBLIC KEY"))
+    throw new StackConfigError("NYLORUN_COMPUTER_TICKET_KEY is required for --service computer: the PEM public key tickets are checked with");
+  const nameFile = read(env, "NYLORUN_COMPUTER_NAME_FILE");
+  if (nameFile === undefined)
+    throw new StackConfigError("NYLORUN_COMPUTER_NAME_FILE is required for --service computer: the file holding the actor's name");
+  const rawPort = read(env, "NYLORUN_COMPUTER_PORT");
+  const root = read(env, "NYLORUN_HARNESS_ROOT") ?? "/harness";
+  if (!root.startsWith("/"))
+    throw new StackConfigError(`NYLORUN_HARNESS_ROOT must be an absolute path, not ${root}`);
+  const egressCaFile = read(env, "NYLORUN_SANDBOX_EGRESS_CA_FILE");
+  return {
+    port: rawPort === undefined ? 8080 : parsePort("NYLORUN_COMPUTER_PORT", rawPort),
+    ticketKey,
+    nameFile,
+    root,
+    ...(egressCaFile ? { egressCaFile } : {}),
+    substrate: read(env, "NYLORUN_SANDBOX_SUBSTRATE") === "1",
+  };
+}
+
+/** `StackConfig.harness` from `NYLORUN_HARNESS_*` and `NYLORUN_GATES_URL`. */
+function parseHarnessService(env: EnvSnapshot): HarnessServiceConfig {
+  const held = [
+    ...HARNESS_REFUSED.filter((name) => read(env, name) !== undefined),
+    ...Object.keys(env)
+      .filter((name) => name.startsWith("NYLORUN_RESTATE_") && read(env, name) !== undefined)
+      .sort(),
+  ];
+  if (held.length > 0)
+    throw new StackConfigError(
+      `--service harness refuses to start with ${held.join(", ")} set: a harness reaches no database, no gate or keys credential and no Restate`,
+    );
+  const pod = read(env, "NYLORUN_SANDBOX_KIND") === "pod";
+  const url = parseUrl(env, "NYLORUN_HARNESS_URL", pod ? ["http:", "https:", "ws:", "wss:"] : ["ws:", "wss:"]);
+  if (url === undefined)
+    throw new StackConfigError(
+      "NYLORUN_HARNESS_URL is required for --service harness: core's Harness API, e.g. ws://runtime:4200/nylorun/harness/v1",
+    );
+  const gatesUrl = parseUrl(env, "NYLORUN_GATES_URL", ["http:", "https:"]);
+  if (gatesUrl === undefined)
+    throw new StackConfigError(
+      "NYLORUN_GATES_URL is required for --service harness: its model and MCP calls go through the gates service, e.g. http://gateway:4100",
+    );
+  const root = read(env, "NYLORUN_HARNESS_ROOT") ?? "/harness";
+  if (!root.startsWith("/"))
+    throw new StackConfigError(`NYLORUN_HARNESS_ROOT must be an absolute path, not ${root}`);
+  const rawHealth = read(env, "NYLORUN_HARNESS_HEALTH_PORT");
+  const podHost = pod ? parsePodHost(env, url) : undefined;
+  return {
+    url: podHost ? podHost.wsUrl : url,
+    ...(podHost
+      ? { pod: podHost.config }
+      : { token: parseHarnessToken(env, "for --service harness: the credential core's Harness API accepts") }),
+    gatesUrl: gatesUrl.replace(/\/+$/, ""),
+    root,
+    healthPort:
+      rawHealth === undefined
+        ? DEFAULT_HARNESS_HEALTH_PORT
+        : parsePort("NYLORUN_HARNESS_HEALTH_PORT", rawHealth),
+  };
+}
+
+/**
+ * The engine in a pod sandbox: the pod's identity and its join file, from the variables the
+ * sandboxes service renders into the pod. `NYLORUN_HARNESS_URL` is the listener's address on the
+ * Docker host (`http://<host>:<port>`); the WebSocket URL adds the Harness API path.
+ */
+function parsePodHost(env: EnvSnapshot, url: string): { config: PodHostConfig; wsUrl: string } {
+  const need = (name: string) => {
+    const value = read(env, name);
+    if (value === undefined)
+      throw new StackConfigError(`${name} is required for the engine in a sandbox pod (NYLORUN_SANDBOX_KIND=pod)`);
+    return value;
+  };
+  if (read(env, "NYLORUN_HARNESS_TOKEN") !== undefined)
+    throw new StackConfigError("A sandbox pod's engine holds no NYLORUN_HARNESS_TOKEN: it joins with its join token");
+  const base = new URL(url);
+  const secure = base.protocol === "https:" || base.protocol === "wss:";
+  const origin = `${secure ? "https" : "http"}://${base.host}`;
+  const egress = read(env, "NYLORUN_EGRESS_PROXY");
+  const egressCa = read(env, "NYLORUN_SANDBOX_EGRESS_CA_FILE");
+  return {
+    wsUrl: `${secure ? "wss" : "ws"}://${base.host}/nylorun/harness/v1`,
+    config: {
+      sandboxId: need("NYLORUN_SANDBOX_ID"),
+      podUid: need("NYLORUN_POD_UID"),
+      joinFile: need("NYLORUN_SANDBOX_JOIN_FILE"),
+      httpUrl: origin,
+      ...(egress ? { egressProxy: egress.replace(/\/+$/, "") } : {}),
+      ...(egressCa ? { egressCaFile: egressCa } : {}),
+      ...(read(env, "NYLORUN_SANDBOX_SUBSTRATE") === "1" ? { substrate: true } : {}),
+      blocked: blockedAddresses(env),
+    },
+  };
+}
+
+/** `StackConfig.gates` from `NYLORUN_GATES_*`. */
+function parseGates(env: EnvSnapshot): GatesConfig {
+  const listen = parseListener(env, "NYLORUN_GATES_", DEFAULT_GATES_LISTEN_PORT, {
+    senders: "the loop sends",
+    example: (port) => `gateway:${port}`,
+  });
+  const token = read(env, "NYLORUN_GATES_TOKEN");
+  if (token === undefined)
+    throw new StackConfigError(
+      "NYLORUN_GATES_TOKEN is required for --service gates: the token the loop presents (`nylorun start` sets it)",
+    );
+  if (!GATES_TOKEN.test(token))
+    throw new StackConfigError("NYLORUN_GATES_TOKEN must be at least 32 bytes as hex");
+  return { listen, token };
+}
+
+/** The prefix of the credential resolver's variables (removed in protocol 10). */
+const REMOVED_RESOLVER_PREFIX = "NYLORUN_RESOLVER_";
+
+/** `StackConfig.egress` from `NYLORUN_EGRESS_LISTEN_*`. CONNECT has no Host header to check. */
+function parseEgress(env: EnvSnapshot): EgressConfig {
+  const keysToken = read(env, "NYLORUN_EGRESS_KEYS_TOKEN");
+  if (keysToken !== undefined && !/^[0-9a-f]{64,}$/i.test(keysToken))
+    throw new StackConfigError("NYLORUN_EGRESS_KEYS_TOKEN must be 32 bytes or more as hex (nylorun local sandbox enable makes it)");
+  return {
+    listen: parseListener(env, "NYLORUN_EGRESS_", DEFAULT_EGRESS_LISTEN_PORT),
+    ...(keysToken === undefined ? {} : { keysToken }),
+  };
+}
+
+/** `StackConfig.modelGate` from `NYLORUN_GATES_URL` and `NYLORUN_GATES_TOKEN`. */
+function parseModelGate(env: EnvSnapshot): ModelGateEndpoint | undefined {
+  const url = parseUrl(env, "NYLORUN_GATES_URL", ["http:", "https:"]);
+  const token = read(env, "NYLORUN_GATES_TOKEN");
+  if (url === undefined) {
+    if (token !== undefined)
+      throw new StackConfigError(
+        "NYLORUN_GATES_TOKEN is set without NYLORUN_GATES_URL: set the URL of the gates service, e.g. http://gateway:4100",
+      );
+    return undefined;
+  }
+  if (token === undefined)
+    throw new StackConfigError(
+      "NYLORUN_GATES_TOKEN is required with NYLORUN_GATES_URL: the gates service refuses calls without it",
+    );
+  if (!GATES_TOKEN.test(token))
+    throw new StackConfigError("NYLORUN_GATES_TOKEN must be at least 32 bytes as hex");
+  return { url: url.replace(/\/+$/, ""), token };
+}
+
+/** `StackConfig.keys` from `NYLORUN_KEYS_URL` and `NYLORUN_GATES_TOKEN`. */
+function parseKeysEndpoint(env: EnvSnapshot): ModelGateEndpoint | undefined {
+  const url = parseUrl(env, "NYLORUN_KEYS_URL", ["http:", "https:"]);
+  if (url === undefined) return undefined;
+  const token = read(env, "NYLORUN_GATES_TOKEN");
+  if (token === undefined)
+    throw new StackConfigError(
+      "NYLORUN_GATES_TOKEN is required with NYLORUN_KEYS_URL: the keys service refuses calls without it",
+    );
+  if (!GATES_TOKEN.test(token))
+    throw new StackConfigError("NYLORUN_GATES_TOKEN must be at least 32 bytes as hex");
+  return { url: url.replace(/\/+$/, ""), token };
+}
+
+/** `StackConfig.delivery` from `NYLORUN_ENDPOINT_*`, or `undefined` when none is set. */
+function parseDelivery(env: Readonly<Record<string, string | undefined>>): StackConfig["delivery"] {
+  const loopback = read(env, "NYLORUN_ENDPOINT_LOOPBACK");
+  if (loopback !== undefined && loopback !== "docker-host")
+    throw new StackConfigError(`NYLORUN_ENDPOINT_LOOPBACK must be docker-host, not ${loopback}`);
+  const choice = (name: string) => {
+    const value = read(env, name);
+    if (value !== undefined && value !== "allow" && value !== "refuse")
+      throw new StackConfigError(`${name} must be allow or refuse, not ${value}`);
+    return value as "allow" | "refuse" | undefined;
+  };
+  const privateAddresses = choice("NYLORUN_ENDPOINT_PRIVATE");
+  const http = choice("NYLORUN_ENDPOINT_HTTP");
+  if (!loopback && !privateAddresses && !http) return undefined;
+  return {
+    ...(loopback ? { loopback } : {}),
+    ...(privateAddresses ? { privateAddresses } : {}),
+    ...(http ? { allowHttp: http === "allow" } : {}),
+  };
+}
+
+/** `StackConfig.a2a` from `NYLORUN_A2A_PUSH_*`, or `undefined` when none is set. */
+function parseA2a(env: Readonly<Record<string, string | undefined>>): StackConfig["a2a"] {
+  const secret = read(env, "NYLORUN_A2A_PUSH_SECRET");
+  if (secret !== undefined) {
+    const key = secret.startsWith("whsec_") ? Buffer.from(secret.slice(6), "base64") : undefined;
+    if (!key || key.length < 24 || !/^[A-Za-z0-9+/]+={0,2}$/.test(secret.slice(6)))
+      throw new StackConfigError(
+        "NYLORUN_A2A_PUSH_SECRET must be a Standard Webhooks secret: whsec_ and the base64 of at least 24 bytes"
+      );
+  }
+  const hosts = read(env, "NYLORUN_A2A_PUSH_ALLOW_HOSTS");
+  const allowHosts = hosts === undefined ? undefined : parseAllowHosts(hosts);
+  if (secret === undefined && allowHosts === undefined) return undefined;
+  return { push: { ...(secret !== undefined ? { secret } : {}), ...(allowHosts ? { allowHosts } : {}) } };
+}
+
+/**
+ * `host:port` entries, comma-separated; a host may be a name, an IPv4 or a bracketed IPv6 address,
+ * and the port `*` for any port (a test receiver on a port it picks).
+ */
+export function parseAllowHosts(value: string): string[] {
+  const entries = value
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry !== "");
+  for (const entry of entries)
+    if (!/^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5}|\*)$/.test(entry) || Number(entry.slice(entry.lastIndexOf(":") + 1)) > 65535)
+      throw new StackConfigError(`NYLORUN_A2A_PUSH_ALLOW_HOSTS entries must be host:port, not ${entry}`);
+  return entries;
+}
+
+/** Endpoint summary for logs: which endpoints are set, never their values. */
+export function describeEndpoints(endpoints: StackEndpoints): string[] {
+  return Object.entries(endpoints)
+    .filter(([, value]) => value !== undefined)
+    .map(([key]) => key)
+    .sort();
+}

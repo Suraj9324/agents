@@ -1,0 +1,160 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Agent, type ToolDefinition } from "@nylorun/core/define";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  PTC_RULE,
+  PTC_USAGE,
+  programmaticToolCalling,
+} from "../agents/ptc/tools.js";
+import { invokeTool } from "./support.js";
+
+const temps: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temps.splice(0).map((root) => rm(root, { recursive: true, force: true }))
+  );
+});
+
+function catalogTool(
+  name: string,
+  mode: Awaited<ReturnType<typeof programmaticToolCalling>>
+): ToolDefinition {
+  const found = mode.tools.find((tool) => tool.name === name);
+  if (!found) throw new Error(`Missing tool ${name}`);
+  return found;
+}
+
+describe("programmaticToolCalling()", () => {
+  it("offers only run_code and a generated SDK for the tools catalog", async () => {
+    const mode = await programmaticToolCalling();
+    expect(mode.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+    expect(mode.instructions).toEqual([
+      PTC_RULE,
+      PTC_USAGE,
+      expect.stringContaining("declare const tools:"),
+    ]);
+    const sdk = mode.instructions[2] ?? "";
+    expect(sdk).toContain("calculate: (args:");
+    expect(sdk).toContain("convert: (args:");
+    expect(sdk).toContain("now: (args:");
+    expect(sdk).toContain('from: "celsius"');
+  });
+
+  it("runs a program that composes calculate then convert", async () => {
+    const mode = await programmaticToolCalling();
+    await expect(
+      invokeTool(catalogTool("run_code", mode), {
+        code: [
+          'const calculated = await tools.calculate({ expression: "100 / 4" });',
+          'const converted = await tools.convert({ value: calculated.value, from: "celsius", to: "fahrenheit" });',
+          "return { value: calculated.value, result: converted.result };",
+        ].join("\n"),
+        description: "Convert 100/4 celsius to fahrenheit.",
+      })
+    ).resolves.toEqual({
+      kind: "completed",
+      output: {
+        logs: [],
+        result: { value: 25, result: 77 },
+        calls: [
+          {
+            name: "calculate",
+            args: { expression: "100 / 4" },
+            output: { expression: "100 / 4", value: 25 },
+          },
+          {
+            name: "convert",
+            args: { value: 25, from: "celsius", to: "fahrenheit" },
+            output: {
+              value: 25,
+              from: "celsius",
+              to: "fahrenheit",
+              result: 77,
+            },
+          },
+        ],
+      },
+    });
+  });
+
+  it("rejects a failed binding as ToolCallError that the program can catch", async () => {
+    const mode = await programmaticToolCalling();
+    await expect(
+      invokeTool(catalogTool("run_code", mode), {
+        code: [
+          "try {",
+          '  await tools.convert({ value: 1, from: "celsius", to: "meter" });',
+          "  return { caught: false };",
+          "} catch (error) {",
+          "  return {",
+          "    caught: error instanceof ToolCallError,",
+          "    toolName: error.toolName,",
+          "    message: error.message,",
+          "  };",
+          "}",
+        ].join("\n"),
+        description: "Catch an incompatible convert.",
+      })
+    ).resolves.toEqual({
+      kind: "completed",
+      output: {
+        logs: [],
+        result: {
+          caught: true,
+          toolName: "convert",
+          message: "Cannot convert celsius to meter.",
+        },
+        calls: [
+          {
+            name: "convert",
+            args: { value: 1, from: "celsius", to: "meter" },
+            error: "Cannot convert celsius to meter.",
+          },
+        ],
+      },
+    });
+  });
+
+  it("rejects an unknown tools binding", async () => {
+    const mode = await programmaticToolCalling();
+    await expect(
+      invokeTool(catalogTool("run_code", mode), {
+        code: "await tools.missing({});",
+        description: "Call a tool that is not in the SDK.",
+      })
+    ).resolves.toEqual({
+      kind: "failed",
+      code: "code_run_failed",
+      message: "missing: Unknown tool 'missing'.",
+    });
+  });
+
+  it("omits the transport when the directory has no catalog modules", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ptc-test-"));
+    temps.push(root);
+    await expect(programmaticToolCalling({ directory: root })).resolves.toEqual({
+      instructions: [],
+      tools: [],
+    });
+  });
+
+  it("builds the PTC agent with only run_code on the model surface", async () => {
+    const mode = await programmaticToolCalling();
+    const agent = Agent({
+      id: "ptc",
+      name: "Programmatic Tool Calling",
+    })
+      .instructions("Be concise.", ...mode.instructions)
+      .tools(...mode.tools)
+      .build();
+    const offered = agent.manifest;
+    expect(offered.tools?.map((tool) => tool.name)).toEqual(["run_code"]);
+    expect(offered.tools?.map((tool) => tool.name)).not.toEqual(
+      expect.arrayContaining(["calculate", "convert", "now"])
+    );
+    expect(offered.instructions?.join("\n")).toContain("calculate: (args:");
+  });
+});

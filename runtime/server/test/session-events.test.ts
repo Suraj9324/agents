@@ -1,0 +1,120 @@
+import { expect, it } from "vitest";
+import { Agent } from "@nylorun/core/define";
+import { decodeCursor, encodeCursor } from "../src/record/index.js";
+import { startTestTenant } from "./support/tenant.js";
+import { deploy, openSession } from "./support/agents.js";
+
+const APP = "server-token-value-aaaaaaaa";
+const headers = {
+  authorization: `Bearer ${APP}`,
+  "content-type": "application/json",
+};
+
+type Event = { type: string; cursor: string };
+
+async function say(url: string, content: string) {
+  const response = await fetch(`${url}/v1/sessions/s1/commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      type: "message",
+      requestId: content,
+      idempotencyKey: content,
+      content,
+    }),
+  });
+  expect(response.ok).toBe(true);
+  return (await response.json()) as { cursor: string };
+}
+
+async function history(url: string, cursor?: string) {
+  const query = cursor ? `?cursor=${cursor}` : "";
+  const response = await fetch(`${url}/v1/sessions/s1/items${query}`, {
+    headers,
+  });
+  expect(response.ok).toBe(true);
+  return (await response.json()) as { items: Event[]; cursor: string | null };
+}
+
+async function settled(url: string, count: number): Promise<Event[]> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const { items } = await history(url);
+    if (items.filter((e) => e.type === "turn.completed").length >= count)
+      return items;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("turn did not complete");
+}
+
+/** Reads SSE frames until `done` holds for the events seen so far. */
+async function readStream(
+  body: ReadableStream<Uint8Array>,
+  done: (events: Event[]) => boolean
+): Promise<Event[]> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const events: Event[] = [];
+  let text = "";
+  while (!done(events)) {
+    const { value, done: ended } = await reader.read();
+    if (ended) break;
+    text += decoder.decode(value, { stream: true });
+    let end: number;
+    while ((end = text.indexOf("\n\n")) >= 0) {
+      const frame = text.slice(0, end);
+      text = text.slice(end + 2);
+      const data = frame
+        .split("\n")
+        .find((line) => line.startsWith("data: "));
+      if (data) events.push(JSON.parse(data.slice(6)) as Event);
+    }
+  }
+  await reader.cancel();
+  return events;
+}
+
+it("numbers events per session and replays SSE after a cursor, then follows live", async () => {
+  const runtime = await startTestTenant({ applicationKey: APP });
+  try {
+    await deploy(runtime.url, headers, Agent({ id: "bot", name: "Bot" }).build());
+    expect((await openSession(runtime.url, headers, "s1", { agent: "bot", ownerUserId: "ada" })).ok).toBe(true);
+    // The session's first event, at seq 0, is `agent.attached` (protocol 16); the message follows.
+    const accepted = await say(runtime.url, "first");
+    expect(accepted.cursor).toBe(encodeCursor("s1", 1));
+    const first = await settled(runtime.url, 1);
+    // Served events skip the seqs of internal events (transcript.updated): they only increase.
+    const firstSeqs = first.map((e) => decodeCursor("s1", e.cursor));
+    expect(firstSeqs[0]).toBe(0);
+    expect(firstSeqs.every((seq, i) => i === 0 || seq > firstSeqs[i - 1]!)).toBe(true);
+    const tail = await history(runtime.url, first[0]!.cursor);
+    expect(tail.items).toEqual(first.slice(1));
+    expect(tail.cursor).toBe(first.at(-1)!.cursor);
+    expect(
+      (
+        await fetch(`${runtime.url}/v1/sessions/s1/items?cursor=bogus`, {
+          headers,
+        })
+      ).status
+    ).toBe(400);
+
+    const stream = await fetch(
+      `${runtime.url}/v1/sessions/s1/events?cursor=${first[0]!.cursor}`,
+      { headers }
+    );
+    expect(stream.status).toBe(200);
+    const reading = readStream(
+      stream.body!,
+      (events) => events.filter((e) => e.type === "turn.completed").length >= 2
+    );
+    await say(runtime.url, "second");
+    const streamed = await reading;
+    const seqs = streamed.map((e) => decodeCursor("s1", e.cursor));
+    // The replay starts after the cursor, and live events follow with no gap or duplicate.
+    expect(seqs[0]).toBeGreaterThan(0);
+    expect(seqs.every((seq, i) => i === 0 || seq > seqs[i - 1]!)).toBe(true);
+    expect(streamed.slice(0, first.length - 1)).toEqual(first.slice(1));
+  } finally {
+    await runtime.close();
+  }
+  // Two full turns: on Postgres this takes 4–5 s unloaded, so the 5 s default flakes.
+}, 20_000);

@@ -1,0 +1,23 @@
+/**
+ * The Studio server that `ghcr.io/nylorun/studio` runs (`server-main.ts` is the
+ * container entry). This package is private: it ships only as that image.
+ */
+export {
+  DEFAULT_SESSION_COOKIE,
+  parseAllowedHosts,
+  parseAnalyticsId,
+  parseRuntimeUrl,
+  parseSessionCookieName,
+  readAdminKeyFile,
+  startStudioServer,
+} from "./server.js";
+export type {
+  StudioServer,
+  StudioServerHello,
+  StudioServerOptions,
+  StudioTenantSummary,
+} from "./server.js";
+export { proxyRuntime } from "./proxy.js";
+export type { StudioProxyOptions } from "./proxy.js";
+export { parseMetricsSources, parsePrometheus, readMetrics } from "./metrics.js";
+export type { MetricSample, MetricsRead, MetricsSource } from "./metrics.js";

@@ -1,0 +1,154 @@
+/**
+ * The Durable Streams seam.
+ *
+ * Durable Streams deliver what the record holds. Each Tenant has one S2 basin per basin
+ * generation (`streams/basin.ts`); inside it:
+ *
+ * | Stream | Contents | Written by | Read by |
+ * | --- | --- | --- | --- |
+ * | `sessions/<sessionId>` | every event of the session, in sequence | the stream relay, from the record | history and session SSE |
+| `runs` | every run of the Tenant's triggers, kept 7 days | `tenant/runs-stream.ts`, after the commit that made the run, and the sweep | `GET /v1/runs/stream` |
+ *
+ * S2 serves API listeners only (history, SSE, AG-UI, A2A): nothing inside the Runtime signals
+ * through it or waits on it. Signals between processes go over the control bus on
+ * Postgres (`store/postgres/control.ts`).
+ *
+ * **Basin generations.** A session id is unique within its Tenant's basin generation. A
+ * Tenant reset, the only path that frees ids, moves the Tenant to the next generation, so
+ * a session created again with the same id starts in an empty basin at sequence 0; the old
+ * basin is deleted afterwards. The cursor is `base64url("<sessionId>:<seq>")`. The `runs`
+ * stream starts at 0 in each generation too; its cursor names the generation
+ * (`base64url("runs:<generation>:<seq>")`), so one from an older basin is refused.
+ *
+ * S2 is the supported implementation (`adapters/streams/s2.ts`, the only file
+ * importing the S2 SDK); `streams/memory.ts` is the in-memory fake.
+ *
+ * ## Guarantees every implementation keeps
+ *
+ * - **Sequence numbers.** Each stream numbers its records from 0 without gaps.
+ *   The tail is the sequence the next appended record gets (0 for a stream
+ *   that does not exist yet).
+ * - **Conditional appends.** With `matchSeq`, a batch is appended only when the
+ *   tail equals `matchSeq`; otherwise nothing is written and the result is a
+ *   `SeqMismatch` carrying the current tail. The relay appends a session
+ *   stream with `matchSeq` set to the record row's sequence, so a retried
+ *   append after an unacknowledged success is detected and never duplicated.
+ * - **Batches are atomic.** A batch is appended entirely or not at all.
+ * - **Reads resume.** `read` from `fromSeq` yields every record with
+ *   `seq >= fromSeq` in order, with no gap between history and the live tail.
+ * - **Tenant scope.** Methods take a Tenant id, or a basin key from `basinOf`
+ *   for a later generation. `ensureTenant` creates the basin (idempotent) and
+ *   must run before appends; streams are created on first append or read.
+ *   `deleteTenant` removes the basin and every stream in it (with
+ *   `allGenerations`, every generation's basin of the Tenant).
+ * - **Records are JSON.** Bodies are JSON-serializable values; implementations
+ *   encode them as they need.
+ */
+
+/** A record as read from a stream. */
+export interface StreamRecord<T = unknown> {
+  seq: number;
+  /** Milliseconds since the epoch, as assigned by the stream at append. */
+  timestamp: number;
+  body: T;
+}
+
+export interface AppendOptions {
+  /** Append only when the stream's tail equals this sequence. */
+  matchSeq?: number;
+}
+
+export interface AppendAck {
+  status: "ok";
+  /** Sequence of the first appended record. */
+  start: number;
+  /** Sequence after the last appended record (the new tail). */
+  end: number;
+}
+
+/** A conditional append found the stream elsewhere. Nothing was written. */
+export interface SeqMismatch {
+  status: "seq_mismatch";
+  /** The stream's current tail. */
+  tail: number;
+}
+
+export type AppendResult = AppendAck | SeqMismatch;
+
+export interface ReadOptions {
+  /** Ends the read. Iteration then finishes without throwing. */
+  signal?: AbortSignal;
+  /**
+   * `true` (default) keeps reading live records after the history. `false`
+   * stops at the tail observed when the read started (history requests).
+   */
+  follow?: boolean;
+}
+
+export interface DurableStreams {
+  /**
+   * Appends `records` as one batch. Rejects when the Tenant has no basin or
+   * `records` is empty.
+   */
+  append(
+    tenantId: string,
+    stream: string,
+    records: readonly unknown[],
+    options?: AppendOptions,
+  ): Promise<AppendResult>;
+  /**
+   * Reads `stream` from `fromSeq`: history first, then (with `follow`) live
+   * records as they are appended, until `signal` aborts. Reading a stream that
+   * does not exist yet waits for its first record.
+   */
+  read<T = unknown>(
+    tenantId: string,
+    stream: string,
+    fromSeq: number,
+    options?: ReadOptions,
+  ): AsyncIterable<StreamRecord<T>>;
+  /** The sequence the next record will get; 0 for a missing stream. */
+  tail(tenantId: string, stream: string): Promise<number>;
+  /** Creates the Tenant's basin. Idempotent. */
+  ensureTenant(tenantId: string): Promise<void>;
+  /**
+   * Deletes the basin and all its streams. Idempotent. With `allGenerations`, given a Tenant
+   * id, also every later generation's basin (Tenant deletion).
+   */
+  deleteTenant(tenantId: string, options?: { allGenerations?: boolean }): Promise<void>;
+  /** Deletes one stream. Idempotent. */
+  deleteStream(tenantId: string, stream: string): Promise<void>;
+  /**
+   * Creates `stream` if it does not exist, or sets its configuration, keeping its records for
+   * `retentionSecs` (the basin's default keeps them forever). Absent for in-process
+   * implementations, which keep what they hold until they close.
+   */
+  ensureStream?(tenantId: string, stream: string, options: { retentionSecs: number }): Promise<void>;
+  /**
+   * Names of the Tenant's streams starting with `prefix`, in name order,
+   * without streams being deleted. Empty when the Tenant has no basin.
+   */
+  listStreams(tenantId: string, prefix: string): Promise<string[]>;
+  close(): Promise<void>;
+  /**
+   * Resolves when the backing service answers, rejects otherwise (the Tenant's status,
+   * `streamsStatus` in `tenant/streams.ts`; never readiness). Absent for in-process implementations, which are
+   * always reachable.
+   */
+  probe?(signal: AbortSignal): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Stream names
+
+export const SESSION_STREAM_PREFIX = "sessions/";
+/** The Tenant's runs stream: every run of its triggers, beside the session streams. */
+export const RUNS_STREAM = "runs";
+/** How long the runs stream keeps a run: 7 days. */
+export const RUNS_STREAM_RETENTION_SECS = 7 * 24 * 3600;
+/** The stream of a session: `sessions/<sessionId>`. */
+export function sessionStream(sessionId: string): string {
+  if (!sessionId) throw new Error("sessionId is required");
+  return `${SESSION_STREAM_PREFIX}${sessionId}`;
+}
+

@@ -1,0 +1,399 @@
+/**
+ * Remote MCP servers in the gates service: the gate holds each session's connection to a
+ * declared `streamable-http` or `sse` server, authorizes it with the Tenant vault and runs
+ * `tools/list` and `tools/call` on it. The loop names the server; the gate
+ * finds it in the session's pinned manifest, so the loop never chooses a URL or a credential.
+ *
+ * A failure is an answer (`{ok: false, error}`), shaped so the loop's diagnostics read it as
+ * they read a failure in their own process; a tool call's failure is coded. A call's
+ * result and failure carry no credential value sent for it (`sdkClient`), so neither does
+ * its `tool_crossings` row. Logs one line per call, never arguments, results or credentials, and
+ * measures each for operators (`mcp.client.operation.duration`).
+ */
+import type { McpServerManifest } from "@nylorun/core/define";
+import {
+  McpCallFailed,
+  McpConnectionStale,
+  openMcpServer,
+  unreachable,
+  type LiveConnection,
+  type McpToolPage,
+} from "../mcp/connect.js";
+import { findServer, type McpServerRef } from "../mcp/pool.js";
+import type { OutboundPolicy } from "../tenant/outbound.js";
+import { readRuntimeLimits } from "../tenant/runtime-limits.js";
+import type { Logger } from "../tenant/types.js";
+import type { McpAnswer, McpGateError } from "./tool-contract.js";
+import { GateRefusal, type TenantVault, type TenantVaults } from "./tenant-vaults.js";
+import { hostTuning } from "../tuning.js";
+import { context as otelContext, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
+import { defined, instruments, telemetry } from "../telemetry/telemetry.js";
+import { remoteContext } from "../telemetry/http.js";
+
+export interface McpHandlerOptions {
+  readonly vaults: TenantVaults;
+  readonly logger: Logger;
+  /**
+   * A connection unused this long is closed; the next request opens it again. Default
+   * `gates.mcpIdleMs` (Host tuning, 15 min).
+   */
+  readonly idleMs?: number;
+  readonly now?: () => number;
+  /** Tests replace how a server is opened. */
+  readonly open?: typeof openMcpServer;
+  /** How the gate reaches remote servers (`NYLORUN_ENDPOINT_*`). Default: no limits. */
+  readonly delivery?: OutboundPolicy;
+}
+
+export interface McpHandler {
+  /** Opens the connection; answers the server's instructions when it gave any. */
+  connect(
+    tenantId: string | undefined,
+    server: McpServerRef,
+  ): Promise<McpAnswer<{ instructions: string } | null>>;
+  list(
+    tenantId: string | undefined,
+    server: McpServerRef,
+    cursor: string | undefined,
+    signal: AbortSignal,
+  ): Promise<McpAnswer<McpToolPage>>;
+  /** One `tools/call`; the raw `CallToolResult` on success. */
+  call(
+    tenantId: string | undefined,
+    request: {
+      server: McpServerRef;
+      effectId: string;
+      name: string;
+      arguments: Record<string, unknown>;
+      /** The call's `Idempotency-Key`, sent to the server in `_meta`. */
+      key?: string;
+      /** The call's span context from its journal row, sent as `traceparent`. */
+      traceparent?: string;
+    },
+    signal: AbortSignal,
+  ): Promise<McpAnswer<Record<string, unknown>>>;
+  close(server: McpServerRef): Promise<void>;
+  /** Closes connections idle past the timeout. */
+  sweep(): Promise<void>;
+  /** Closes every connection (gateway shutdown). */
+  closeAll(): Promise<void>;
+  /** Open connections (tests). */
+  readonly size: number;
+}
+
+interface Live {
+  readonly connection: LiveConnection;
+  lastUsedAt: number;
+  active: number;
+  /** Out of the map (`McpConnectionStale`): closed when its last request ends. */
+  evicted?: boolean;
+}
+
+/** The server is not one the session may reach through the gate. */
+class NotDeclared extends Error {}
+
+export function createMcpHandler(options: McpHandlerOptions): McpHandler {
+  const { vaults, logger } = options;
+  const idleMs = options.idleMs ?? hostTuning().gates.mcpIdleMs;
+  const now = options.now ?? Date.now;
+  const open = options.open ?? openMcpServer;
+  const live = new Map<string, Live>();
+  const opening = new Map<string, Promise<Live>>();
+
+  const keyOf = (server: McpServerRef) =>
+    JSON.stringify([server.sessionId, server.agentId ?? null, server.serverName]);
+
+  /** The declared remote server, from the session's pinned manifest. */
+  async function declared(
+    vault: TenantVault,
+    server: McpServerRef,
+  ): Promise<McpServerManifest> {
+    const session = await vault.session(server.sessionId);
+    if (!session) throw new NotDeclared(`Session ${server.sessionId} not found`);
+    const found = findServer(session.manifest, server.agentId, server.serverName);
+    if (!found) throw new NotDeclared(`MCP server '${server.serverName}' is not declared`);
+    return found.server;
+  }
+
+  async function connection(tenantId: string | undefined, server: McpServerRef): Promise<Live> {
+    const key = keyOf(server);
+    const existing = live.get(key);
+    if (existing) return existing;
+    let pending = opening.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const vault = await vaults.open(tenantId);
+        const manifest = await declared(vault, server);
+        const connection = await open({
+          server: manifest,
+          authorize: (url) =>
+            vault.authorizeMcp(server.sessionId, {
+              url,
+              serverName: server.serverName,
+              ...(server.agentId === undefined ? {} : { agentId: server.agentId }),
+            }),
+          policy: options.delivery ?? {},
+          errorExcerptChars: (await vault.store.tx((t) => readRuntimeLimits(t))).errorExcerptChars,
+        });
+        const entry: Live = { connection, lastUsedAt: now(), active: 0 };
+        live.set(key, entry);
+        return entry;
+      })().finally(() => opening.delete(key));
+      opening.set(key, pending);
+    }
+    return pending;
+  }
+
+  async function answer<T>(
+    what: "connect" | "list" | "call",
+    server: McpServerRef,
+    run: () => Promise<T>,
+    extra: Record<string, unknown> = {},
+    call?: { readonly tool: string; readonly traceparent?: string | undefined },
+  ): Promise<McpAnswer<T>> {
+    const started = now();
+    const measured = startMcpOperation(what, call);
+    try {
+      const result = await measured.run(run);
+      measured.end(undefined);
+      logger.info("mcp_request", { what, ...fields(server), ...extra, ms: now() - started, outcome: "ok" });
+      return { ok: true, result };
+    } catch (error) {
+      const failed = errorOf(error);
+      const outcome = failed.failure?.code ?? (failed.code === undefined ? "failed" : String(failed.code));
+      measured.end(outcome);
+      logger.info("mcp_request", {
+        what,
+        ...fields(server),
+        ...extra,
+        ms: now() - started,
+        outcome,
+      });
+      return { ok: false, error: failed };
+    }
+  }
+
+  /** The server's connection; for a tool call, one that cannot be opened is `mcp.unreachable`. */
+  async function opened(tenantId: string | undefined, server: McpServerRef, call: boolean): Promise<Live> {
+    try {
+      return await connection(tenantId, server);
+    } catch (error) {
+      // The call was never sent, so the model may try again. A gate that cannot serve
+      // the session is not the server's failure, and stays as it was.
+      if (!call || error instanceof GateRefusal || error instanceof NotDeclared) throw error;
+      const limits = await vaults
+        .open(tenantId)
+        .then((vault) => vault.store.tx((t) => readRuntimeLimits(t)))
+        .catch(() => undefined);
+      throw unreachable(server.serverName, error, limits?.errorExcerptChars);
+    }
+  }
+
+  async function use<T>(
+    tenantId: string | undefined,
+    server: McpServerRef,
+    run: (entry: Live) => Promise<T>,
+    call = false,
+  ): Promise<T> {
+    const entry = await opened(tenantId, server, call);
+    entry.active += 1;
+    try {
+      return await run(entry);
+    } catch (error) {
+      // The connection can no longer make requests: the next one opens a new connection, and
+      // the calls still running on this one finish first (the last closes it).
+      if (error instanceof McpConnectionStale) {
+        const key = keyOf(server);
+        if (live.get(key) === entry) live.delete(key);
+        entry.evicted = true;
+      }
+      throw error;
+    } finally {
+      entry.active -= 1;
+      entry.lastUsedAt = now();
+      if (entry.evicted && entry.active === 0) void entry.connection.close().catch(() => {});
+    }
+  }
+
+  /**
+   * One `tools/call`. A connection found stale before the tool saw the call is opened again, and
+   * the call sent once more.
+   */
+  async function callOnce(
+    tenantId: string | undefined,
+    request: {
+      server: McpServerRef;
+      name: string;
+      arguments: Record<string, unknown>;
+      key?: string;
+      traceparent?: string;
+    },
+    signal: AbortSignal,
+  ) {
+    // The Tenant's Runtime limits, read for this call: the largest answer the gate keeps, and how
+    // much of a failed one its error quotes.
+    const { toolAnswerBytes, errorExcerptChars } = await (await vaults.open(tenantId)).store.tx((t) =>
+      readRuntimeLimits(t),
+    );
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await use(
+          tenantId,
+          request.server,
+          (entry) =>
+            entry.connection.client.callTool(
+              { name: request.name, arguments: request.arguments },
+              {
+                signal,
+                maxResultBytes: toolAnswerBytes,
+                errorExcerptChars,
+                ...(request.key === undefined ? {} : { key: request.key }),
+                ...(request.traceparent === undefined ? {} : { traceparent: request.traceparent }),
+              },
+            ),
+          true,
+        );
+      } catch (error) {
+        if (!(error instanceof McpConnectionStale) || attempt > 0) throw error;
+      }
+    }
+  }
+
+  return {
+    connect: (tenantId, server) =>
+      answer("connect", server, async () => {
+        const { instructions } = (await connection(tenantId, server)).connection;
+        // The server's instructions, for the note on its deferred tools.
+        return instructions === undefined ? null : { instructions };
+      }),
+    list: (tenantId, server, cursor, signal) =>
+      answer("list", server, () =>
+        use(tenantId, server, (entry) =>
+          entry.connection.client.listTools(cursor ? { cursor } : undefined, { signal }),
+        ),
+      ),
+    async call(tenantId, request, signal) {
+      const answered = await answer(
+        "call",
+        request.server,
+        () => callOnce(tenantId, request, signal),
+        { effect: request.effectId },
+        { tool: request.name, traceparent: request.traceparent },
+      );
+      if (!answered.ok) return answered;
+      const { result, redacted } = answered.result;
+      return { ok: true, result, ...(redacted ? { redacted } : {}) };
+    },
+    async close(server) {
+      const key = keyOf(server);
+      const entry = live.get(key);
+      if (!entry) return;
+      live.delete(key);
+      await entry.connection.close().catch(() => {});
+    },
+    async sweep() {
+      const cutoff = now() - idleMs;
+      const idle: Live[] = [];
+      for (const [key, entry] of live) {
+        if (entry.active > 0 || entry.lastUsedAt > cutoff) continue;
+        live.delete(key);
+        idle.push(entry);
+      }
+      await Promise.all(idle.map((entry) => entry.connection.close().catch(() => {})));
+    },
+    async closeAll() {
+      const all = [...live.values()];
+      live.clear();
+      await Promise.all(all.map((entry) => entry.connection.close().catch(() => {})));
+    },
+    get size() {
+      return live.size;
+    },
+  };
+}
+
+/** The MCP method each of the gate's requests sends. */
+const MCP_METHODS = { connect: "initialize", list: "tools/list", call: "tools/call" } as const;
+
+/**
+ * One request to a remote MCP server, measured: `mcp.client.operation.duration` with
+ * `mcp.method.name`, `gen_ai.tool.name` for a tool call and `error.type` for a failure (its code);
+ * with span export, a tool call's CLIENT span `tools/call {tool}`, under the call's own trace
+ * context (the effect's span).
+ */
+function startMcpOperation(
+  what: keyof typeof MCP_METHODS,
+  call: { readonly tool: string; readonly traceparent?: string | undefined } | undefined,
+) {
+  const method = MCP_METHODS[what];
+  const clock = performance.now();
+  const tracer = telemetry().tracer;
+  const parent = call?.traceparent ? remoteContext(call.traceparent) : undefined;
+  const span =
+    tracer && call && parent
+      ? tracer.startSpan(
+          `${method} ${call.tool}`,
+          {
+            kind: SpanKind.CLIENT,
+            attributes: {
+              "mcp.method.name": method,
+              "gen_ai.operation.name": "execute_tool",
+              "gen_ai.tool.name": call.tool,
+            },
+          },
+          parent,
+        )
+      : undefined;
+  return {
+    run: <T>(fn: () => Promise<T>): Promise<T> => (span ? otelContext.with(trace.setSpan(parent!, span), fn) : fn()),
+    end(errorType: string | undefined) {
+      instruments().mcpDuration.record(
+        (performance.now() - clock) / 1000,
+        defined({
+          "mcp.method.name": method,
+          ...(call ? { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": call.tool } : {}),
+          "error.type": errorType,
+        }),
+      );
+      if (!span) return;
+      if (errorType !== undefined) {
+        span.setAttribute("error.type", errorType);
+        span.setStatus({ code: SpanStatusCode.ERROR });
+      }
+      span.end();
+    },
+  };
+}
+
+function fields(server: McpServerRef) {
+  return {
+    session: server.sessionId,
+    server: server.serverName,
+    ...(server.agentId === undefined ? {} : { agent: server.agentId }),
+  };
+}
+
+/** An error as the loop's `diagnosticFromError` reads it, with a coded failure's code. */
+function errorOf(error: unknown): McpGateError {
+  if (error instanceof GateRefusal) return { message: error.outcome.message };
+  if (error instanceof McpCallFailed)
+    return {
+      message: error.message,
+      ...(error.code === "credential_rejected" ? { code: 401 } : {}),
+      failure: error.failure,
+    };
+  const message = error instanceof Error ? error.message.slice(0, hostTuning().gates.errorMessageChars) : String(error);
+  const code =
+    error && typeof error === "object" && "code" in error && typeof (error as { code?: unknown }).code === "number"
+      ? (error as { code: number }).code
+      : undefined;
+  const credentialIds =
+    error && typeof error === "object" && "credentialIds" in error
+      ? (error as { credentialIds?: readonly string[] }).credentialIds
+      : undefined;
+  return {
+    message,
+    ...(code === undefined ? {} : { code }),
+    ...(credentialIds === undefined ? {} : { credentialIds: [...credentialIds] }),
+  };
+}

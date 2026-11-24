@@ -1,0 +1,392 @@
+/**
+ * A pod Environment's lifecycle, as one pure decision: from the row, the
+ * Tenant's lifecycle settings, the Sandbox's status as the sandboxes service sees it and the
+ * clock, what to ask of the service, what to write to the row, which events to record, and
+ * when to look again. `reconcile.ts` gathers the facts, carries the decision out and runs it
+ * again until nothing is left to do; the `Sandbox` object (`execution/`) serializes its runs
+ * per sandbox and keeps its timers.
+ *
+ * - **Create** is eager: a `PUT` of a new pod sandbox asks for `Running` at once. One that is
+ *   not ready within `pods.readyDeadlineMs` (Host tuning) is `failed`, with the pod's reason; the next turn
+ *   start tries again.
+ * - **Every change** the Runtime asks for bumps `rev`; the `PUT` carries `opId =
+ *   <name>.r<rev>`, so a repeated apply is a no-op at the service, and a Sandbox whose `opId`
+ *   is not the row's is applied again.
+ * - **Idle** (`trigger: idle`): no turn on a session that names it, and none ended within its
+ *   `lifecycle.idle` (at most the Tenant's `limits.idle`) → `Suspended` (`agent.suspended`,
+ *   reason `idle`). The volume is kept; the next turn start asks for `Running` again. Every
+ *   running, ready pod has its idle timer armed (at `lastActiveAt` + idle) whenever it is
+ *   reconciled, whichever path woke it: a turn's end arms it too, but a wake with no turn end
+ *   (a disk copy's `wakePod`, commands through the session's sandbox route) armed nothing and
+ *   ran on for days. A timer that fires during a turn looks again one idle period later.
+ *   Becoming ready moves `lastActiveAt` to that moment, so a slow start doesn't use up the
+ *   idle period before the pod can take a turn.
+ * - **Crashed** (Agent Substrate): a running pod whose sandbox crashed is `failed` at once
+ *   (`agent.failed`, saying what the Agent lost); a crash an idle suspend finds is recorded the
+ *   same way. The next turn start asks for `Running`, and the sandboxes service reverts the
+ *   sandbox to its last suspend before resuming it.
+ * - **Drained** (Agent Substrate): a worker that stops gives its actors 30 minutes to be
+ *   suspended. The sandboxes service suspends each, records `drainedAt` and resumes it on
+ *   another worker; a new `drainedAt` is `agent.suspended` (reason `drain`) and `agent.resumed`
+ *   (cause `drain`), once, and a pod that is `Moving` waits rather than fail at the ready deadline.
+ * - **Awake time**: a pod that becomes `running` (its first start, a resume, a restart) writes
+ *   `agent.resumed`, so every stretch of awake time starts with an event and ends with the next
+ *   `agent.suspended`, `.failed`, `.lost`, `.reset`, `.deleted`, `.start_failed` or `.resumed`.
+ *   A meter pairs them; the Runtime meters nothing.
+ * - **Lost**: an incarnation that has run (a pod joined) whose Sandbox is gone or whose volume
+ *   is missing is `lost` (`agent.lost`): its host epoch moves, its Sandbox is deleted, and
+ *   only a reset brings the Environment back. agent-sandbox recreates a deleted claim empty, so
+ *   the engine's join also checks the id it keeps on the volume (`join.ts`): a new volume is
+ *   lost too. A pod replaced on the same volume is not lost: the new pod's join bumps the epoch
+ *   (`agent.relaunched`).
+ * - **Delete** (`desired: deleted`): the Sandbox is deleted, and the row once it is gone.
+ * - **Reset** (`tenant/environments.ts`) bumps the volume generation: a new name, so a new
+ *   Sandbox and volume; the old name is `retiring` and deleted here.
+ *
+ * - **Setup**: a failed setup (`sandbox/setup.ts`) leaves the pod `failed` with a
+ *   reason that starts `setup:`, even while the pod is ready, until a turn start asks it to run.
+ * - **Image**: the first ready pod's workload image is recorded by digest (`imageDigest`),
+ *   and every later apply runs that digest, so a stop, relaunch or reset never pulls another
+ *   image under the same tag. Only a digest of the repository the Environment asked for is
+ *   pinned: an image id with no repository, or one a node gave a name of its own (kind names an
+ *   image it loads `import-<date>`), pins nothing, since no registry serves it under that name.
+ *
+ * An unused Environment is deleted by the Tenant sweep (`lifecycle.deleteAfter`), not here.
+ */
+import type { AgentEventPayload, AgentEventType } from "@nylorun/core/contracts";
+import type { Environment, SandboxPodPatch, SandboxPodState } from "../../store/types.js";
+import type { PodStatus } from "./client.js";
+import { hostTuning } from "../../tuning.js";
+import { DEFAULT_SANDBOX_IMAGE } from "../policy.js";
+
+/**
+ * The repository an image reference names, as a container runtime writes it: the tag and digest
+ * dropped, Docker Hub's host and `library/` filled in (`python:3.13-slim` is
+ * `docker.io/library/python`).
+ */
+export function repositoryOf(reference: string): string {
+  let name = reference.replace(/^docker-pullable:\/\//, "");
+  const at = name.indexOf("@");
+  if (at >= 0) name = name.slice(0, at);
+  const colon = name.lastIndexOf(":");
+  if (colon > name.lastIndexOf("/")) name = name.slice(0, colon);
+  const parts = name.split("/");
+  const first = parts[0] ?? "";
+  const hasHost = parts.length > 1 && (first.includes(".") || first.includes(":") || first === "localhost");
+  if (hasHost) return name;
+  return parts.length === 1 ? `docker.io/library/${name}` : `docker.io/${name}`;
+}
+
+/**
+ * The pullable reference of the image id a container status names (`repo@sha256:…`), when it is
+ * a digest of `requested`'s repository; undefined for an id without a repository, or with one
+ * the node made up for an image loaded onto it, which no registry serves.
+ */
+export function imageDigestOf(imageID: string | undefined, requested: string): string | undefined {
+  const id = imageID?.replace(/^docker-pullable:\/\//, "");
+  if (!id) return undefined;
+  const at = id.indexOf("@sha256:");
+  if (at <= 0 || !/^[0-9a-f]{64}$/.test(id.slice(at + 8))) return undefined;
+  return repositoryOf(id) === repositoryOf(requested) ? id : undefined;
+}
+
+/**
+ * The sandboxes service's reason for a sandbox suspended because its Agent Substrate worker
+ * stopped, until it runs on another one.
+ */
+export const MOVING = "Moving";
+
+/**
+ * The sandboxes service's reason for a sandbox whose actor cannot take the template asked for
+ * (Agent Substrate: its volumes would change, so only a new incarnation can). The pod never
+ * starts on that volume again: the Runtime gives it a new one (`renew`).
+ */
+export const REPOINT_REFUSED = "RepointRefused";
+
+/** A setup failure's `reason` starts with this (`sandbox/setup.ts`); it is sticky. */
+export const SETUP_FAILED = "setup:";
+
+/** A crash's `reason` (see `crashReasonOf`) starts with this; it stays until a turn starts the pod. */
+export const CRASHED = "Crashed: ";
+
+/**
+ * A sandbox that crashed (Agent Substrate: its worker went away, or a wake failed) lost what its
+ * Agent wrote since its last suspend; the next start reverts it to that suspend. The reason
+ * `agent.failed` records, or undefined when the sandbox has not crashed.
+ */
+export function crashReasonOf(status: PodStatus): string | undefined {
+  if (status.reason !== "Crashed") return undefined;
+  const what = status.message?.trim() || "the sandbox stopped";
+  return `${CRASHED}${what}. What the Agent wrote since its last suspend is lost; its next turn starts it from that suspend.`;
+}
+
+/** The lifecycle settings, read each time a decision is made. */
+export interface PodLifecycleConfig {
+  readonly idleMs: number;
+}
+
+/** Why the decision is made: a reconcile, or the idle timer firing. */
+export type PodTrigger = "reconcile" | "idle";
+export type PodTimer = "idle";
+
+export type PodRow = Environment & { readonly pod: SandboxPodState };
+
+export interface PodFacts {
+  readonly row: PodRow;
+  /**
+   * The workload image the pod is asked to run: its applied recipe's, else the sandboxes
+   * service's default (`DEFAULT_SANDBOX_IMAGE`). Only a digest of its repository is pinned.
+   */
+  readonly image: string;
+  readonly config: PodLifecycleConfig;
+  /** The Sandbox's status; undefined when the sandboxes service did not answer. */
+  readonly status: PodStatus | undefined;
+  /** The retiring Sandbox's status, when the row names one. */
+  readonly retiring?: PodStatus | undefined;
+  /** A session that names the Environment has a turn running. */
+  readonly busy: boolean;
+  readonly now: number;
+  readonly trigger: PodTrigger;
+}
+
+export interface PodEvent<T extends AgentEventType = AgentEventType> {
+  readonly type: T;
+  readonly payload: AgentEventPayload<T>;
+}
+
+export interface PodDecision {
+  /** Apply the row's spec (after `patch`) in this mode; `rotateJoin` mints a new join token. */
+  readonly apply?: { readonly mode: "Running" | "Suspended"; readonly rotateJoin: boolean };
+  /** Sandboxes to delete, by name. */
+  readonly delete: readonly string[];
+  readonly patch: SandboxPodPatch;
+  readonly events: readonly PodEvent[];
+  /** The Sandbox is gone and the Environment deleted: remove the row. */
+  readonly removeRow?: true;
+  /**
+   * The Sandbox can't take the spec it was asked to run on its volume (`REPOINT_REFUSED`): give
+   * the pod a new volume (`renewRefusedVolume`), saying why.
+   */
+  readonly renew?: { readonly reason: string };
+  /** Look again this soon. */
+  readonly retryAfterMs?: number;
+  /** Timers to (re)arm, at ms since the epoch. */
+  readonly arm: readonly { readonly timer: PodTimer; readonly at: number }[];
+}
+
+/** The service's operation id of the row's current spec. */
+export function opIdOf(pod: Pick<SandboxPodState, "k8sName" | "rev">): string {
+  return `${pod.k8sName}.r${pod.rev}`;
+}
+
+/** No Sandbox, pod or volume is left. */
+function gone(status: PodStatus): boolean {
+  return !status.exists && !status.podPhase && status.volume === "missing";
+}
+
+const event = <T extends AgentEventType>(type: T, payload: AgentEventPayload<T>): PodEvent =>
+  ({ type, payload }) as PodEvent;
+
+export function decide(facts: PodFacts): PodDecision {
+  const { row, status, now } = facts;
+  // A pod not ready `readyDeadlineMs` after it was asked to run has failed; look again after
+  // `pollMs` while it changes, or `unreachableRetryMs` when the sandboxes service does not answer.
+  const { readyDeadlineMs, pollMs, unreachableRetryMs } = hostTuning().pods;
+  const pod = row.pod;
+  const patch: SandboxPodPatch = {};
+  const events: PodEvent[] = [];
+  const arm: { timer: PodTimer; at: number }[] = [];
+  const deletes: string[] = [];
+  let retryAfterMs: number | undefined;
+  const again = (ms: number) => {
+    retryAfterMs = retryAfterMs === undefined ? ms : Math.min(retryAfterMs, ms);
+  };
+  const done = (extra: Partial<Pick<PodDecision, "apply" | "removeRow" | "renew">> = {}): PodDecision => ({
+    ...extra,
+    delete: deletes,
+    patch,
+    events,
+    arm,
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+  });
+
+  // An earlier incarnation's Sandbox (reset, loss) is deleted until it is gone.
+  if (pod.retiring !== undefined) {
+    const retiring = facts.retiring;
+    if (retiring === undefined) again(unreachableRetryMs);
+    else if (gone(retiring)) patch.retiring = null;
+    else {
+      if (retiring.exists && !retiring.deleting) deletes.push(pod.retiring);
+      again(pollMs);
+    }
+  }
+  if (status === undefined) {
+    again(unreachableRetryMs);
+    return done();
+  }
+
+  if (pod.desired === "deleted") {
+    if (gone(status) && (pod.retiring === undefined || patch.retiring === null))
+      return done({ removeRow: true });
+    if (status.exists && !status.deleting) deletes.push(pod.k8sName);
+    if (pod.observed !== "deleting") patch.observed = "deleting";
+    again(pollMs);
+    return done();
+  }
+
+  // Lost is terminal: only a reset (a new name) leaves it.
+  if (pod.observed === "lost") {
+    if (status.exists && !status.deleting) deletes.push(pod.k8sName);
+    if (status.exists) again(pollMs);
+    return done();
+  }
+
+  let desired = pod.desired;
+  let rev = pod.rev;
+  // Ready on this revision but not yet seen running (the idle timer and the ready poll fired
+  // together): it runs first, and its idle period starts now, below.
+  const becomingReady = status.ready && pod.observed === "creating" && status.opId === opIdOf(pod);
+  if (facts.trigger === "idle" && desired === "running" && !facts.busy && !becomingReady) {
+    const last = Date.parse(pod.lastActiveAt ?? row.createdAt);
+    const due = last + facts.config.idleMs;
+    if (now >= due) {
+      desired = "suspended";
+      rev += 1;
+      patch.desired = desired;
+      patch.rev = rev;
+      patch.hostEpoch = pod.hostEpoch + 1;
+      events.push(event("agent.suspended", { reason: "idle" }));
+    } else arm.push({ timer: "idle", at: due });
+  } else if (facts.trigger === "idle" && desired === "running" && !becomingReady) {
+    // Busy: a turn's end arms the timer again, but look again anyway, so a turn that never ends
+    // cleanly doesn't keep the pod running for good.
+    arm.push({ timer: "idle", at: now + facts.config.idleMs });
+  }
+
+  // An incarnation a pod has joined, whose Sandbox or volume is gone: lost.
+  if (pod.podUid !== undefined && (!status.exists || status.deleting || status.volume === "missing")) {
+    const reason = !status.exists
+      ? "The Agent's pod and volume were deleted outside the Runtime"
+      : status.deleting
+        ? "The Agent's pod is being deleted outside the Runtime"
+        : "The Agent's volume is gone";
+    patch.observed = "lost";
+    patch.reason = reason;
+    patch.hostEpoch = (patch.hostEpoch ?? pod.hostEpoch) + 1;
+    events.push(event("agent.lost", { reason }));
+    if (status.exists && !status.deleting) deletes.push(pod.k8sName);
+    if (status.exists) again(pollMs);
+    return done();
+  }
+
+  if (status.deleting) {
+    // The previous incarnation of this name is still going (an Environment deleted and created again).
+    again(pollMs);
+    return done();
+  }
+  // Agent Substrate: its worker stopped, and the sandboxes service suspended it with everything it
+  // held and resumes it on another worker (suspend before drain). Recorded once per drain.
+  if (status.drainedAt !== undefined && status.drainedAt !== pod.drainedAt) {
+    patch.drainedAt = status.drainedAt;
+    // The move keeps it awake: its awake time goes on, on another worker.
+    events.push(event("agent.suspended", { reason: "drain" }));
+    events.push(event("agent.resumed", { cause: "drain" }));
+  }
+  const opId = opIdOf({ k8sName: pod.k8sName, rev });
+  if (desired === "suspended" && !status.exists) {
+    if (pod.observed !== "suspended") patch.observed = "suspended";
+    return done();
+  }
+  if (status.opId !== opId) {
+    if (desired === "running" && (pod.observed !== "creating" || pod.startedAt === undefined)) {
+      patch.observed = "creating";
+      patch.startedAt = new Date(now).toISOString();
+      patch.reason = null;
+    }
+    // A pod started by this apply (a create, a resume) is the Environment's first, not a relaunch.
+    if (desired === "running" && pod.podUid !== undefined) patch.podUid = null;
+    again(pollMs);
+    return done({
+      apply: { mode: desired === "running" ? "Running" : "Suspended", rotateJoin: !status.exists },
+    });
+  }
+
+  if (desired === "running") {
+    // A failed setup stays failed until a turn start asks the pod to run again,
+    // though the pod itself is ready: its engine takes no turn meanwhile.
+    if (pod.observed === "failed" && pod.reason?.startsWith(SETUP_FAILED)) return done();
+    if (status.ready) {
+      // Becoming ready counts as activity: the idle period runs from when the pod could first take
+      // a turn, so a slow start (a cold node's image pull) doesn't use it up (a 56 s
+      // start was once suspended as idle 3.6 s after it ran).
+      let lastActive = Date.parse(pod.lastActiveAt ?? row.createdAt);
+      if (pod.observed !== "running") {
+        patch.observed = "running";
+        patch.reason = null;
+        events.push(event("agent.resumed", { cause: "use" }));
+        if (now > lastActive) {
+          patch.lastActiveAt = new Date(now).toISOString();
+          lastActive = now;
+        }
+      }
+      // The image it runs, pinned by digest from now on.
+      const digest = pod.imageDigest === undefined ? imageDigestOf(status.imageID, facts.image) : undefined;
+      if (digest !== undefined) patch.imageDigest = digest;
+      // Whatever woke it, a running pod has an idle timer (the idle trigger armed its own above,
+      // unless this is when it became ready).
+      if (facts.trigger !== "idle" || becomingReady)
+        arm.push({ timer: "idle", at: lastActive + facts.config.idleMs });
+      return done();
+    }
+    const startedAt = Date.parse(pod.startedAt ?? row.updatedAt);
+    // Its actor can't take this spec on its volume, crashed or not: no wait for the deadline,
+    // a new volume now (reconcile.ts).
+    if (status.reason === REPOINT_REFUSED && status.opId === opIdOf(pod) && pod.observed !== "failed") {
+      again(pollMs);
+      return done({ renew: { reason: [status.reason, status.message].filter(Boolean).join(": ") } });
+    }
+    if (pod.observed === "failed") return done();
+    // A pod that was running and crashed will not come back by itself: failed now, not at the
+    // ready deadline. One still starting is left to its wake, which reverts a crashed sandbox.
+    const crash = crashReasonOf(status);
+    if (crash !== undefined && pod.observed === "running") {
+      patch.observed = "failed";
+      patch.reason = crash;
+      events.push(event("agent.failed", { reason: crash }));
+      return done();
+    }
+    // On its way to another worker after a drain: neither failed nor starting.
+    if (status.reason === MOVING) {
+      again(pollMs);
+      return done();
+    }
+    if (now - startedAt >= readyDeadlineMs) {
+      const reason =
+        crash ??
+        ([status.reason, status.message].filter(Boolean).join(": ") ||
+          `The pod was not ready within ${Math.round(readyDeadlineMs / 1000)} s`);
+      patch.observed = "failed";
+      patch.reason = reason;
+      events.push(event("agent.failed", { reason }));
+      return done();
+    }
+    if (pod.observed !== "creating") patch.observed = "creating";
+    again(pollMs);
+    return done();
+  }
+
+  // Suspended, applied: suspended once its pod is gone.
+  if (status.suspended || !status.podPhase) {
+    if (pod.observed !== "suspended") patch.observed = "suspended";
+    // A suspend can find the sandbox already crashed (the idle timer fired before anything saw
+    // the crash): record the crash once, so its owner learns what it lost.
+    const crash = crashReasonOf(status);
+    if (crash !== undefined && pod.reason !== crash) {
+      patch.reason = crash;
+      events.push(event("agent.failed", { reason: crash }));
+    }
+    return done();
+  }
+  again(pollMs);
+  return done();
+}

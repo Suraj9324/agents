@@ -1,0 +1,1509 @@
+# @nylorun/core
+
+## 0.54.0-beta
+
+### Minor Changes
+
+- 807b302: Skills only a person starts. A `SKILL.md` may set `disable-model-invocation: true`, as Claude Code's skills do; the compiler and the SDK carry it as the skill's `disableModelInvocation: true`. Such a skill is left out of the model's catalog and `load_skill` unless the turn's message names it: a message command's new `skill` (the SDK's `MessageOptions.skill`, an A2A message's `metadata.skill`). The named skill is offered for that turn only, and the model is told the person started it; an agent used as a tool never gets it. A name the session's agent doesn't hold is `400 unknown_skill`, and a message naming a skill waits for its own turn rather than steering one. Host feature `person-started-skills`; agent manifest `v8.7` and harness file `v1.7` take the field. Also fixes the SDK sending a message's `context` twice with parts.
+- f872ddd: An Agent Plugin's own files reach the sandbox. A vendored plugin holding files beyond its `plugin.json`, servers, skills and subagent files (a plugin's `resources/`, its persona files, its docs) carries all of them, but secret-shaped ones, by hash on its `harness.plugins` entry and on the loop manifest's new `plugins`, in the folder compiler and in the SDK's `.plugin()` and `harness.manifest.json` plugins. They are definition files: uploaded with the skills' files, named at save (`definition_files_missing`), bounded together as a skill's are, and served to the run. Before a sandbox call the harness mounts each such plugin read-only at `/plugins/<name>@<hash>/`, for the root and its subagents, and `load_skill` answers a plugin skill's `pluginPath`. A plugin holding only its parts carries no files, so its manifest doesn't change. Agent manifest schema `v8.7`, harness file `v1.7`, Host feature `plugin-files`; `nylorun check` says how many of a plugin's files are mounted.
+- 0ebf870: A vendored Agent Plugin loads as its author published it, with or without a `$schema`. A plugin's `plugin.json` and `mcp.json` without `$schema` read as Agent Plugins 1.0.0, in the folder compiler and in the SDK's `.plugin()` and `harness.manifest.json` plugins; a `$schema` that names another format is still refused (`plugin_invalid`, `plugin.schema-unsupported`). A `harness.manifest.json`'s own `mcpServers` file keeps its rule.
+- 8390f9b: An Agent Plugin's subagents work like the agent's own. In `format: agent-folder/4`, each `agents/*.md` of a plugin under `plugins/<name>/` is a subagent of the manifest that installs the plugin, read by the same rules as the root's own files: it inherits the manifest's library, narrows it with `tools`, `disallowedTools`, `skills`, `mcpServers`, `readonly` and `flow`, and is checked and reported at its own path in the plugin. Its tool in `harness.tools` carries `plugin: { name, version }`, as the plugin's skills and MCP servers do; no subagent inherits another. A subagent file is now named by its frontmatter `name`, whatever the file is called, as Claude Code and Cursor name theirs; the name must be a tool name (`name_invalid` otherwise). A name used twice is `plugin_duplicate` when a plugin's file is involved and `tool_twice` otherwise. `license` is noted and ignored in a subagent file. In formats 1 to 3 a plugin's `agents/` stays a note, which now names `nylorun migrate folder <dir> --to 4`.
+
+  The agent manifest's tool entry takes the optional `plugin` label, published as `agent-manifest/v8.6.json` and `harness-manifest/v1.6.json`; a Runtime announcing the Host feature `plugin-subagents` accepts it and keeps it through a run's rebuild, and the run is otherwise unchanged. `nylorun check` prints a line per plugin naming the subagents, skills and servers it brings, and Studio shows a subagent's plugin as it does a skill's.
+
+### Patch Changes
+
+- 8b3df7c: Help text, error messages, API descriptions and doc comments say what the behaviour is without naming internal plan or decision identifiers. No behaviour changes.
+
+## 0.53.0-beta
+
+### Minor Changes
+
+- 8ab577f: Subagents are files: a manifest's files in the new `format: agent-folder/4` write each subagent as one file, `agents/<id>.md`, as Claude Code and Cursor do. The root's `tools/`, `skills/`, `mcp.json`, `plugins/` and Runtime plugins are the manifest's library: a subagent file gets everything in it that a subagent can use, and narrows it with `tools`, `disallowedTools`, `skills` and `mcpServers`; the root can narrow its own tools with `tools` and `disallowedTools`; `flow: ./<id>.flow.json` drives a subagent with a flow; a manifest driven by a flow may hold the library its stages draw on. Claude Code's and Cursor's keys (`model`, `color`, `readonly`, …) and tool names (`Read`, `Grep`, …) are noted and read. A subagent folder in format 4 is `subagent_folder`, and a subagent file in an older format `subagent_file`. `nylorun migrate folder <dir> --to 4` turns each subagent folder into a file and writes only when the folder compiles to the same agent manifest. Formats 1 to 3, the agent manifest JSON, the API, the harness and delegation's one level are unchanged. The Runtime accepts format 4 uploads with this core.
+
+## 0.52.0-beta
+
+### Minor Changes
+
+- b9b0965: A subagent used as a tool receives `{ task }` as a string, so one that declares an `inputSchema` that can't take a string is now refused when it is built or saved: `delegation.input` in the builder and the manifest contract, `delegation_input` in a manifest's files. Before, the manifest saved and the flow's first stage got a string it didn't declare. Messages and Studio now use the same words: an agent manifest is driven by a model loop or by a flow, and a flow's stages can be subagents; "flow agent" is no longer a kind. Studio's Agent manifests list filters by **Driven by** (Model loop or Flow), a flow's section is **Stages**, and a subagent used as a tool shows as "Subagent". No code, diagnostic code or wire format changes.
+
+## 0.51.0-beta
+
+### Minor Changes
+
+- 13eb181: No image carries the engine (breaking; see docs/upgrading/migration.md). The Tenant's `engine.images` is retired: `PUT /v1/tenant/sandbox` refuses it, `GET`, the `PUT` answer, the admin SDK and Studio's Compute tab no longer show it, and a value an older Runtime stored is dropped on read. The sandboxes service refuses `entrypoint: "builtin"`, so every pod copies or mounts the Runtime's engine and every computer runs the computer agent. A pod engine no longer reports an engine of its own at join. nylorun/agents no longer publishes `ghcr.io/nylorun/dev` or its `engine-<runtime>` builds (`images/dev`, `images/dev-engine` and their workflows are removed): pin your own computer image, built from the recipe in `docs/self-hosting/computer-images.md`.
+
+## 0.50.0-beta
+
+### Minor Changes
+
+- 9f17705: The event log is for developers, telemetry for operators. Each event type in the catalog names its layer: `agent`, what the agent saw and did, or `runtime`, what the Runtime did to the session. `eventLayer(type)` and `EVENT_LAYERS` are exported from `@nylorun/core/contracts` and `@nylorun/agents`, with the `TurnTrace` and `OtlpSpan` types; the envelope does not change. Studio's Events tab opens on the agent's events, with Runtime and All beside them and each row's writer, and gains a Trace view: a turn's spans as a waterfall, from the per-turn trace route, with Open trace on an event and Open event on a span. Studio's proxy allows a session's tool calls and a turn's trace. `guides/OBSERVABILITY.md` is the guide for both readers.
+- 2b80f71: A Tenant stream with an audit read (Host feature `tenant-audit`). Keys put and deleted (`key.created`, `key.revoked`), signing keys rotated and revoked (`signing_key.rotated`, `signing_key.revoked`), the tool policy and every other setting changed (`policy.changed` with the rule count, `settings.changed` with the setting's key), vault credentials written, replaced, deleted and used (`credential.created`, `.rotated`, `.deleted`, `.used`, beside the `vault_audit` rows, which are still written) and Studio sign-ins (`studio.signed_in`) are recorded in `nylorun_streams.tenant_events` (migration `0050_tenant_events`), each in the transaction of the change it records, with who acted (`principal`, from the request's credential) and what wrote it (`source`), and never a secret value: every payload is strict. The stream is not relayed to S2 and a reset keeps it. `TENANT_EVENT_TYPES`, `TENANT_EVENT_PAYLOADS`, `TenantEventSchema` and `TenantAuditPageSchema` are in `@nylorun/core/contracts`.
+
+  The Management API reads it newest first with `GET /v1/tenant/audit?since&until&types&cursor&limit`, a management key only; `POST /v1/tenant/audit/studio-sign-in` takes only Studio's key. `@nylorun/admin` adds `tenant.audit({ since, until, types, cursor, limit })` and exports the Tenant event types. Studio records each sign-in (`token`, `forwarded`, and `loopback` at most hourly) in the background, so a failure never blocks one, and adds a Tenant › Audit tab: time, type, who and a one-line summary, with a type filter and Load more. Its proxy allows the read and nothing else under the audit. `guides/OBSERVABILITY.md` has an Audit part for operators.
+
+## 0.49.0-beta
+
+### Minor Changes
+
+- d688ce5: An Agent sets when its sessions compact: `harness.loop.compaction` (`loop.compaction` in `AGENT.md`) takes `threshold` and `keepTokens`, positive whole numbers of tokens, and `roles.<role>` over them for sessions opened with that role. Our harness compacts before a model call whose estimate passes the lower of `threshold` and the model's window minus the reply reserve, and keeps `keepTokens` word for word; unset, sessions compact as before. A value that is not a positive integer is ignored with an `engine.diagnostic` (`compaction_setting_ignored`), and the folder compiler refuses it. `turn.start` names the session's role (`role`) to our harness.
+
+  An `agent-folder/3` folder may now set `loop` for the harness's own settings, such as `compaction`; only `loop.plan`, `loop.connections` and `loop.ask`, which its plugins declare, are refused. `nylorun migrate folder --to 3` keeps those settings.
+
+- d688ce5: A message's context (Host feature `message-context`): a message takes `context`, up to 16 items `{ type?, value }` and 16 KiB in all, facts for its own turn only. The Runtime keeps them on `command.message` and passes them to the turn as its input's `metadata.context`; our harness renders the turn's latest ones in the `<runtime-context>` block after the history on every model call of that turn, and later turns leave them out. A workflow session refuses them. `session.input(value, { context })` and `session.inputParts(parts, { context })` send them, and refuse before sending when the Runtime lacks the feature.
+
+## 0.48.0-beta
+
+### Minor Changes
+
+- 536ff54: A harness reaches a computer's new volume after a restore: a computer restored through `POST /v1/agents/{id}/restore`, reset, or given a new volume by its lifecycle gets a new sandbox name (`…-g0` → `…-g1`), but a harness that had opened it kept sending its sessions' `bash`, `read` and `write` to the last computer until the ticket expired, and a gateway or router that still served it ran them on the old volume. Before each request to a computer the harness now asks core where it is (`computer.current`, Harness API 5.7, `harness-api/v5.7.json`: a store read that never wakes it) and opens it again with `computer.open` when the URL moved. Core's own uses checked this already. A harness on a core older than 5.7 keeps its access until the ticket is renewed, as before.
+
+## 0.47.0-beta
+
+### Minor Changes
+
+- 7b56c2b: A computer's disk is measured: before an idle suspend the Runtime runs `du -sk /workspace /skills` on a running computer (at most 20 s; a failure records nothing and holds nothing up) and records the size as `diskBytes` on `agent.suspended`, with a `computer suspended` host log line. A wake logs `computer ready` with `waitedMs`, and the sandboxes service logs each Substrate suspend (`substrate suspended`, with `ms` or the error).
+- 7b56c2b: A `virtual` Agent can become a computer (Host feature `computer-move`): on a Runtime whose pod Agents are computers, a `PUT /v1/agents/{id}` naming a `pod` version of its manifest changes its kind in place, keeping its id, sessions, memory, vault, triggers, events and labels. `from` seeds the new volume from a disk version of another Agent with the same owner. Its virtual workspace is deleted, and the move is `agent.version_changed` with `kindFrom` and `kindTo`. It is refused while a turn runs or its disk is copied (`agent_busy`), on a version that would wait for a secret (`request_rejected`), and for any other kind change or on a Runtime without computers (`agent_fixed_field`). A manifest save never changes an Agent's kind.
+- 7b56c2b: Model roles (Host feature `model-roles`): `AGENT.md` may declare `roles`, a map from a role's name to a model (`<provider>/<model>`), compiled into `harness.roles` beside `model`. A session opened with `role` (`PUT /v1/sessions/{id}`, `client.createSession({ role })`, or an A2A message's `metadata.role` when it opens the context) runs on that role's model, through the same checks as `harness.model`; its model record says `source: "role"` and the role. A role the version does not declare is `400 unknown_role`. The JSON Schemas are republished as `agent-manifest/v8.5`, `harness-manifest/v1.5` and `agent-folder/v1/agent-md.5`.
+
+## 0.46.0-beta
+
+### Minor Changes
+
+- 5b49361: A pod Agent on an Agent Substrate cluster can be a computer: with `NYLORUN_SANDBOX_GATEWAY_URL` and `NYLORUN_COMPUTER_TICKET_KEY_FILE` set (the Runtime's Helm chart sets both), its sessions' runs go to the harness container, and their sandbox tools, file reads and writes, skill folders and disk versions reach the Agent's actor through the sandbox gateway and `atenet-router`, with a ticket core signs (Ed25519). The engine's `--service computer` runs no loop: it serves commands (a start and attaches, each under 50 s) and files on port 8080, checks each ticket against the key its template carries, and answers the wake-up probe on `/ready`. A harness opens a computer with `computer.open`; core wakes it, waits until it is ready, writes a seed onto a new disk, runs the disk's setup through it and passes a version's start check. The tools, `runtime.json` and every other backend are unchanged.
+
+  - `@nylorun/core`: Harness API 5.6 (`harness-api/v5.6.json`): `routing.sandbox.computer` and the request `computer.open`.
+  - `@nylorun/runtime`: `--service computer`; the `computer` sandbox backend; `NYLORUN_SANDBOX_GATEWAY_URL` and `NYLORUN_COMPUTER_TICKET_KEY_FILE`.
+
+## 0.45.0-beta
+
+### Minor Changes
+
+- 17951fe: A client can give one Agent a trigger over the API (Host feature `api-triggers`). `PUT /v1/agents/{agentId}/triggers/{triggerId}` creates or replaces the Agent's trigger of a fourth origin, `api`: the body is a `Trigger` exactly as a definition's `runtime.triggers` entry holds it (one of `schedule` with `timezone`, `at` or `webhook`; `session`; `prompt`) and an optional `title`. A new one is active with its next time; a replaced one gets its next time again and keeps its status; the same body again changes nothing and records no event. An id the definition declares, or one an agent's trigger or a booked wake holds, is `409 trigger_conflict`. The checks and limits are a definition's, and `runtime.limits.triggers.count` now counts the triggers an Agent's agents made and those clients put together (`422 trigger_limit`). Upgrades and moves never touch an `api` trigger, `DELETE` removes it, and pause, resume, run and a webhook's secret work as for any trigger.
+
+  - `@nylorun/core`: `TRIGGER_ORIGINS` adds `api`; `TriggerPutSchema`; `TriggerView.principal`; `agent.trigger_created` and `agent.trigger_updated` carry `origin`, `principal`, the timing and `changed` (their `sessionId` is now optional, set for `agent` only; `kind` adds `webhook`), and `agent.trigger_deleted` carries `origin`; Host feature `api-triggers`.
+  - `@nylorun/runtime`: the route; `agent_triggers.principal` and the `api` origin (store migration 0049, run at start).
+  - `@nylorun/agents`: `agents.putTrigger(agentId, triggerId, trigger)`; `deleteTrigger` deletes `api` triggers too.
+  - `nylorun`: `nylorun agents triggers put <id> <trigger>` with `--schedule`, `--timezone`, `--at`, `--webhook`, `--session`, `--prompt` and `--title`, or a JSON file; `rm` deletes `api` triggers.
+  - `@nylorun/studio`: the Triggers tab shows where each trigger came from (the definition's version, the agent that made it, or the principal that put it), its prompt and time zone for every origin, and deletes one an agent made or a client put; Activity words trigger changes and filters them.
+
+## 0.44.0-beta
+
+### Minor Changes
+
+- 874cc83: Pods on Agent Substrate (preview): suspend before drain, following Substrate's eviction contract. A worker pod that stops (a drain, a GKE node upgrade or scale-down, a WorkerPool rollout, a deleted pod) sends each of its actors SIGTERM and gives them 30 minutes to be suspended; until now the engine exited on that signal, so the actor crashed and went back to its last suspend, losing everything since.
+
+  - `@nylorun/runtime`: on Substrate (`NYLORUN_SANDBOX_SUBSTRATE=1`, which the sandboxes service's template sets), the engine logs `harness_worker_stopping` on SIGTERM and keeps running, with its runs. The sandboxes service watches worker pods (label `ate.dev/worker-pool`) and, when one turns Terminating, suspends each of the Tenant's actors on it synchronously (eight at a time, trying again for up to 29 minutes), records `drainedAt`, and resumes a sandbox whose request is `Running` on another worker. While it moves, its status reason is `Moving`, and the pod lifecycle waits instead of failing it at the ready deadline. Each drain is recorded once, as `agent.suspended` with reason `drain` (the pod row's `drained_at`, store migration 0048, nullable, run at start). Not covered: a spot reclaim or a node that dies, which still crash and revert. An actor created by an earlier release keeps its engine (#643) until it is reset.
+  - `@nylorun/core`: `agent.suspended`'s `reason` may be `drain`.
+  - `nylorun`: `local sandbox enable --backend substrate` lets the sandboxes service read pods cluster-wide (`get`, `list`, `watch`), for the worker pods it watches.
+
+## 0.43.0-beta
+
+### Minor Changes
+
+- 745ef22: A model call's retries are in its event. `message.assistant` and `model.failed` carry `attempts`, the provider calls the gate made for the call (the first included), and `retries`, one `{ attempt, delayMs, error }` for each retry (the error as the provider worded it, cut to 300 characters, with the provider's credential scrubbed). Before, a call that answered after a retry was one `message.assistant` that showed no sign of it, and a call that failed after its attempts showed only its last error; the retries were only in the gates service's `model_retry` log lines.
+
+  - `@nylorun/core`: `ModelRetrySchema`, and the optional `attempts` and `retries` on the facts `message.assistant`, `model.failed` and `context.compacted` share. `ModelFailureOutcome` takes optional `attempts` and `retries`.
+  - `@nylorun/runtime`: the gate's answer reports them in `evidence.extras`, the usage ledger keeps them (`model_usage.attempts` and `retries`, store migration 0047, nullable, run at start), and the call's event takes them from its row; a failed call's from its failure outcome. A trace's chat span has `nylorun.model.attempts`. A retried call is still metered once, as one call. `/calls/model` is unchanged.
+
+## 0.42.0-beta
+
+### Minor Changes
+
+- 6b49200: A2A `SendMessage` takes `message.metadata.delivery: "steer"` (Host feature `a2a-steer`), a session message's steer: to a busy context the message waits marked `steer`, and the running turn takes it before its next step, so its task becomes that turn's. To an idle context it starts a turn; to a workflow's, or a turn past its last step, it is an ordinary queued message. The task answered to a steer carries `metadata.delivery`: `steered`, or `queued` when the message started a turn or waits unmarked; callers that don't ask for steer get the same answer as before. `createA2aClient`'s `send` takes `delivery: "steer"`, and `readDelivery(task)` reads what applied.
+
+## 0.41.0-beta
+
+### Minor Changes
+
+- fe118db: The Tenant's sandbox settings round-trip, and `engine.images` comes back (#588).
+
+  - **Breaking (`@nylorun/runtime`, `@nylorun/core`, `@nylorun/admin`): `config` is the settings as stored.** `GET` and `PUT /v1/tenant/sandbox` (`admin.settings.sandbox`) answer `config` as the Tenant set it, with no defaults, in exactly the shape `PUT` takes (`limits.resources.memory: "8GiB"`), so `put(get().config)` changes nothing and saves no default as a setting. The settings in force, every default filled in and sizes in MiB (`memoryMiB`), are `effective`, which is what `config` was. Before, `PUT` refused what `GET` answered (`unrecognized_keys "memoryMiB"`). Read the settings in force from `effective` (`view.effective.limits.resources.memoryMiB`), and build a `PUT` body from `view.config`. `TenantSandboxViewSchema` has `config: TenantEnvironmentsConfigSchema` and `effective: EffectiveSandboxConfigSchema`.
+  - **`engine.images` is answered.** A `PUT` with `engine.images` was stored and used, but left out of its answer and of the next `GET`. Both now carry it, in `config` as set and in `effective` (`[]` when unset).
+  - `@nylorun/studio`: Edit compute settings puts the stored settings with only the fields it changed, so it no longer erases `engine.images` set through the API, keeps `placement`, and saves no default as a setting; clearing idle, stop grace or most Agents puts back the default. The Compute tab lists the engine images.
+  - `nylorun`: `nylorun tenant settings sandbox put` takes what `get` printed and puts back its `config`. `nylorun doctor sandbox` reads the limits in force from `effective`, or from `config` on an older Runtime.
+
+### Patch Changes
+
+- fe118db: A message's `removeTools` turns a Runtime plugin's tool off by its own name too: `memory` now does what `nylorun__memory` does, so the name events and `check --explain` showed no longer leaves the tool on without a word (#589). `nylorun check --explain` lists a plugin's tools by the names the model reads (`nylorun__memory`, `nylorun__update_plan`), the ones `removeTools` and tool policy take, and its memory note says the index is pinned again at a turn after a write from elsewhere (#590, #591).
+
+## 0.40.0-beta
+
+### Minor Changes
+
+- b6a7c1d: An agent sees the images and PDFs it makes in its sandbox. `read` of a file the turn's model reads as media, known by its extension (an image, a PDF, an Office document, audio or video), comes back as the file itself, shown to the model in the turn's files, instead of numbered lines of decoded bytes. Our engine runs it in the harness: it reads the bytes, checks they start as the type says, and stores them as an artifact for the model only. A model that can't read the kind is told so before anything is read or stored (`sandbox.unreadable`), and a file that isn't what its name says fails `sandbox.binary_file`.
+
+  - **Model-only artifacts.** `artifact.write` `begin` takes `audience: "model"` (Harness API 5, schema revision 5, `harness-api/v5.5.json`; only our own engine sends it). Such an artifact is readable by id and carries `audience: "model"` in its view and its `artifact.created` event, but is never listed (`GET /v1/artifacts`, a session's artifacts, pages) and is no A2A task file. Runtime store migration 0046 (`artifacts.audience`, nullable) runs at start.
+  - **Binary files.** The sandbox's `read` of any other binary file fails `sandbox.binary_file`, in words, instead of answering decoded bytes as text.
+  - **A cap per call.** A model call carries at most the 6 newest files from tool results as media; older ones in the same turn go as a note naming them, which `read_artifact` brings back. A person's own files are never capped.
+  - `read`'s description says what it now does, so the prompt prefix of every agent with a sandbox changes once: its first call after the upgrade misses the prompt cache.
+
+## 0.39.0-beta
+
+### Minor Changes
+
+- 0c6634b: `GET /v1/tenant/sandbox`'s `cluster` names its `backend` (`agent-sandbox` or `substrate`) and, on Agent Substrate, its `atespace`. `nylorun doctor sandbox` prints the Tenant's pods line (backend, context, namespace, ready), and Studio's Sandbox section says Agent Substrate with the atespace.
+
+## 0.38.0-beta
+
+### Minor Changes
+
+- 1d3a5c5: Queued messages no longer wait for good (Host feature `queue-recovery`). When a turn ends and its
+  Agent refuses to start the next one for the session's queued messages (its disk being copied, its
+  pod lost, the Agent deleted), the messages wait with the session's `queueStalled`, and the Tenant
+  sweep tries the start again (Host tuning `sweep.queueRetryMs`, 30 seconds), as does the end of the
+  Agent's disk copy. A message that has waited longer than the new Runtime limit `queuedStartMs`
+  (15 minutes) is removed with the new event `queue.failed` (`queue.start_expired`, with the
+  refusal's code as `reason`); a refusal no retry changes (a turn request the version no longer
+  resolves, another harness) fails the messages at once (`queue.start_refused`), and the messages
+  behind them are tried next. Before, nothing started such a queue until another message arrived.
+
+  On the A2A endpoint (profile v2), a queued task that fails is `TASK_STATE_FAILED` with a status
+  message saying why, in `GetTask`, its pushes and a blocking `SendMessage`. `CancelTask` on a queued
+  task now takes it out of the queue, whether a task runs in its context or not, and answers
+  `TASK_STATE_CANCELED` (the new event `queue.cancelled`), pushed; before, it was
+  `TaskNotCancelableError`.
+
+## 0.37.0-beta
+
+### Minor Changes
+
+- c649f33: A message can steer a running turn. `delivery: "steer"` on a `message` command, behind the
+  optional Host feature `steer`: to a busy agent session it waits in the session queue marked
+  `steer`, and our engine takes it into the running turn before its next step, after the tool
+  results, through a new effect kind, `inputs`, which core answers in the transaction that journals
+  it (Harness API 5, `harness-api/v5.4.json`). Each taken message's `command.message` is written
+  under the running turn, then `queue.taken` with the `step`. The queued answer and
+  `message.queued` say which delivery applied; a workflow session queues. A steer the turn doesn't
+  take starts the next turn like any queued message, and the queue's defaults never choose steer.
+
+## 0.36.0-beta
+
+### Minor Changes
+
+- 2afa44d: The Runtime's primitives as its own Agent Plugins. An `agent-folder/3` folder lists them under `plugins:` (`nylorun-memory`, `nylorun-triggers`, `nylorun-plan`, `nylorun-interactions`, `nylorun-artifacts`, `nylorun-sandbox`, which needs a computer), with no versions, and turns one of their tools off with `mcpServers.nylorun.tools.<tool>.enabled: false`. The compiler reads them as the `agent-folder/2` declarations they stand for (`memory`, `loop`, `engine.sandbox`, `engine.artifacts`, `engine.triggers`, which v3 refuses) and records them in `harness.engine.plugins`, each with its tools and the hash of its files. The engine presents their tools as the reserved server `nylorun`: the model reads `nylorun__memory` and the declared plugins' words as one text, with their skills (`memory`, `triggers`) in the catalog, served from the bundle; every effect keeps its target and `toolName`, so the record, tool policy (`kind: "runtime"` rules) and dispatch are unchanged. New: `ask` (`nylorun-interactions`, `harness.loop.ask`), a question that pauses the turn as an A2A `question`; `removeTools` takes `nylorun__<tool>`; `triggers` answers carry `now`; under `nylorun-triggers`, an agent-made trigger's run starts with a `[trigger <id> · <title> · nobody is watching]` line, and a turn a trigger started may set a one-off follow-up (`in` or `at`, `session: "this"`); the sandbox's instructions name the hosts `runtime.json` allows. `nylorun migrate folder <dir> --to 3` writes the plugins that keep an agent's tools and features, and `nylorun check --explain` names the plugin behind each. The JSON Schemas are republished as `agent-manifest/v8.4`, `harness-manifest/v1.4` and `agent-folder/v1/agent-md.4`.
+
+## 0.35.0-beta
+
+### Minor Changes
+
+- 714bee2: The triggers capability (Host feature `agent-triggers`): an agent-folder/2 folder declares `engine: { triggers: true }` (the root agent's only; `engine.instructions.triggers` replaces its wording), which compiles to `harness.engine.triggers` and offers the root agent the `triggers` tool (`list`, `create`, `delete`) and the text block `triggers@1`. The Runtime serves each call as a `runtime` effect (operation `triggers`, `turn.start.agent.triggers`, Harness API v5.3): a trigger an agent makes is the Agent's (`origin: "agent"`, with its title and the session that made it), runs in the calling session (`session: "this"`) or one of its own (`"own"`, `<session>_t_<id>`), is checked against the limits in force (`runtime.limits.triggers` within the Tenant's), survives upgrades and waits paused while a version lacks the capability; a turn a trigger started can't create one. Tool rules take `kind: "runtime"`, so an `ask` rule can hold a `triggers` call (its interaction carries `metadata.input`); `DELETE /v1/agents/{id}/triggers/{triggerId}` deletes an agent's trigger (`409 trigger_from_manifest` for a manifest's); `GET /v1/runs/stream` serves the Tenant's runs as server-sent events from a cursor (`410 cursor_expired` across a reset). `client.agents.deleteTrigger`, `client.runs.stream` and `nylorun agents triggers rm` follow. The JSON Schemas are republished as `agent-manifest/v8.3`, `harness-manifest/v1.3`, `runtime-manifest/v1.2`, `agent-folder/v1/agent-md.3`, `agent-folder/v1/runtime.2` and `harness-api/v5.3`.
+
+## 0.34.0-beta
+
+### Minor Changes
+
+- 67ed2ea: `agent-folder/2`: a folder that declares every engine feature it uses. `format:
+agent-folder/2` (or `2`) in `AGENT.md` turns it on; `agent-folder/1` and a folder with no format
+  compile exactly as before. Its `engine:` block declares `sandbox` (any of the six sandbox tools;
+  needs a computer), `artifacts: { read, save }` (`save` needs a computer), `outputs` (needs a
+  computer) and `toolSearch`, and `instructions.<block>` replaces a block's wording with a Markdown
+  file under `engine/`; `memory.index: false` pins no memory index. A computer with no sandbox tools
+  is a warning (`sandbox_undeclared`). A subagent declares its own `engine:` block, a subset of its
+  parent's (`engine_subset`).
+
+  The compiled manifest holds it as `harness.engine` (agent manifest v8, JSON Schema
+  `agent-manifest/v8.2.json`; the harness file `harness-manifest/v1.2.json`; the frontmatter
+  `agent-folder/v1/agent-md.2.json`), and the loop manifest the harness runs as `engine`
+  (`loopManifestOf`). `harness.engine.blocks` lists the engine text blocks the agent gets, each with
+  its version and the SHA-256 of its text, so an engine release that changes one changes the
+  version's hash.
+
+  New `@nylorun/core/engine`: our engine's text blocks by name and version (`skills`, `sandbox`,
+  `skill_folder`, `artifacts_save`, `outputs`, `artifacts_read`, `wake`, `memory`, `plan`,
+  `connection`, `tool_search`, each `@1`), the definitions of its own tools, the MCP tools' naming
+  and deferral (`mcpToolSet`, which no longer defers automatically for an agent that declares its
+  engine features without `toolSearch: true` and reports `mcp_tools_inline` instead), the projection
+  for one agent (`engineProjection`), `previewTurn` and `explainEngine`. Harness API v5 takes the
+  claim `engine.diagnostic` (a new event type) and a `turn.start.memory` without `index`
+  (`harness-api/v5.2.json`).
+
+- 67ed2ea: An MCP server that failed at a session's first discovery is tried again at each later turn's first
+  segment, and joins the session's snapshot once it answers: its tools are offered from that turn on,
+  its diagnostic is replaced, and `mcp.discovered` names it again with `rejoined: true`. `session.mcp`
+  takes a later snapshot of servers the session lacks and merges them within `mcpSnapshotBytes`.
+- 67ed2ea: The memory index a session pinned is refreshed at its next turn's first segment (never mid-turn)
+  when another session of the Agent, or the API, wrote the Agent's memory since its last turn started:
+  `turn.start.memory.refresh` (Harness API), and our engine pins the index again (`runDurable`'s
+  `refreshPinned`). The Runtime keeps the newest memory version a turn saw on the session
+  (`Session.memoryIndex`, `memoryWritesSince`). A session's own writes leave its index as pinned.
+- 67ed2ea: A message's `removeTools` (Host feature `remove-tools`): the tools its turn may not use, by name. A
+  declared tool or an agent used as a tool by its name (in the agent and the agents it uses as tools),
+  an MCP server's tool as `<server>__<tool>`, a whole server by its name. The Runtime applies it to the
+  version the turn runs, after the turn's first segment re-pins the session to its Agent's version, so
+  a session that always sends it still moves to new versions; names that version lacks are ignored.
+  A message's turn manifest is validated again against the version a re-pin moves to; one that is no
+  variant of it keeps the turn on the version it pinned (`turn.version_kept`). A variant may narrow an
+  agent it uses as a tool (`isVariantOf`; `withoutTools` in `@nylorun/core/define`). An HTTP tool call
+  is checked against the turn's manifest. `session.input` and `session.inputParts` take
+  `removeTools`.
+- 67ed2ea: Secret routing: the agent folder names, the installation routes (Host feature `secret-routing`, no
+  protocol change). A `bearer` or `headers` secret slot (`runtime.json`, `runtime.secrets`) takes the
+  gateway's `toolPrefix`, with or without `via`, and a slot's value write
+  (`PUT /v1/agents/{id}/secrets/{name}` with `{ value }` or `{ headers }`) takes `via`, with the same
+  URL rules as a slot's. At each request the secret's `via` wins, else the slot's in the version the
+  Agent runs, else none (the slot's `url`); the slot's `toolPrefix` wins over the secret's and
+  applies only with a `via`; the slot's `url` still picks the credential, for MCP servers and HTTP
+  tools alike, and an HTTP tool whose URL has `{field}` parameters still fails behind a `via`. A
+  write whose `toolPrefix` differs from its slot's is accepted, with a warning in the log. A `via` a
+  write copied from its slot follows the slot when the Agent moves, and a fork keeps a secret's own
+  `via`. Secret views show the `via` and `toolPrefix` in force, never a value.
+  `client.agents.secrets.put` takes `{ value | headers, via?, toolPrefix? }` (`AgentSecretRouting`),
+  and `nylorun agents secrets put` takes `--via` and `--tool-prefix`, and a slot's JSON without a
+  `type`. The JSON Schemas that gained the slot's `toolPrefix` are published as
+  `agent-manifest/v8.2`, `runtime-manifest/v1.1` and `agent-folder/v1/runtime.1`, which `nylorun init`
+  maps; the old `$schema` URLs are still read.
+- 67ed2ea: A session records the model its turns call and why (`SessionModelRecord`): `model` on `GET
+/v1/sessions/{id}` is `{provider, model, source: "manifest" | "session" | "tenant", reason?,
+requested?}`, with the fallback's `reason` (`provider_not_connected`, `not_in_catalog`,
+  `invalid_model`) and the model `requested` by the manifest or the session. It is set when the
+  session opens, chooses or clears its model, and again at each segment's start, and each change
+  writes the new `session.model` event with the `previous` record. `SessionView.model` in
+  `@nylorun/agents`.
+
+### Patch Changes
+
+- 67ed2ea: A tool policy rule whose `agent` names the session's root agent (its manifest's name) also matches
+  the MCP and HTTP calls of the agents it uses as tools; a rule naming the subagent's id still matches
+  them. `PolicyCall.root` carries the root for a subagent's call. The `agent` selector's contract
+  comments say so.
+
+## 0.33.0-beta
+
+### Minor Changes
+
+- 63a6217: An image can carry the Runtime's engine. A pod of an image the Tenant lists in
+  `engine.images` (`PUT /v1/tenant/sandbox`) runs the engine under `/opt/nylorun` with nothing copied
+  in: the sandboxes service's new `entrypoint: "builtin"`, without the `nylo-copy` init container and
+  the `/nylo` volume. Such an engine reports its Runtime version at join (header
+  `nylorun-image-engine`), the Agent's record keeps it beside its pinned image digest, and a pod runs
+  it only while it is the Runtime's own version; otherwise the engine is copied in as for any image.
+  New column `agents.engine_image` (migration 0042).
+
+## 0.32.0-beta
+
+### Minor Changes
+
+- d48b6ef: The A2A endpoint serves the Nylorun A2A profile v2 (Host feature `a2a-profile-v2`).
+
+  - **Push notifications.** The four push config methods and `configuration.taskPushNotificationConfig` in `SendMessage`. Each task update is POSTed as one A2A `StreamResponse`, at least once, with `X-A2A-Notification-Token` and Standard Webhooks signatures (`webhook-id`, `webhook-timestamp`, `webhook-signature`) made with the new Runtime config `a2a.push.secret` (`NYLORUN_A2A_PUSH_SECRET`, `whsec_…`). Private hosts must be listed in `a2a.push.allowHosts` (`NYLORUN_A2A_PUSH_ALLOW_HOSTS`, `host:port` or `host:*`). Failed pushes are retried with backoff for 24 hours (Host tuning `a2a.pushRetry`, `a2a.pushMaxAgeMs`), then dropped. Configs and pushes live in two new tables (migration 0039).
+  - **Queued follow-ups.** A message to a busy context is queued and answered with the task that takes it (`TASK_STATE_SUBMITTED`); `metadata.delivery: "reject"` keeps `UnsupportedOperationError` with reason `CONTEXT_BUSY`.
+  - **Interactions.** Approvals and connection asks are `AUTH_REQUIRED`, questions `INPUT_REQUIRED`, shown under `interactions/v1`; an answer on the same task (`{ interactionId, approved }` or `{ interactionId, value }`) maps to `approve` or `respond`, with the caller as `approvedBy`. Text never approves.
+  - **Progress, telemetry, effects.** `plan.updated` events become `progress/v1`; the terminal status carries `telemetry/v1` (totals and trace id); an uncertain effect `effects/v1`.
+  - **Files.** `url` parts are fetched and stored like `raw` ones; the files a task writes are artifacts whose `url` points at the new `GET /v1/a2a/files/{artifactId}/versions/{version}`, served only to the same subject, with `files/v1`.
+  - **Extensions and card.** `A2A-Extensions` activates the five extensions and is echoed; data of the others is left out. The card lists the Runtime's JSON-RPC interface (A2A 1.0), `streaming: false`, `pushNotifications`, and the five extensions (`required: false`).
+  - ProtoJSON's original field names (`task_id`) are accepted in A2A params.
+
+- d48b6ef: An agent manifest names the model its agent runs on (Host feature `agent-model`).
+
+  - **`harness.model`**: `<provider>/<model>`, such as `anthropic/claude-sonnet-4-5` (the provider's id, a `/`, then the model's id, which may hold a `/`; at most 200 characters). In an agent folder it is `model:` in `AGENT.md`'s frontmatter; the compiler refuses any other shape (`value_invalid`) and a `model` in an agent under `agents/`, which runs on the root agent's. `harness.manifest.json` takes it too, and the composer keeps it.
+  - **A new session starts on it.** A session opened on a version that names a model gets it as its own model (`GET /v1/sessions/{id}/model` answers `source: "session"`), as `PUT /v1/sessions/{id}/model` would choose it, when the provider is connected and its catalog lists the model. Otherwise the session has none and the Tenant's model applies; nothing fails. Sessions opened by the A2A server and by triggers get it too. An explicit choice still replaces it, and an open session keeps its model across versions.
+  - `agentModelChoice` and `AgentModelSchema` in `@nylorun/core/contracts`.
+  - The JSON Schema documents that gained the field are published at new ids: `agent-manifest/v8.1.json`, `harness-manifest/v1.1.json` and `agent-folder/v1/agent-md.1.json`; the old ids are retired. `manifestSchemaVersion` stays 8.
+
+- d48b6ef: An agent keeps a durable plan (A2A profile v2, `progress/v1`).
+
+  - **`plan.updated`**, a new durable session event: `{ steps: [{ label, state, note? }] }`, the agent's whole plan each time, never a diff. `state` is `pending`, `active`, `done`, `blocked` or `skipped`; at most 20 steps, labels of at most 120 and notes of at most 280 characters (`PLAN_LIMITS`, `PLAN_STEP_STATES`, `PlanUpdatedPayloadSchema` in `@nylorun/core/contracts`). The Runtime records and serves it like any public event, with the harness as its writer (evidence `claimed`), and the OpenAPI document lists it.
+  - **`update_plan`**, a built-in tool of our engine, off by default. A version opts in with `harness.loop.plan: true` (in an agent folder, `loop: { plan: true }` in `AGENT.md`'s frontmatter); the session's root agent then gets the tool, unless it declares its own tool of that name. A call takes `{ steps: [...] }`, cuts long labels and notes (ending in `…`) and steps past 20 rather than refusing them, claims one `plan.updated` and answers `Plan updated`. A malformed plan is a failed result the model sees.
+  - **Harness API**: `plan.updated` is a claim a harness may make (`HARNESS_CLAIMS`), additive within v5. The JSON Schema document is now published as `https://docs.nylorun.com/schemas/harness-api/v5.1.json`; `v5.json` is retired.
+  - The agent folder compiler takes `loop.plan` (true or false) and suggests it for a close typo.
+
+- d48b6ef: An agent asks for an app to be connected (A2A profile v2, `interactions/v1` kind `connection`).
+
+  - **`request_connection`**, a built-in tool of our engine, off by default. A version opts in with `harness.loop.connections: true` (in an agent folder, `loop: { connections: true }` in `AGENT.md`); the session's root agent then gets the tool, unless it declares its own tool of that name.
+  - A call takes `{ app, reason }` (app cut at 80 characters, reason at 280, never refused for length) and pauses the turn on an interaction: kind `response`, prompt `Connect <app>: <reason>`, `metadata: { kind: "connection", app, reason }`, which the session's `waits` carry. Answered with `respond`, `true` or `{ connected: true }` gives the model `Connected: <app>`; any other value `Not connected: <app>`.
+  - The agent folder compiler takes `loop.connections` (true or false).
+
+- d48b6ef: The Runtime keeps a turn index and serves it as a change feed (Host feature `turns`).
+
+  - **The turn index.** Every turn has a row: its session, Agent, status (`running`, `paused`, `completed`, `failed`, `cancelled`), start, end, last change, totals and, for an A2A context, its context and task id. It is written in the same transaction as the event that changes the turn, so it always agrees with the session's log. Migration `0041_turn_index_backfill` indexes the turns already recorded when the Runtime first starts on this version.
+  - **`GET /v1/turns`** pages the turns in the order they changed: pass the page's `cursor` as `changedAfter` to read on (a turn comes again each time it changes, and the cursor comes back even when nothing changed), `limit` up to 500 (default 100). `sessionId` reads one session's turns, oldest first. An application key reads the whole Tenant; acting for a person, only their sessions' turns. A client that missed pushes catches up with one call per interval.
+  - **A2A `ListTasks`** is served: the caller's tasks with the Agent, latest status change first, filtered by `contextId`, `status` and `statusTimestampAfter`, paged with `pageSize` (up to 100, default 50) and `pageToken`, with `totalSize`; each task as `GetTask` answers it (interaction, `progress/v1` and `telemetry/v1` metadata), with history only for `historyLength` and artifacts only for `includeArtifacts`. A paused task is `AUTH_REQUIRED` for an approval or a connection and `INPUT_REQUIRED` for a question, and the `status` filter agrees. `GetTask`, `CancelTask`, replies and push configs find a task (a queued message's id too, once a turn took it) through the index and read only that turn's events.
+  - **A2A contexts are listable.** The session of a context now carries `info.a2a` (`contextId` and the subject); a context opened by an earlier version gets it with its next message. Its session id is still the one-way hash of the subject, Agent and context.
+  - `@nylorun/core` adds `TurnSummarySchema`, `TurnChangesPageSchema` and `TURN_STATUSES`.
+
+## 0.31.0-beta
+
+### Minor Changes
+
+- 2f3fc06: A skill file can be uploaded from a stream, so a client never holds a large one in memory.
+
+  - **`SkillFileSource.stream()`**, optional: each call opens a new stream of the file's bytes. When a source has it, `client.files.ensure` (and so `agentManifests.save`) sends the stream instead of `read()`'s bytes.
+  - **`client.files.uploadStream(stream, { sha256 })`** sends one file half-duplex, up to the Tenant's skill limit (2 GiB by default). The Runtime already streams the body to its hash.
+  - **A stream is never sent twice by the transport.** After an expired token or a protocol check, `ensure` opens a new stream and sends it once more.
+
+## 0.30.0-beta
+
+### Minor Changes
+
+- 2ef610b: An outside credential provider for the egress gate (Host feature `credential-provider`; no protocol change). A Host's operator names a service that holds people's keys with `NYLORUN_CREDENTIAL_PROVIDER_URL` and `NYLORUN_CREDENTIAL_PROVIDER_TOKEN`, which `nylorun start` passes from its shell to the `gateway` and `runtime` containers. For a pod Agent with an owner, egress-gate asks the provider (`POST /v1/hosts`, with the Agent and its owner) which hosts the owner connected, lets them through on 443 inside the Tenant's egress ceiling, terminates TLS for them and hands each request to `<url>/v1/forward/<path>` with the sandbox's own headers plus `nylorun-provider-host`, `nylorun-provider-agent`, `nylorun-provider-owner` and `nylorun-provider-token`; the provider adds the key and sends it on, so the Runtime never sees a value. Each segment's sandbox sees the variables the provider names (`POST /v1/environment`) as `nylorun_managed`, under the vault's own. A secret in the Agent's vault bound to the same host still wins. Answers are cached per Agent for 15 s (Host tuning `credentialProvider.*`); an Agent with no owner is never asked about, and a provider that fails answers nothing, so its hosts are refused as before.
+
+## 0.29.0-beta
+
+### Minor Changes
+
+- 95f98f1: A model can use the Host's own identity (Host feature `model-host-identity`). `PUT /v1/tenant/model` takes `auth: { type: "host_identity", project, location }` for `google-vertex`. It keeps no secret, and the model gate calls Agent Platform with the Host's Google Application Default Credentials: on Google Cloud, the attached service account from the metadata server. It's off unless the operator lists the provider in `NYLORUN_MODEL_HOST_IDENTITY` on the process that runs the gates, which `nylorun start` passes from its shell to the `gateway` container. Every Tenant on that Host may use it. `nylorun tenant models set --provider google-vertex --model <id> --host-identity --project <id> --location <location>` sets it with no key.
+- d99b3ac: A session can have its own model (optional Host feature `session-model`). `PUT /v1/sessions/{id}/model` chooses one of a connected provider's models for that session's turns, `DELETE` clears it, and `GET` answers the model the next turn uses (`source: "session"` or `"tenant"`). The Tenant's model and every other session's stay as they are. The Model Gate calls the session's model on its provider's credential (a refreshed OAuth credential is written back to that provider), `turn.start.model` describes it, and the usage ledger records it. A choice names a connected provider and a model its catalog lists, is set by the application only (a trusted issuer's token can read it, not change it), and is refused while a turn runs or waits (`409 session_busy`); while its provider is disconnected the session uses the Tenant's model. The SDK adds `session.model()`, `setModel({ provider, model })` and `clearModel()`.
+
+  Studio's model picker under the message box now sets the model of that session only, instead of the Tenant's: "Tenant model" clears the session's choice, the picker is locked while a turn runs, it groups models by provider, and its search keeps what is typed. A Runtime without `session-model` shows no picker.
+
+## 0.28.0-beta
+
+### Minor Changes
+
+- 498d972: `nylorun check --fix` makes the edits the compiler's diagnostics carry. A diagnostic one edit fixes has a `fix` (`AgentFolderFix`, in `AgentFolderDiagnostic` and the Runtime API's): `rename_key` for an unknown key with exactly one did-you-mean (in `AGENT.md`, a trigger, a `SKILL.md`, a tool file, `runtime.json`, `mcp.json`, `flow.json` and a JSON Schema's keywords), at its line and column, and none when two keys are as close or the key it would be is already there; `crlf` for a file with CRLF line ends, which is now a `crlf` note (it is read as LF, as before); and `move_skill_secrets` for `secrets` in a root skill's `SKILL.md`, when `AGENT.md` lists none for the skill, or lists them all. Messages, manifests and hashes are unchanged. `applyFolderFixes` in `@nylorun/core/folder` makes them on text: the key token renamed with every other byte kept, LF line ends, and the secrets moved to `AGENT.md`'s `skills` block as `migrate folder` writes it, skipping (with why) a fix whose text is no longer where it was.
+
+  `nylorun check` marks each fixable problem `(fixable with --fix)` and writes nothing. `check --fix` makes the edits in the folder's files, prints each change by file, and checks again until nothing is left to fix; it leaves a file whose bytes changed since it was checked (writing nothing when one changes while it fixes), and a `runtime.json` that `extends` another. `check --json` gives each diagnostic's `fix`, and with `--fix` each folder's `fixed` and `unfixed`.
+
+- d23304e: `compileAgentFolder` gives every verdict that needs no Runtime, so `nylorun check` is the whole truth offline, with file, line and column. Each `inputSchema`, `outputSchema` and schema file is checked as JSON Schema 2020-12 (`json_schema_invalid`: a `type` such as `"objekt"`, with a did-you-mean, `properties` that is not a map, `required` that is not a list of names, in every nested schema) and as the engine reads it each turn (`if`/`then`, `not`, `dependentRequired`, `unevaluatedProperties`, a `$ref` outside `$defs` are refused); a keyword close to a known one (`proprties`) is a warning. A trigger's cron and time zone are read as the Runtime reads them (`schedule_invalid`, `timezone_invalid`, with a did-you-mean), in `triggers/*.md` and in `runtime.json`. The harness and runtime sections are checked against each other at the field that asks (`manifest_inconsistent`: skills with no sandbox, a custom harness such as `harness: workflow` off a pod, a credential bound to another URL), and the runtime's kind against what the folder asks of it (`runtime_kind`: `files/` needs a pod, `network` a sandbox). `approval` is no longer a key in `AGENT.md`, a tool file, `mcp.json` or a server's tool settings: `approval_removed` names the Tenant's tool policy (`nylorun tenant tool-policy`) as the way to ask a person.
+
+  Secrets warn, never refuse. A `.env` or key file is a `secret_file` warning instead of a refusal, and a literal value in an `Authorization`, `X-Api-Key`, `Api-Key`, `Cookie` or `*-Token` header, or a token-shaped string (`ghp_`, `github_pat_`, `sk-`, `xox…-`, a JWT) in any `mcp.json` header, is a `secret_literal` warning. Each says the folder is kept byte-exact as the version's source, readable with `agents:read`, and names `"Bearer ${NAME}"` with the value in the Agent's vault. A root `tool-policy.json`, `policy.json` or `*.policy.json` is a `tool_policy_file` warning: tool policy is the Tenant's.
+
+  Messages are the compiler's own: a field, what it takes and a did-you-mean (`kind is "virtual", "pod" or "none", not "virtal". Did you mean 'virtual'?`), never zod's `Invalid input` or `Too small`; a typo inside `memory` is named at its key, not as an invalid harness; a missing `session` and an empty trigger body say what they are. A `loop` key the nylorun harness does not read (`loop_key`) and an agent with no instructions (`instructions_empty`) are warnings. CRLF frontmatter compiles as LF does. `instructions/*.md` are read in natural order (`2-x.md` before `10-y.md`), which changes the manifest only for folders with ten or more of them. `$schema` is accepted in every JSON file and left out of the manifest (a JSON Schema's own stays, as its dialect); one that names another kind of file, or a schema that is not ours, is a `schema_url` warning, and `runtime.json` also takes the `runtime-manifest` schema. `@nylorun/core/define` adds `sectionGapsAt` (each gap with its manifest path), `cronScheduleIssue`, `isTimeZone` and `timeZoneNames`.
+
+- b3dad06: Agent folders convert both ways. `folderOfManifest(manifest)` in `@nylorun/core/folder` (also exported by `@nylorun/agents`) writes the agent folder that compiles back to the same manifest: name, description, metadata, harness, memory, loop and server and skill settings in `AGENT.md`, the first instruction as its body and the rest as `instructions/NN-*.md`, HTTP tools as `tools/<name>.json`, subagents as `agents/<name>/`, a flow as `flow.json` (v3's node tree, naming agents by id and tools by file name) with one flat `agents/<id>/` for its agents and its sub-flows' (a sub-flow is an `agents/<id>/` with its own `flow.json`, and a tool stage or HTTP verifier a `tools/<name>.json` beside the `flow.json` that names it), MCP servers in `mcp.json` with `Bearer ${SLOT}` or `${SLOT}` for a credential, triggers as `triggers/<id>.md`, and `runtime.json` without the slots the compiler derives the same way. It checks itself by compiling the folder, says whether the hash is the same (`exact`), and notes what it writes differently. Skills are written from their bytes when given them, else as a placeholder with the files to copy in. An embedded agent's display `name` is left out with a note, since a folder names an agent by its id.
+
+  `nylorun export --folder <name>[@<version>]` writes the folder of a saved manifest, from JSON or TypeScript; `nylorun migrate folder <dir>` writes the folder of a three-file folder, offline, with its skills; `nylorun pull <name>[@<version>]` writes back the folder a version was saved from, byte for byte, and says to use `export --folder` for a version saved as JSON. None writes over a file with other bytes.
+
+  Deprecated, still read: the three-file format (`agent.manifest.json`), whose `composeManifest` and `nylorun apply` now warn and name `nylorun migrate folder`, and `secrets` in a `SKILL.md`, which the skills loader warns about (a `DeprecationWarning` from `.skills()`): an agent folder lists a skill's secrets in `AGENT.md`.
+
+- b3dad06: Agent folders compile flows, subagents and vendored Agent Plugins. `agents/<id>/` of an agent is offered to it as a tool, as the TypeScript builder offers an agent used as a tool: named `<id>`, input `{ task }`, one level deep, with no `runtime.json`, `triggers/` or `files/` of its own. `flow.json` makes a folder a flow (`harness.kind: "workflow"`, v3's node tree): every `flow.json` under the flow root names stages from the root's one `agents/` by id, a stage with its own `flow.json` is a sub-flow, and the compiler embeds each agent where v3 wants it. `"tool": "<name>"` names `tools/<name>.json` beside the `flow.json`, and a loop's `verify` takes `{ agent }` or `{ tool }`. A flow's `AGENT.md` takes `inputSchema` and has no body; an unknown agent or tool is an error with its file, line, column and a did-you-mean, and an agent no flow names is a warning. `plugins/<name>/` folds a plugin's skills and `mcp.json` servers as `.plugin()` does, labelled, and notes what Nylorun does not run (hooks, commands). Diagnostics keep their file, line and column across nested folders (`agents/research/flow.json:3:12`). New codes: `flow_invalid`, `flow_body`, `flow_refused`, `flow_namespace`, `flow_cycle`, `agent_unknown`, `agent_unused`, `agent_name`, `tool_unknown`, `tool_unused`, `tool_twice`, `input_schema_refused`, `nested_refused`, `subagent_depth`, `credential_unsupported`, `plugin_invalid`, `plugin_unknown_key`, `plugin_duplicate` and `plugin_part_ignored`. `flow.json`, `agents/` and `plugins/` are no longer refused as `not_supported`.
+- 498d972: JSON Schemas for each kind of file in an agent folder, the ones `nylorun init` maps in `.vscode/settings.json` and the compiler takes in `$schema`. Each is JSON Schema 2020-12 at `https://docs.nylorun.com/schemas/agent-folder/v1/<kind>.json`, exported as `@nylorun/core/schemas/agent-folder-<kind>.json`: `runtime` (`runtime.json`, with `$schema` and `extends`, and `kind` required unless `extends` names a file that gives it), `tool` (`tools/<name>.json`), `mcp` (`mcp.json`, Agent Plugins syntax), `flow` (`flow.json`'s node tree: exactly one of `agent`, `tool`, `chain`, `switch`, `parallel`, `map` and `loop`, and `id`), and `agent-md` and `trigger-md` for the frontmatter of `AGENT.md` and `triggers/<id>.md`. `agentFolderJsonSchemas()` in `@nylorun/core/folder` gives them by kind (`AGENT_FOLDER_SCHEMA_KINDS`). They are built from what the compiler checks: its key lists name each document's properties, and a value the manifest takes as it is comes from the manifest's own schema, so an unknown key is refused where the compiler refuses it, and `loop` and `metadata` stay open. `@nylorun/core/contracts` also exports `HttpToolTargetSchema`, `McpToolSettingsSchema`, `HarnessMemorySchema` and `AGENT_MANIFEST_NAME_PATTERN`, which they are built from.
+
+  `flow.json` now takes `$schema`, as every JSON file of a folder does: the compiler refused it before. A URL that names another kind of file is a warning.
+
+- b3dad06: Compare two versions' agent folders, and set what a folder may hold per Tenant.
+
+  - **`GET /v1/agent-manifests/{name}/source/diff?from=<v>&to=<v>`** answers the files added, removed and changed (by SHA-256) from one version's source to another's, each list sorted by path, and how many stayed the same (`AgentManifestSourceDiff` in `@nylorun/core/contracts`). A version saved as JSON has no source (`404`); a `from` or `to` that is not a version number is `400`. `client.agentManifests.sourceDiff(name, from, to)` in `@nylorun/agents` calls it.
+  - **Folder limits are Tenant settings**: the Runtime limits `folderFiles` (2,000), `folderBytes` (50 MiB) and `folderTextFileBytes` (1 MiB), the values that were fixed before, set with `PUT /v1/tenant/limits` like the others. A folder save with more files or bytes is `413 limit_exceeded` (`details.limit` names the limit), and the compiler holds each Markdown or JSON file to `folderTextFileBytes` (`422 folder_invalid`).
+  - `compileAgentFolder({ entries, files, name, limits })` takes the limits as an optional input (`AgentFolderLimits`); each left out is `AGENT_FOLDER_LIMITS`'.
+  - `@nylorun/agents` also exports the types `AgentManifestSource`, `AgentManifestSourceDiff`, `AgentManifestSourceSummary` and `AgentFolderDiagnostic`, and `AGENT_FOLDER_MEDIA_TYPE`.
+
+### Patch Changes
+
+- b3dad06: Both ends of the agent folder loop.
+
+  - `nylorun init <path>` names the agent after the path's last segment (`init agents/hello`). `--example` adds `tools/get_order.json`, `mcp.json` (a `Bearer ${ORDERS_MCP_TOKEN}` header) and `triggers/new-order.md`, explained in the folder's README.md, and the result passes `nylorun check`. The first run in a project (the nearest directory with `.git`) writes `.gitattributes` (`* text=auto eol=lf`), ignores `.nylorun/credentials.json` in `.gitignore`, and maps the folder files to their JSON Schemas in `.vscode/settings.json`, merged into an existing file. Its hint names `apply --agent` and `chat`.
+  - `nylorun apply --agent [<id>]` makes the Agent from the manifest after a save (or on an unchanged one), or moves it, as `nylorun agents put` does, and prints what it needs a person for.
+  - `nylorun apply --watch [--save]` checks and plans again on each change to the folders (and the files their `runtime.json` extends); it saves only with `--save`.
+  - A plan's change to the instructions prints their text diff, `-` and `+` lines.
+  - `nylorun chat <agent> [--session <id>] [--message <text>]` opens or reuses a session, sends `--message` or each line of standard input, and prints the reply as it comes.
+  - `nylorun check --json` prints `{ folders: [{ path, ok, manifest?, diagnostics }] }` for CI, with the same exit codes. `check` says "1 file", and `nylorun --version` prints the version.
+  - `packFolder` (`@nylorun/agents`) leaves out what the folder's `.nyloignore` names (gitignore rules), and resolves `extends` in `runtime.json`: the packed file is the merge, the folder's own keys winning, with `.nylorun/origin.json` naming the files it came from; a missing file or a cycle is a `FolderError`. `ignoreMatcher` is exported.
+  - `session.approve(id, approved)` and `session.respond(id, value)` take no options: each makes its own idempotency key.
+  - The Runtime's Agent view names each required secret of the version it runs that has no value, as an attention item (`secret_unset: required secret ORDERS_TOKEN unset`, state `input_required`), until it is set.
+  - The compiler's refusal of an unresolved `extends` says to resolve it before uploading.
+
+## 0.27.0-beta
+
+### Minor Changes
+
+- 9ba6634: Agent folders: `@nylorun/core/folder` exports `compileAgentFolder`, which turns a folder of Markdown and JSON into agent manifest v8. It is pure, so the Runtime and `nylorun check` give one verdict: `AGENT.md` (frontmatter and instructions) and `instructions/*.md`, `runtime.json`, `mcp.json` in Agent Plugins syntax (`${NAME}` in a header names the credential; a slot `runtime.json` does not declare is derived for the server's URL), `skills/<name>/`, HTTP `tools/<name>.json` with schemas inline or by path, `triggers/<id>.md` and `files/**`. Every problem comes back in one pass, with file, line and column for parse and schema errors, and an unknown key gets a "did you mean". JSON is strict; frontmatter is YAML 1.2 core with no aliases, tags or merge keys. Flows, subagents and vendored plugins are refused for now. `folderTextPaths` names the files the compiler reads; `AGENT_FOLDER_LIMITS` holds the folder limits (2,000 files, 50 MiB, 1 MiB per Markdown or JSON file).
+- aaa079f: The Runtime saves agent folders. `PUT /v1/agent-manifests/{name}` with `Content-Type: application/vnd.nylorun.folder+json` takes a folder by hash (`PutAgentFolderRequestSchema`): the files uploaded first, the Markdown and JSON read back from the definition file store and compiled with `compileAgentFolder`. A folder that does not compile is `422 folder_invalid`, with the compiler's diagnostics by file, line and column in `details.diagnostics`. A save keeps the folder as the version's source: `AgentManifestView.source` summarises it, `GET /v1/agent-manifests/{name}/versions/{v}/source` lists its files and `.../source/files/{path}` returns one. With `?dryRun=true` the plan adds the compiled `manifest`, the `diagnostics` and the `compiler`. A folder whose manifest is unchanged saves no version, and says so (`source_not_saved`). New Host feature `agent-folders`; new error code `folder_invalid`.
+
+## 0.26.0-beta
+
+### Minor Changes
+
+- fce0c9b: Headers for a custom model endpoint (#493). A custom endpoint's `settings` (`PUT /v1/tenant/model`) take `headers`, sent on every call, and `callHeaders`, whose values the Runtime resolves per call from the calling Agent: one of its labels (`{ from: "agent.label", key: "org" }`), its id (`agent.id`) or the session's owner when it is a person (`session.owner`). A source with no value sends no header. A Runtime that serves several orgs' Agents can then send each call's org (`x-nylorun-org` from the `org` label), so a model gateway attributes and budgets it while the call is made, in process and through the gates service alike. They are settings, read back by `GET /v1/tenant/model`: neither map may set `authorization`, a hop-by-hop or transport header, or `Nylorun-*`, and a name appears once across both. Studio keeps them when it saves the model.
+- ab7c08a: A gateway's tool prefix (#494, Host feature `gateway-credentials`). A `bearer` or `headers` credential with `via`, written to an Agent's vault, may add `toolPrefix`: what the gateway at `via` puts before each tool name it lists, such as LiteLLM's `github-`. The Runtime lists the server's tools without it, so tool names (`github__create_issue`), a manifest's `tools` settings and tool policy rules name the server's own tools whether or not a gateway is in between, and calls each tool by the name the gateway listed. A listed tool that lacks the prefix keeps its name, and the server's `mcp.discovered` message names it. `toolPrefix` needs `via`, and secret views carry it. It is the installation's routing, never a manifest's: a manifest's secret slot cannot name it, and a slot's value write (`{ headers, toolPrefix }`) adds it. A fork keeps it while the new slot keeps `via`. No protocol change.
+- 4a563e7: The workload token (#496). A Runtime given `NYLORUN_WORKLOAD_TOKEN_FILE`, a token a platform rotates through a file, reads it at each use and keeps nothing, so a rotation applies to the next request with no restart; a missing, unreadable or empty file fails the request, naming the variable, and nothing is sent without it. A custom model with `auth: { type: "workload" }` sends it as the endpoint's bearer. A new credential type, `workload` (`{ url, via, identity?, toolPrefix? }`, no value), sends `Authorization: Bearer <token>` to its `via` only, and only when `via`'s origin is in `NYLORUN_WORKLOAD_TOKEN_ORIGINS`, since an Agent's writer chooses `via`. A gateway's `401` is `credential_rejected` with `gateway`, its origin. The token stays in the process that makes the call: never in a sandbox, the model, an event or a log. Studio shows the credential and the model's auth.
+
+## 0.25.0-beta
+
+### Minor Changes
+
+- eeb6294: Session usage as one ledger (protocol 18). The usage ledger keeps each model call's cost by token kind (uncached input, cache read, cache write, output) at the prices the adapter applied (migration 0037). For a protocol 18 client, `GET /v1/sessions/{id}/calls/model` returns each call's `startedAt`, `endedAt` and `usage.costSplit` (null for a call recorded before), and `GET /v1/sessions/{id}/usage` adds `costSplit` with `splitCalls`, and the calls' durations added up as `modelTimeMs` with `timedCalls`. A protocol 16 or 17 client reads usage as before. Studio's Usage tab is rebuilt on them: a Session card with one tokens bar and a ledger of tokens and cost by kind adding up to a total row, then the model calls grouped by turn with the same columns (cached, uncached, output, total, time, cost), and a row menu whose View event opens the call's event in the Events tab.
+
+### Patch Changes
+
+- ed08ba8: `agentManifests.save({ agent, runtime, memory })` turns on a built agent's memory (`harness.memory`, `{ access?, instructions? }`), and a skill folder's `SKILL.md` may list the secret slots its scripts read in its frontmatter (`secrets: [GH_TOKEN]`): `.skills()`, `.plugin()` and `composeManifest` make them the skill's `secrets` in the harness section, which the Runtime checks against `runtime.secrets` at save. A `secrets` that is not a list of environment variable names skips the skill with a warning.
+- ed08ba8: A flow's HTTP stage or HTTP verifier, and an HTTP tool of an agent the harness section embeds (a flow's `agents`, or an agent used as a tool), now has its `credential` checked when the manifest is saved, as an agent's own HTTP tool has: it must name a `bearer` or `headers` slot of `runtime.secrets` bound to its URL, or the save is `422 manifest_inconsistent` naming it (`harness.root stage "refund" http.credential "checks" is not a secret slot in runtime.secrets`). Before, such a manifest saved and each call failed at run time with `http.credential`.
+- ed08ba8: Public text names no internal roadmap codes: the OpenAPI documents' descriptions, the type comments of `@nylorun/core`, `@nylorun/agents` and `@nylorun/admin`, and the CLI's help, README and generated compose file. A Runtime test fails when either OpenAPI document names one.
+- ed08ba8: The tool policy's documentation matches how rules match: `tool` is the tool's identity (an MCP tool's own name on its `server`, or an HTTP tool's declared name), never the model-facing `server__tool`, which is refused; `agent` is the agent manifest's name, or the id of an agent used as a tool or of a flow's agent. `PUT /v1/tenant/tool-policy` describes each selector, and `GET` documents its `409` for a stored rule it cannot apply.
+
+## 0.24.0-beta
+
+### Minor Changes
+
+- 218b078: Agent manifest v8, the schema of protocol 16, ahead of the Runtime that saves it: `AgentManifestV8Schema`, with a `harness` section (what runs inside the loop: the harness id, instructions, tools, skills with the secret slots they read, MCP servers with the slot they authenticate with, plugins, `loop`) or a flow's, and a `runtime` section (environment manifest v1's fields; `kind` required, `harness` moved to `harness.id`, `triggers` reserved). The authoring files `nylorun apply` will read have their own schemas: `AgentManifestFileSchema`, `HarnessManifestFileSchema` and `RuntimeManifestFileSchema`, published as `@nylorun/core/schemas/agent-manifest-v8.json`, `harness-manifest.json` and `runtime-manifest.json`.
+
+  `sectionGaps(manifest)` (from `@nylorun/core/define`) checks the two sections against each other, as the Runtime will when a manifest is saved: a custom harness needs a pod with an image; every credential the harness names is a declared slot of the right type (an MCP server's or HTTP tool's a `bearer` or `headers` slot bound to its URL, a skill's `secrets` an `environment_secret` or `environment_variable` slot); and the runtime's kind gives the loop the sandbox it needs (`sandboxNeedOf`). `loopManifestOf` and `harnessSectionOf` convert between a version's harness section and the loop manifest the engine runs. Nothing calls them yet.
+
+- 22c61ce: Protocol 16, Agents from one manifest, a fresh start. An agent manifest (v8) is one versioned document at `/v1/agent-manifests/{name}` with a `harness` section (what runs inside the loop, including the harness's id) and a `runtime` section (what an environment manifest said). The Runtime checks the two against each other when it is saved (`422 manifest_inconsistent` with `details.gaps`), in place of `requires` at session open. Agent definitions and environment manifests are gone.
+
+  Environments are Agents: `/v1/agents/{id}` and its sub-routes, made from a saved manifest only (`manifest: "name"` tracks it, `"name@n"` pins a version; either resolves once, into `resolvedVersion`), with a derived `state` (`working`, `sleeping`, `input_required`, `failing`, `paused`) and `attention`. Every session runs on one Agent (`PUT /v1/sessions/{id} { agent, ownerUserId }`) and pins its manifest version. No session is special. Error codes, events (`agent.*`), scopes (`agents:write`, `agent-manifests:write`) and identity-file grants (`agents`) say Agent; model budget scope `agent` is `manifest`. Harness API 5: `turn.start.agent` replaces `turn.start.environment`, with `definition` and `loop`. Migration 0032 closes older sessions (`protocol_16`) and drops Environments with their disks and vaults.
+
+  The SDK has `client.agentManifests`, `client.agents` and `composeManifest(dir)` for three-file authoring; the CLI has `nylorun apply`, `nylorun agent-manifests`, `nylorun agents` and `nylorun migrate v8`; Studio has an Agents screen, an Agent page and an Agent manifests screen. See MIGRATION.md.
+
+- 1ded443: Agents that evolve: an Agent moves between versions of its manifest in place, with its id, disk, vault and sessions. `PUT /v1/agents/{id}` with another version moves it (`?dryRun=true` answers the plan, `AgentMovePlan`), and saving a manifest moves every Agent that tracks it. A harness-only change applies at once; a runtime change a pod applies only when it starts (image, resources, network, setup, files) leaves the Agent outdated (`targetVersion`, `waitingFor: "start"`) until its pod's next start, on the same volume; a version that adds a required secret waits for its value (`waitingFor: "secrets"`, state `input_required`). Its manifest's name, kind, harness and storage are fixed: `409 agent_fixed_field` replaces `409 agent_upgrade_unavailable`. Only secrets that fill a slot of the running version are used; others stay in the vault, dormant. New events `agent.outdated` and `agent.version_changed`, `GET /v1/agents?outdated=true`, and the save plan's `moves` and `agents_move` warning. Migration 0033 adds the Agent's target and failed versions and its start check.
+- 76dcd11: The next start and its check: a pod Agent's start on a new version is checked until the new pod's harness joins (`startCheck` on the Agent). A failed setup, a failed pod, or a start slower than the Host's `tenant.upgradeStartMs` (10 minutes) takes the Agent back to the version it ran, its definition and not its disk, records `agent.start_failed`, and names the version `failedVersion` (state `failing`), which a tracking Agent does not move to again. A new version's setup runs on the same volume when its commands or files changed (`setupHash` in the setup plan and the volume's marker). While a pod waits to start on a new version it idles at most `tenant.upgradeIdleMs` (1 minute). `POST /v1/agents/{id}/restart` applies a pending version now; `retry: true` tries the failed version again.
+- bf942ed: Our engine offers the `memory` tool. An agent whose version sets `harness.memory` gets one `memory` tool with Anthropic's memory tool schema (`view`, `create`, `str_replace`, `insert`, `delete`, `rename`; `view` only for a `read_only` agent and an agent used as a tool), our memory rules followed by the agent's `instructions`, and its memory index pinned after the instructions as user-role context: kept for the session so the prompt prefix stays cacheable (`ExecutionState.pinned`), and re-pinned after a compaction. Each command's parameters are checked before a call is sent (`checkMemoryCall` in `@nylorun/core/contracts`, which the Runtime also uses), and a call named `memory.<command>` or `memory/<command>` runs as `memory` with that command (`memoryAliasOf`). `ModelRequest.pinned` carries the pinned text; `memoryTool` and `memoryIndexBlock` are exported for your own harness.
+- 4fa160d: Agent memory, storage and API. An agent manifest's `harness.memory` (`access`: `read_write` or `read_only`; `instructions`, at most 4,096 characters) turns on the Agent's memory: Markdown files under `/memories` it keeps across sessions, wakes and upgrades. The Runtime keeps them in Postgres (`memories`, `memory_versions`, migration 0036) with a version per change and who made it. `GET /v1/agents/{id}/memories` lists them (`pathPrefix`), `GET`, `PUT` (whole content, with an optional `contentSha256` precondition: `409 memory_conflict`) and `DELETE /v1/agents/{id}/memories/{path}` read, write and delete one (or a folder), and `GET /v1/agents/{id}/memory_versions` and `.../memory_versions/{versionId}` page the versions. A fork copies the memories (the fork plan adds `memories`); a delete removes them. `@nylorun/core` adds `memoryPathOf`, `memoryDescriptionOf` and the memory contracts; new Runtime limits `memoryBytes` (100 KiB) and `memoriesPerAgent` (10,000); new error code `memory_conflict`. The SDK adds `client.agents.memories`; the CLI adds `nylorun agents memories ls|cat|put|rm|versions`. The model's `memory` tool arrives in a later release.
+- 9fed948: The `memory` tool's calls. A new effect target, `{kind: "runtime", operation: "memory"}` (additive on Harness API 5), carries Anthropic's memory tool input (`command`: `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and its parameters); core serves it in the intent's own transaction, so a replayed turn applies a write once. A malformed call fails with text for the model and changes nothing; a write from a `read_only` agent or a sub-agent is `memory.forbidden`. Each write is a memory version naming the turn's manifest version, session, turn and the trigger run that started the turn, with a new session event `memory.updated` and Agent event `agent.memory_updated`. `turn.start.memory` (`TurnMemorySchema`) carries the Agent's memory access, instructions and the index a harness pins, newest first, within the new Runtime limits `memoryIndexLines` (200) and `memoryIndexBytes` (25 KiB).
+- ffeb3bb: `schedule_wake`. An agent manifest's `runtime.selfWake: true` offers the agent `schedule_wake`: `{in | at, note}` books its session's next turn, replacing the booking before, and `{cancel: true}` removes it. The Runtime serves the call in its own transaction (a new effect target, `{kind: "runtime", operation: "schedule_wake"}`, additive on Harness API 5; `turn.start.agent.selfWake` tells a harness to offer it), so a replayed turn books once. The booking fires as a trigger run of kind `wake`, its note the turn's message with `cause.kind: "self"`. New session events `wake.booked` and `wake.cancelled`, tool call kind `runtime`, and Runtime limits `wakeMaxAheadMs` and `wakeNoteChars`.
+- 9e60e40: Protocol 17, a queue per session. A message sent while the session's turn runs or waits is queued (`{status: "queued", queuedMessageId, position}`, `message.queued`) and starts the next turn when this one ends, with every queued message, each its own user message (`queue.taken`); a cancel ends the turn, not the queue. `delivery: "reject"` keeps the refusal, now `409 session_busy`, and a protocol 16 client's messages default to it, so the Host serves protocol 16 and 17. The queue holds at most the Runtime limit `sessionQueuedMessages` (`429 queue_full`), and session reads count `queuedMessages`. Our engine takes `{kind: "messages", messages}` as a turn's input. The SDK's `input` and `inputParts` take `delivery`, and the CLI's `sessions send` takes `--reject-if-busy`. See MIGRATION.md.
+- f85483d: Triggers. An agent manifest's `runtime.triggers` declares `schedule` (cron with an IANA `timezone`) and `at` triggers, each with the session its runs go to (a session id, opened on the first run, or `new` for a session per run) and its prompt. They start active with a new Agent, fire on a durable timer per trigger with Postgres as the truth (one late fire after downtime, never a backfill, a fixed jitter per trigger), and each fire is a run (`started`, `queued`, `skipped` or `failed`, with a reason) at `GET /v1/agents/{id}/runs`. A schedule adds at most one queued message to a busy session. `GET /v1/agents/{id}/triggers` and `POST .../triggers/{triggerId}/pause`, `/resume` and `/run` (with an `Idempotency-Key`); Agent reads add `nextWakeAt`, and the Agent's stream adds `agent.run`, `agent.trigger_paused` and `agent.trigger_resumed`. New Runtime limits: `triggersPerAgent`, `triggerMinIntervalMs` and `triggerRunRetentionMs` (with floors), `triggerRunsPerHour`, `triggerJitterPercent`, `triggerJitterMaxMs`, `triggerPromptChars`; Host tuning `triggers.lateGraceMs` and `triggers.intervalCheckFires`. The SDK's `client.agents` adds `triggers`, `pauseTrigger`, `resumeTrigger`, `runTrigger` and `runs`; the CLI adds `nylorun agents triggers` and `nylorun agents runs`.
+- ae54de7: Webhook triggers. A `webhook: "standard-webhooks"` trigger has an endpoint, `POST /v1/webhooks/{endpointId}`, an anonymous, unversioned route that takes any body up to the new Runtime limit `webhookBodyBytes` and verifies Standard Webhooks (`webhook-id`, `webhook-timestamp` within the Host's `triggers.webhookToleranceMs`, `webhook-signature`) in the keys service, which alone opens the trigger's sealed secret; anything else is `401` and writes nothing. A delivery runs the trigger once per `webhook-id` (`202 {runId, status}`); a paused trigger answers a signed one `409 trigger_paused`. `POST /v1/agents/{id}/triggers/{triggerId}/secret` makes or replaces the `whsec_` secret, shown once (`agent.trigger_secret_rotated`); trigger reads show `webhookUrl` and `secretSet`. The payload reaches the model under the trigger's prompt in a labelled `<trigger-payload>` block. The SDK adds `agents.rotateWebhookSecret`, and the CLI `nylorun agents triggers new-secret`.
+
+## 0.23.0-beta
+
+### Minor Changes
+
+- 0a2fbc5: **Artifacts reach the harness through the Harness API; `read_artifact` and `save_artifact` run in the harness (protocol 15, Harness API 4).** The first step of the harness boundary: model-facing work belongs to the harness, and the Runtime offers primitives and holds limits and access. A fresh start for agent sessions: the Runtime speaks protocol 15 only. See MIGRATION.md.
+
+  - **The artifact seam.** A harness reads and writes the artifacts of the run it holds: `artifact.read {artifactId, version?, offset?, length?}` answers the version's metadata (`ArtifactMetaSchema`) and its bytes from `offset`, at most `turn.start.limits.chunkBytes`; `artifact.write` (`begin`, `chunk`, `commit`, `abort`) makes a file artifact of the session or a new version of one of its own, streamed with backpressure into the Object store and committed in Postgres within the Tenant's and the Environment's artifact limits. The scope is always the run's session: its own artifacts, and the Tenant-wide ones its messages named; anything else is the new error code `not_found`, alike. A write's `key` makes it idempotent within the session (`artifact_versions.write_key`, migration 0028), and its `effectId` links the artifact to a tool call of the turn, whose call id `artifact.created` carries. An upload the run leaves open commits nothing. Client helpers: `readArtifact`, `openArtifactWrite`, `writeArtifactBytes`, `toBase64` and `fromBase64` in `@nylorun/core/harness-api`.
+  - **Our harness runs the artifact tools.** `read_artifact` (every agent) and `save_artifact` (with a sandbox) are our engine's tools, defined in `@nylorun/harness` (`artifactToolsFor`, `runArtifactTool`) and run over the seam and the run's sandbox files (`HarnessExecutors.files`, `SandboxManager.writeBytes`); their calls are kind `harness`. `save_artifact` keys its write by its effect id. `read_artifact` takes `path` with a sandbox, which copies the whole artifact into it, and hands a file of any other type to the model as a file of the result (the Model Gate writes the note for one the model does not read; `artifact.unsupported` is gone). Its page is harness configuration, `createHarness({ artifactPageBytes })` (32 KiB by default), and now always ends on a whole character. `runDurable` takes `engineTools`; `apiHost` takes the engine's configuration.
+  - **The Runtime pins no artifact tools.** `runtimeManifestFor` has no `save` or `read`; `RUNTIME_TOOL_NAMES` no longer holds the two names, so an author tool may take one (our harness then refuses the turn). A session without a sandbox or skills pins its definition unchanged. Core no longer runs either tool (`tenant/artifact-tool.ts` is gone). Migration 0029 closes every agent session that pinned them (`closedReason: "protocol_15"`, `409 session_closed`); workflow sessions carry over.
+  - **Media types are core's.** `contentTypeFor`, `essence`, `normalizeContentType`, `isText`, `isModelImage`, `modelInputOf`, `inputLabel`, `extensionFor`, `unreadableReason`, `MODEL_IMAGE_TYPES` and `DEFAULT_CONTENT_TYPE` are exported from `@nylorun/core/contracts`, for the Runtime and harnesses alike.
+  - `PROTOCOL_VERSION` 15 with required feature `harness-boundary`; `HARNESS_API_VERSION` 4. The SDKs and the CLI send protocol 15.
+
+- ebe7348: **The harness decides how files reach the model; the Model Gate only fetches and translates (protocol 15).** The second step of the harness boundary, still protocol 15 and Harness API 4. See MIGRATION.md.
+
+  - **Any file may be sent.** A message naming a file the model does not read is accepted: `422 attachment_unsupported` and its error code are gone, and AG-UI and A2A accept such files too. Files are still held to the artifact size limits at upload.
+  - **`turn.start.model`** is the model descriptor (`ModelDescriptorSchema`): the provider, id, inputs, context window and output limit of the model the turn's calls use, absent for flows and without a model. One resolution (`model/descriptor.ts`) serves it, the catalog's inputs and the gate.
+  - **Our engine shows each file.** An image or document the model reads goes as its artifact reference, a text file is read over the artifact seam and inlined as a `<file>` block, and anything else (past `modelFileBytes`, a kind the model does not read) is a note it writes. `fileView`, `representFiles`, `fileBlock`, `fileNote` and `mediaReferenceLine` (moved from `@nylorun/core/define`) are exported from `@nylorun/harness`. A budget from the descriptor bounds the prompt before the first answer, and compaction counts files as the model gets them.
+  - **The Model Gate refuses instead of writing notes.** A text file as a media part, or a kind the model or its API does not read, fails the call with the new model failure code `unsupported_input`; a reference it cannot fetch fails `invalid_request`. Nothing is sent, and neither is retried.
+  - **Structured answers are the engine's.** `ModelCall.outputSchema` is removed: our engine writes the JSON instruction and parses the answer (fenced, with control characters repaired; `parseJsonWithRepair` ported from pi-ai). `message.assistant` for a structured answer now carries its JSON text.
+  - **`read_artifact`** refuses a file the turn's model does not read (`artifact.unsupported`, with the reason).
+  - `unreadableReason` is removed; `isOffice` joins the media type helpers in `@nylorun/core/contracts`.
+  - Studio's file picker accepts every file, and the refusal chips are gone.
+
+- ff6470e: **The harness writes the model's instructions and defines the sandbox and skill tools; no `runtime` block (protocol 15).** The third step of the harness boundary, still protocol 15 and Harness API 4. See MIGRATION.md.
+
+  - **No `runtime` block.** The Runtime no longer pins model-facing text or tools on a session's manifest: a session pins its definition as registered (`manifestHash` equals `definitionHash`) and keeps its sandbox spec on the session. The manifest schema refuses `runtime` with what replaces it (`REMOVED_MANIFEST_FIELDS`). `runtimeManifestFor`, `runtimeToolOf`, `RuntimeManifest`, `RUNTIME_TOOL_NAMES`, `isRuntimeToolName`, `createSandboxTools`, `SANDBOX_INSTRUCTIONS`, the skill tool names, `isSkillTool`, `SKILLS_USAGE`, `formatSkillCatalog` and `skillOfToolCall` leave `@nylorun/core/define`; `RUNTIME_PART_ID` is `SESSION_PART_ID` (`"session"`), and `agentFrom` takes `sessionInstructions`. `@nylorun/agents` no longer re-exports the skill catalog helpers. Migration 0030 closes the agent sessions that still pinned a `runtime` block (`closedReason: "protocol_15"`).
+  - **`turn.start` states facts.** `environment` (`TurnEnvironmentSchema`: `{id, kind, sandbox?: {workspace}}`) and `routing.sandbox.spec` (the pinned spec) join the agent's `skills`.
+  - **Our engine words them.** `@nylorun/harness` writes the skill catalog, the sandbox note and the skills' folder note, and defines the six sandbox tools, `load_skill` and `read_skill_resource`, in the order and bytes the `runtime` block had, so the prompt's prefix is unchanged (`engineToolsFor`, `sandboxTools`, `sandboxInstructions`, `skillCatalogText`, `skillFolderNote`, `skillTools`, all exported for a harness of your own). The skill tools run in the harness over `definition.file` (`runSkillTool`), and core no longer runs them (`tenant/skill-tool.ts` is gone). The sandbox tools' limits are harness configuration (`createHarness({ sandboxTools })`, `harnessExecutors({ sandboxTools })`, `DEFAULT_SANDBOX_TOOL_LIMITS`), as is the most a skill read takes into the context (`createHarness({ skillReadBytes })`, 10 MiB by default), held to the run's `limits.recordEntryBytes`.
+  - **Effects name their target.** A tool effect carries `target: {kind: "mcp" | "http" | "sandbox" | "harness" | "platform"}` (`EffectTargetSchema`) and may carry `skill`; the record routes by the kind, never by the tool's name, and a call without a target or one the session lacks is `tool.unavailable`. `hello.features.tools` and `NativeToolSchema` are removed, no tool name is reserved, and the record keeps the skill the intent names when the agent has it. A skill tool's `tool.completed` is `kind: "harness"` (it was `platform`).
+  - **Studio** drops the manifest panel's Runtime section: it shows the sandbox tools when the session's Environment has a sandbox.
+
+- f443475: **The harness builds the MCP tool list and shapes tool results; tools are identified by server and tool (protocol 15).** The fourth step of the harness boundary, still protocol 15 and Harness API 4. See MIGRATION.md.
+
+  - **Tools have an identity.** An MCP tool call's target is `{kind: "mcp", server, tool}` (the server's own name for the tool) and an HTTP tool call's `{kind: "http", tool}` (its declared name); `platform` is gone. `toolName` is the model's name, for display. The record checks an MCP call against the session's discovery (`tool.unknown`) and the turn's tool settings (`tool.disabled`), and `tool.completed`, tool-call rows (`tool`), approvals (`Approve server / tool?`, `interaction.tool`) and traces (`nylorun.tool.identity`) carry the identity. The Tool Gate matches a call to its journaled target.
+  - **Tool policy keys on identity.** A rule's `tool` is the tool's identity, never the model's name. A rule whose `tool` has `__` in it is refused at `PUT /v1/tenant/tool-policy`; a stored one makes the policy unreadable, so every call is denied (and `GET` answers `409`) until the policy names the tool by `server` and `tool`.
+  - **`turn.start.mcp` states facts.** The session pins what its servers listed, raw (`McpSnapshot` v2: servers, scrubbed instructions, tools as named); each turn gets `mcp` (`McpFactsSchema`: every tool with `enabled` and the manifest's `deferred` hint) in place of `sessionTools` and `routing.mcpSnapshot`, and `session.mcp` answers `{mcp}`. `mcp.discovered` has no `renamed` or `deferred`. Migration 0031 closes the sessions that pinned the former snapshot (`closedReason: "protocol_15"`).
+  - **Our engine names, defers and searches.** `@nylorun/harness` names MCP tools (`mcpToolName`, `mcpToolNames`, within the 64-character provider ceiling), defers them by the manifest's setting or the model's window and pins that layout in its state (`mcpToolSet`, `McpLayout`), and runs `tool_search` (BM25) itself; core's `tool_search`, `deferredToolsTools`, `TOOL_SEARCH_TOOL` and `TOOL_CALL_TOOL` leave `@nylorun/core/define`, and `runDurable` takes `mcp` instead of `sessionTools`.
+  - **Our engine shapes tool results.** Core no longer stores large or binary tool results: the record refuses an outcome past `limits.recordEntryBytes` (`limit_exceeded`). Our engine spills them with `artifact.write`, keyed by the call and its bytes (`spillKey`), with a preview, an image as a file for a model that reads images, and one budget per step (`shapeToolOutcome`, `StepBudget`, exported for a harness of your own). The Tool Gate still scrubs credentials and refuses answers past `limits.toolAnswerBytes`.
+  - **Harness configuration.** `createHarness({ mcpTools, toolResults })` sets the deferral share, characters per token, fallback window, the note's instruction length, `tool_search`'s limits, the inline cap, preview head and tail, step budget, stub, small size and entry envelope (`DEFAULT_MCP_TOOL_CONFIG`, `DEFAULT_TOOL_RESULT_CONFIG`).
+  - **The MCP preview** names tools as Nylorun's engine would (`modelName`, `renamed`) and shows a server's instructions uncut.
+  - **Studio** shows an MCP tool as `server / tool` in tool and approval cards, with the model's name, and links the artifacts a tool's result was stored in.
+  - **`examples/harness-minimal`** spills a large `bash` output with `artifact.write` and keeps a preview; its README shows how a harness of your own offers MCP tools.
+
+- cf425c6: **The harness mounts skills and saves outputs; the in-process harness uses the gates; compaction is a transcript edit (protocol 15).** The fifth step of the harness boundary, still protocol 15 and Harness API 4. See MIGRATION.md.
+
+  - **Skill folders are our engine's.** Before each sandbox call our engine mounts each skill version of the turn's tree at `/skills/<name>@<hash>/` with `executors.files.mount`, reading the bytes over `definition.file`; the SandboxManager only writes them (`mountFolder`), once per open sandbox (`present` after). `SandboxManager.mountSkills`, its `definitionFile` port and `SandboxSessionRef.manifest` are gone, and the operator sandbox route mounts nothing.
+  - **The outputs folder is our engine's.** At a completed turn's end in a sandbox our engine saves `/workspace/outputs` as the session's `outputs` folder before `turn.completed`, over the new folder mode of `artifact.write` (`kind: "folder"`, `file`, chunks named by hash, `unchanged`, `refused`). Core takes every byte, checks each file's hash before content is stored under it, dedupes, and keeps the content epoch and quotas. Versions say `source: "engine"`; `artifact.export.skipped` and `artifact.export.failed` are harness claims. Core's export (`artifacts/export.ts`, the `WorkspaceReader`, `workspace.read` listing and bytes calls) is removed.
+  - **No limit literals.** The new Runtime limit `folderEntries` (10,000; a count, its ceiling from the manifest's one string) replaces `EXPORT_MAX_FILES`, and `createHarness({ outputs: { dir, maxBytes } })` (`/workspace/outputs`, 1 GiB) replaces `EXPORT_MAX_BYTES`. `RUNTIME_LIMIT_CEILINGS` entries are `{value, unit, why}`.
+  - **In-process parity.** Every model call goes through the Model Gate: a scripted model is served by `providerModelGate`, metered like any. The MCP pool opens every server through the Tool Gate (`openRemote` is required; the in-process gate's `openMcp` finds the server in the session's pinned manifest and authorizes it with the vault). `ModelRoute` is `{tenantId, modelGate}`; `TenantContext.modelProvider`, `useVaultModel` and `workspaces` are gone.
+  - **Compaction is a transcript edit.** Summary calls say `purpose: "summary"` (no `message.assistant`), and the segment's edit that replaced the history says `kind: "compaction"` with its facts and summary calls (`CompactionFactsSchema`, `transcriptUpdates(..., compaction)`). Core checks the calls and writes one `context.compacted`, which loses `partial`.
+
+- 23774c4: **The last hard-coded limits are configuration.** Still protocol 15 and Harness API 4. Every default is the value before. See MIGRATION.md, and DEPLOYMENT.md's Runtime limits and Host tuning.
+
+  - **21 more Runtime limits** (`GET`/`PUT /v1/tenant/limits`): a message's parts (`messageParts`), page sizes (`pageItems`, `exportPageItems`, `environmentEventItems`; a page asked larger holds that many), labels (`artifactLabels`, `labelKeyChars`, `labelValueChars`), a manifest's setup command, descriptions and secret hosts (`setupCommandChars`, `manifestDescriptionChars`, `secretDescriptionChars`, `secretHosts`), a failed pod's reason (`setupReasonChars`, `setupCommandExcerptChars`), secret values (`secretValueChars`), the tool policy and budgets (`toolRules`, `toolRuleFieldChars`, `toolRuleTextChars`, `modelBudgets`) and flows (`flowConcurrency`, `flowMapItems`, `flowLoopIterations`, replacing the `NYLORUN_FLOW_*` variables no Host read). Request schemas lose these maxima; the Runtime checks the Tenant's.
+  - **More Host tuning** (`NYLORUN_TUNING`): token lifetimes and clock tolerance (`keys.*`), the advance deadline and grace (`execution.*`), `nylorun-operate`'s waits, the credential store's lock, sweep arming, Postgres batches and the replication pool, a basin repair's log cadence, egress sockets, the engine poll and sandbox memory floor, MCP listing pages and diagnostics, sandbox helper commands, the scrub threshold, exec event and local stream sizes; and in the engine, `flowValueChars` and `toolResults.minPreviewBytes`.
+  - **The CLI's own waits are `NYLORUN_CLI_TUNING`**: `nylorun start`'s waits and polls, the Compose healthchecks and WAL cap, and `nylorun local sandbox`'s waits.
+  - **Studio follows the Runtime's limits**: no upload cap of its own, the Tenant's `requestBodyBytes` read for a write it parses past the default (`@nylorun/agents` exports `RUNTIME_LIMIT_DEFAULTS`), no CPU cap in its form.
+  - **Kept, each justified where it is defined**: Linux's `MAX_ARG_STRLEN` (a setup command's ceiling) and `PATH_MAX` (a link target), a model-facing tool name's 64 characters, RFC 6838's media type length, Postgres's 65,535 bind parameters, a tmpfs page, and identifier grammars (the protocol's).
+
+- b1e815d: **Runtime limits are a Tenant setting, and harnesses get them in `turn.start.limits`.**
+
+  - What one record entry, model call, model file, tool answer, custom harness state and Harness API chunk may hold is the new Management API setting `GET`/`PUT /v1/tenant/limits` (`{ limits: { recordEntryBytes, modelCallBytes, modelFileBytes, toolAnswerBytes, harnessStateBytes, chunkBytes } }`), also `admin.settings.limits` and `nylorun tenant settings limits [get | put <file|->]`.
+    - The defaults are today's sizes (`RUNTIME_LIMIT_DEFAULTS`): 960 KiB, 32 MiB, 8 MiB, 8 MiB, 256 KiB and 16 MiB. A limit left out of a `PUT` takes its default.
+    - Each limit has a ceiling a dependency sets (`RUNTIME_LIMIT_CEILINGS`): S2's 1 MiB record less 64 KiB for the event's envelope, the 64 MiB Harness API frame, the longest JavaScript string. A limit above its ceiling is `400`, naming the ceiling.
+    - Each is read from the Tenant's database where it is checked; nothing keeps it.
+  - **The record holds every write to `recordEntryBytes`.** An event whose payload, or an effect outcome whose value, is larger, whoever wrote it, is refused with `limit_exceeded`: `413` (`details.limit: "recordEntryBytes"`) to an API client, the new Harness API error code `limit_exceeded` to a harness. A harness's claimed event past it is refused rather than dropped. Before, such an event reached a record S2 could not take.
+  - **The gates read the setting.** The Model Gate refuses a body past `modelCallBytes` and a file past `modelFileBytes`; the Tool Gate keeps no MCP or HTTP answer past `toolAnswerBytes` (`mcp.too-large`, `http.too-large`) and reads no tool body past it. A custom harness's state past `harnessStateBytes` fails its turn with `limit_exceeded` (it was `invalid`), and a `definition.file` range longer than `chunkBytes` is `limit_exceeded`. Core's step budget for tool results is unchanged (256 KiB), or half `recordEntryBytes` when that is less.
+  - **`turn.start` carries `limits`** (`RuntimeLimitsSchema`), the limits in force when the segment started. Harness API 3 and protocol 14 are unchanged, but `TurnStartSchema` is strict: a harness built against an older `@nylorun/core` refuses a `turn.start` with `limits`, so upgrade a custom harness with the Runtime. Our harness asks for skill files `limits.chunkBytes` at a time, and holds MCP answers on its own connections to `limits.toolAnswerBytes`. `createHarness` takes `onStart(grant, start)`.
+  - **Removed exports:** `MAX_MODEL_CALL_BYTES`, `MAX_TOOL_BODY_BYTES`, `MAX_HARNESS_STATE_BYTES` and `DEFINITION_FILE_CHUNK_BYTES` from `@nylorun/core`. Added: `RuntimeLimitsSchema`, `RUNTIME_LIMIT_DEFAULTS`, `RUNTIME_LIMIT_CEILINGS`, `runtimeLimitsOf`, `runtimeLimitIssues`, `limitExceededMessage`, `S2_RECORD_MAX_BYTES`, `RECORD_ENVELOPE_RESERVE_BYTES`, `JS_STRING_MAX_LENGTH` and the `TenantLimits*` schemas.
+
+- f2e9b0a: **Skill and artifact limits are set per Tenant and per Environment manifest; a skill holds up to 2 GiB by default, with no limit per file or on the number of files.**
+
+  - The 10 MiB limit per skill file and the 500-file limit are gone. A skill's files may hold up to the Tenant's skill limit together: 2 GiB by default (`SKILL_TOTAL_BYTES_DEFAULT`). A file at two paths counts twice, since a sandbox holds both copies. `SKILL_FILES_MAX` and `DEFINITION_FILE_MAX_BYTES` are no longer exported.
+  - The Tenant's skill limit is the new Management API setting `GET`/`PUT /v1/tenant/skills` (`{ limits: { totalBytes } }`), also available as `admin.settings.skills` and `nylorun tenant settings skills [get | put <file|->]`.
+    - `PUT /v1/files/sha256:<hex>` takes a file up to that limit.
+    - `PUT /v1/agents/{id}` refuses a skill over it, an agent used as a tool included: `413 limit_exceeded`, with `details.skills` listing each skill and its size.
+  - An environment manifest, or the inline fields of `PUT /v1/environments/{id}`, may set `limits`: `artifacts.fileBytes`, `artifacts.totalBytes` and `skills.totalBytes`. Like the manifest's other fields, they are fixed for the Environment's life.
+    - Each limit must be at most the Tenant's. A higher one is refused with `400` when the Environment is made or the manifest is saved.
+    - A limit left out is the Tenant's at the time it is checked. A Tenant that lowers a limit lowers it for every Environment.
+    - The Environment view's new `limits` field gives the limits in force.
+  - An Environment's artifacts are its sessions' artifacts and its disk versions. Uploads, `save_artifact`, turn-end exports and disk snapshots hold them to the Environment's per-file limit and to its own total, as well as to the Tenant's total. A turn-end export past the Environment's total is skipped with the new reason `environment_total`, and a disk snapshot past it is `413` with `details.limit: "environment_total"`.
+  - A session opens on an Environment only when its agent's skills fit the Environment's skill limit; otherwise it is `409 environment_unsuitable`, with `details.skills`.
+  - `PUT /v1/files` streams the body to the Object store instead of holding it in memory. Only bytes that match the named hash reach the file's key. Environment files named by hash are held to the same per-file maximum.
+  - `@nylorun/agents`: loading a skills folder no longer checks a size, since the limit is the Tenant's; the Runtime refuses an oversized skill. The `skills.file-too-large` and `skills.too-many-files` errors are gone. Files are hashed and read a chunk at a time.
+  - Sandboxes get skill files as a stream. A harness fetches them from core 16 MiB at a time: `definition.file` takes optional `offset` and `length` (at most the Runtime limit `chunkBytes`).
+  - `load_skill` and `read_skill_resource` read files of up to 10 MiB into the model's context. A larger file fails with `skill.resource_too_large`, and the error names the file's path in the sandbox when there is one.
+
+- 6772612: **The remaining request, upload, token and sandbox limits are Tenant settings.** Still protocol 15 and Harness API 4. See MIGRATION.md and DEPLOYMENT.md's Runtime limits.
+
+  - **27 more Runtime limits** in `GET`/`PUT /v1/tenant/limits`, each with today's value as its default and a ceiling from a dependency (a JavaScript string or timer, a request read as one string, a Harness API frame, a JavaScript number): request bodies and inline files (`requestBodyBytes`, `inlineFileBytes`), `a2aWaitMs`, `errorExcerptChars`, `traceContentBytes`, an Environment's labels, setup and input files (`environmentLabels`, `environmentSetupCommands`, `environmentFiles`, `environmentFilesPerEntry`, `environmentSecretSlots`, `setupCommandMs`, `setupOutputChars`), disk versions (`diskVersionEntries`, `diskVersionBytes`, `diskLeaseMs`, `diskPodWaitMs`; an Environment's manifest may lower the first two with `limits.disk`), model calls (`modelRequestMs`, `modelIdleMs`, `modelAttempts`, `modelRetryDelayMs`, `modelProviderRetries`, `modelRetryDelayMaxMs`, read by the gates for each call) and tools (`toolAttempts`, `httpToolTimeoutMs`, `mcpPreviewMs`, `mcpMetadataBytes`, and the new `mcpSnapshotBytes`: what a session pins of its MCP servers' tools and instructions, past which a server is left out with a diagnostic).
+  - **Schema maxima are checked against the Tenant's limits**: an Environment's labels, setup commands, input files, files per entry, secret slots and setup timeout, and an HTTP tool's `timeoutMs` (at deploy and at each call). `limits.environments` and `lifecycle.stopGrace` lose their arbitrary caps; an identity file's issuer takes any number of grants and `jwksFetch` settings.
+  - **`turn.start.limits` carries only a harness's limits** (`HarnessLimitsSchema`, `harnessLimitsOf`), and a harness drops one it does not know. `transcriptUpdates` takes `recordEntryBytes` and fills each event up to it; `CHUNK_BYTES` is gone.
+  - **Constants a dependency or a standard fixes stay, named for it**: a token is read up to Node's `http.maxHeaderSize`; artifact names and folder paths keep `FILE_NAME_MAX` (255) and `FILE_PATH_MAX` (1,024); a skill file's path is what `FILE_PATH_MAX` leaves under its mount folder; `tracestate` keeps W3C's 512.
+  - **Removed**: `ENVIRONMENT_LABELS_MAX`, `ENVIRONMENT_SETUP_MAX`, `ENVIRONMENT_SETUP_TIMEOUT_MAX_MS` (now `ENVIRONMENT_SETUP_TIMEOUT_DEFAULT`), `ENVIRONMENT_FILES_MAX`, `ENVIRONMENT_SECRET_SLOTS_MAX`, `TOKEN_ENVIRONMENT_GRANTS_MAX`, `HTTP_TOOL_MAX_TIMEOUT_MS`, `READ_ARTIFACT_MAX_BYTES` and `CHUNK_BYTES` from `@nylorun/core`; the image checks (`decodeImageBase64`, `validateImageBytes`, `IMAGE_MEDIA_TYPES`, `MAX_IMAGE_BYTES`), the Tenant configuration's `modelCall` and `TrustedIssuersOptions`' `refetchMs`/`maxAgeMs` from `@nylorun/runtime`. Studio's Environment form no longer caps setup commands and input files at 16: the Runtime checks the Tenant's limit.
+
+### Patch Changes
+
+- 2459430: **An `environment_secret` reads `nylorun_managed` in the sandbox instead of `nylorun-managed`, so CLIs that check a token's format send their requests.**
+
+  - The Vercel CLI refuses a `VERCEL_TOKEN` with any character outside letters, digits and `_` (`Must not contain: "-"`) and exits before egress-gate can set the header. `ENVIRONMENT_SECRET_SENTINEL` is now `nylorun_managed`.
+  - egress-gate never compares the value: it replaces the credential's header whatever the CLI sent, so nothing else changes. A script that checks for the literal `nylorun-managed` should check for `nylorun_managed`.
+
+## 0.22.0-beta
+
+### Minor Changes
+
+- a0cf8b2: **HTTP tools take `GET` and `DELETE`, and URL path parameters.**
+
+  - `method` is `GET`, `POST` (default), `PUT`, `PATCH` or `DELETE`. `POST`, `PUT` and `PATCH` send the input as the JSON body, as before. `GET` and `DELETE` send no body: the input becomes the query string, after any query string written in the URL. An array repeats its name (`tag=a&tag=b`) and a `null` is left out.
+  - The URL's path may name input fields as `{field}`, as in `https://api.example.com/orders/{orderId}`. Each value is percent-encoded into the path and is not sent again in the body or query string. A value that is empty, `.` or `..`, or not a string, number or boolean is refused before the call is sent (`tool.invalid-input`).
+  - `http()` and the manifest contract check a tool against its input schema. Each `{field}` must be a required scalar property. For `GET` and `DELETE`, a property must not be an object and must not repeat a query parameter the URL already sets.
+  - An HTTP verifier still takes only `POST`, `PUT` or `PATCH` and a URL without `{field}` parameters, because it is sent `{ input, output, iteration }` as a body. A credential with `via` cannot serve a tool with `{field}` parameters (`http.credential`).
+  - core exports `httpToolRequest`, which maps a call's input to the request, and `httpPathParameters`. The Runtime's outbound `post()` is now `send()`, which can send a request without a body.
+
+### Patch Changes
+
+- 620072d: **Docs and schemas match what the CLI and the Runtime do.**
+
+  - `@nylorun/core`: the environment manifest's JSON Schema (`@nylorun/core/schemas/environment-manifest.json`) takes the CLI's `{ path, from }` `files` entry, so an editor no longer flags a manifest that `nylorun environments manifests save` accepts. The Runtime's own schema is unchanged: the CLI turns the folder into `{ path, files }` before saving. `manifest_changed` says to save without `If-Match` (`--if-match`, `ifMatch`); no command takes `--force`.
+  - Tool names, skill names and MCP server names are each unique within their kind, as the builder and the Runtime check; a tool, a skill and a server may share a name. The docs said they were unique across kinds.
+  - `harness_mismatch` is described as what it is since protocol 14: an Environment's harness is fixed for its life (fork onto a manifest version to run another), and a session's turn is refused when its Environment id was deleted and made again with another harness, or an Environment changed in place before protocol 14 applies that change.
+  - `@nylorun/agents`: the README names `nylorun environments list | delete`, not `nylorun local sandbox ls | rm`.
+  - MIGRATION.md no longer offers a tool's `approval`, removed in protocol 11, as a replacement for step middleware.
+
+## 0.21.0-beta
+
+### Minor Changes
+
+- 3a32a57: **Files by hash and images by digest.** An Environment's `files` entry may name files by content hash, and a pod Environment runs its image by digest once a pod ran it.
+
+  - **Files by hash.** `{ path, files: { "<relative path>": "sha256:<hex>" } }` copies each definition file the Tenant holds (`PUT /v1/files/sha256:<hex>`, at most 10 MiB each, at most 1000 per entry) under `path`, before `setup`. A file the Tenant does not hold is refused when the manifest is saved or the Environment made. The engine reads them as a folder through `host/files/{index}`. `@nylorun/agents`: `environmentFiles(path, contents)` hashes them, and `manifests.save(manifest, { files })` and `plan()` upload those the Runtime lacks.
+  - **Images by digest.** The sandboxes service reports the workload container's `imageID`; the first time a pod is ready the Runtime records it (`pod.imageDigest` in the view) and every later apply runs that digest, so a stop, relaunch or reset never pulls another image under the same tag. A fork pulls afresh. Migration 0027.
+  - **Studio** lists files by hash on the Environment page.
+
+- af90d1e: **Forks: how an Environment gets a new manifest version.** `POST /v1/environments/{id}/fork` makes a new Environment `id` from a manifest version (default the source's manifest at its latest), its disk started from a version of the source's (`disk`: `latest`, the default, snapshots first; a version; or `empty`) and the secrets the new manifest declares copied inside the Runtime (`secrets: "none"` copies none): each value is unsealed and sealed again under the new vault, with the slot's binding. The source keeps what it runs, its disk and its sessions, and gets `environment.forked`; the new Environment's view has `forkedFrom`. `dryRun: true` answers the plan: the disk, the secrets copied and left behind, required slots still missing, the changes and the sessions that stay. Migration 0026.
+
+  - **Setup on a forked disk.** A pod fork onto other setup runs the new version's setup on the copied disk before its first turn: the engine connects first (the join answer's `afterSeed`), core writes the disk version through it, then the engine runs the setup, and turns wait until it reports it done. A fork onto the same setup, a restore and a lost-volume recovery skip it, as before.
+  - `@nylorun/core`: `ForkEnvironmentRequestSchema`, `EnvironmentForkPlanSchema`, `ForkEnvironmentResponseSchema`, `EnvironmentView.forkedFrom`, the `environment.forked` event and `forkedFrom` on `environment.created`.
+  - `@nylorun/agents`: `client.environments.fork(id, { id, manifest?, disk?, secrets?, labels?, ownerUserId? })` and `planFork()`.
+
+- 104f24f: **Environment manifests, and Environments that never change (protocol 14).** An Environment's definition can now be saved like an agent: a named, versioned environment manifest, written as a JSON file with a published schema and checked with a plan before it is saved. An Environment is made from one version and keeps it for life; a save changes no Environment. The Runtime speaks protocol 14 only; sessions, Environments and vaults carry over. See MIGRATION.md.
+
+  - **Environment manifests.** `PUT /v1/environment-manifests/{name}` saves the next version, or answers the latest `unchanged`; `If-Match: <version>` refuses a save over a newer one (`412 manifest_changed`), and `?dryRun=true` answers the plan (changes, errors, warnings, the Environments behind) and saves nothing. Each version records `savedBy`. `GET` (latest), `GET /v1/environment-manifests`, `.../versions`, `.../versions/{n}` and `DELETE` (refused while an Environment names it, `409 manifest_in_use`). Migration 0025.
+  - **Pinned Environments.** `PUT /v1/environments/{id}` takes `manifest: "name"` (the latest at creation) or `"name@n"`. On an existing Environment only `labels` and `ownerUserId` may change; fields that match are accepted, and anything else is `409 environment_immutable` with `details.fields`. The view's `recipe` is now `manifest`, with `manifestName`, `manifestVersion`, `manifestHash` and `slots`; `version` and `appliedVersion` no longer move. `environment.created` names the manifest.
+  - **Secret slots.** A manifest's (or inline) `secrets` declares each secret's name, type, binding, `required` and `description`, never a value. On such an Environment a secret write sends only `{ value }` (or `{ headers }`), the binding comes from the slot, and an undeclared name is `409 secret_not_in_manifest`.
+  - **`requires`.** Agent manifest v7 takes `requires: { sandbox?: "none" | "any" | "pod", secrets? }` (`.requires()` in `@nylorun/core/define`), checked when a session opens (`409 environment_unsuitable`, `details.missing`). Turn variants keep it.
+  - **Dry runs.** `PUT /v1/agents/{id}?dryRun=true` checks a definition and saves nothing (`dryRun: true` in the answer).
+  - `@nylorun/core`: `PROTOCOL_VERSION` 14, `HOST_PROTOCOL` `{ min: 14, max: 14 }`, required feature `environment-manifests`; `EnvironmentManifestSchema`, `EnvironmentSecretSlotSchema`, `parseEnvironmentManifestRef` and the view, plan and save schemas; JSON Schemas at `@nylorun/core/schemas/environment-manifest.json` and `@nylorun/core/schemas/agent-manifest.json` (`$id` `https://docs.nylorun.com/schemas/environment-manifest/v1.json` and `.../agent-manifest/v7.json`).
+  - `@nylorun/agents`: `client.environments.manifests` (`save`, `plan`, `get`, `list`, `versions`, `delete`), `environmentManifest()`, `EnvironmentInput` (was `EnvironmentRecipeInput`), value-only `secrets.put`, and `saveAgent(agent, { dryRun })`.
+  - **Studio** edits only an Environment's labels and owner guard, shows the manifest it was made from, and its setup and files are read-only.
+  - `nylorun environments put` help says what it runs never changes.
+
+- c96b9a8: **An agent manifest is flat: manifest v7, a `runtime` block the Runtime writes, and tools known by name (protocol 13, Harness API 3).** A manifest listed capabilities, each with its own instructions, tools, skills and servers, and the Runtime added its own as more capabilities. Now the agent's parts sit at the top level, a plugin's skills and servers say which plugin brought them, and what the Runtime adds to a session's agent is one `runtime` block. A fresh start: the Runtime speaks protocol 13 only, so save your agents again; sessions from protocol 12 do not carry over. See MIGRATION.md.
+
+  - **Manifest v7.** `{ manifestSchemaVersion: 7, id, name?, description?, metadata?, outputSchema?, instructions?, tools?, skills?, mcpServers?, runtime? }`. Versions 3 to 6 and a `capabilities` field are refused with a message to rebuild. `SkillManifest.plugin` and `McpServerManifest.plugin` are `{ name, version? }`, set by `.plugin(dir)` from `plugin.json`.
+  - **The `runtime` block.** `{ sandbox?, tools?, instructions? }`, written only by the Runtime when a session pins the agent: the sandbox spec and tools, `save_artifact`, `read_artifact`, `load_skill` and `read_skill_resource`, the skill catalog and the notes that go with them. A definition or a turn variant that sets it is refused. `runtimeManifestFor` in `@nylorun/core/define` replaces `sandboxCapabilityManifest`, `artifactsCapabilityManifest` and `toolsCapabilityManifest`. `.skills()` and `.plugin()` no longer add the skill tools or the catalog.
+  - **Names.** An agent's tool may not take a Runtime tool's name (`RUNTIME_TOOL_NAMES`) or contain `__`, and names are unique across tools, skills and servers.
+  - **Turn variants** may remove tools, tighten MCP servers and change instructions, name, description and metadata. Skills are fixed, and a variant never sets `runtime` or changes `outputSchema`.
+  - **Tools by name.** `capabilityId` is gone from `tool.completed`, `mcp.discovered`, tool call rows, `EffectIntent`, gate requests, checkpoints and `SessionToolRef`. An HTTP tool's `server` is its URL's host. `Implementations` is `{ tools }`, keyed by tool name (`Agent.from(json, { tools })`), `AgentBinding.declarations` is `parts`, and observe events say `partId`.
+  - **Harness API 3.** `hello.capabilities` is `features`, and the `harness` pseudo-capability is gone: a native tool is known by its name, and one whose name is taken fails the turn at its start. `createHarness({ features })` in `@nylorun/harness`. `examples/harness-minimal` speaks it.
+  - **Studio.** The Agent tab shows instructions, tools (HTTP and agent badges), skills and MCP servers, each skill and server with its plugin's badge and a filter by plugin, and a session's Runtime section: its sandbox, tools and instructions.
+  - `@nylorun/core`: `PROTOCOL_VERSION` 13, `HOST_PROTOCOL` `{ min: 13, max: 13 }`, required feature `flat-manifest`, `HARNESS_API_VERSION` 3; `PluginLabel`, `RuntimeManifest`, `RUNTIME_TOOL_NAMES`, `isRuntimeToolName`, `runtimeToolOf`, `isSkillTool`, `SKILLS_USAGE` and `formatSkillCatalog` in `/define`.
+  - `@nylorun/agents`, `@nylorun/admin`, `@nylorun/studio` and `nylorun` send protocol 13.
+
+- 94bf329: **Each model says what it reads, a file it does not read is refused before a turn starts, and a file is an artifact the model reads again after its turn (protocol 12).** A message could name any file, and a model that could not read it failed the turn at its model call; every later turn sent the file's bytes again. Now the Runtime knows what the Tenant's model reads, checks a message's files when it is accepted, and sends a file's bytes only in the turn that brought it. Protocol 12 only adds to 11: the Runtime serves both.
+
+  - **Model inputs.** A model reads `text`, and `image`, `pdf`, `office`, `audio` or `video` when its catalog says so or the operator adds it where its API carries it natively (images everywhere; PDFs on the Anthropic, OpenAI, Azure and Google APIs; Office documents on the OpenAI Responses APIs; audio and video on Google's APIs and OpenAI-compatible completions). `GET /v1/tenant/models` gives each model `inputs` and `addableInputs`, `GET /v1/tenant/providers` each provider's `inputs`, and **`PUT /v1/tenant/models/inputs`** (the Management API; `admin.models.setInputs({ provider, model, inputs })`) sets the added ones, kept in the Tenant setting `model.inputs`. The Model Gate gives the provider adapter a model with an added image, so it is sent.
+  - **A custom endpoint reads text only by default.** It used to be sent images. Set `settings.inputs` on `PUT /v1/tenant/model` (`image`, `pdf`, `audio`, `video`) for what yours reads; `office` is refused there. See MIGRATION.md.
+  - **The accept check.** A message naming a file of a type the Tenant's model does not read is `422 attachment_unsupported`, with `details.parts` (`artifactId`, `name`, `mediaType`, `reason`), and no turn starts. Only the type is checked, never the size. Without a model in the vault nothing is refused.
+  - **Files as artifacts.** After its turn a file is a reference line, `[Uploaded artifact "name" · <artifactId> v<n> · read_artifact to view]` (a tool's: `[Tool <name> returned artifact …]`). Our harness sends the turn's own files once more, as media, in one user message after the conversation, so a message reads the same in every later call. At the gate, an image the model reads is an image, a text file a `<file>` block, and any other file, or one that cannot be read, a note: no file fails a call. PDFs, Office documents, audio and video are notes until the gate sends them natively.
+  - **`read_artifact` for every agent.** Every agent's session has it (an agent that declares its own keeps it), so every agent session pins its definition with it added. It takes a `version`, reads the Tenant-wide artifacts the session's messages named, and shows any file the Tenant's model reads; one it does not read fails `artifact.unsupported`.
+  - **Compaction** keeps the summarized part's reference lines (`files` on the compaction entry), and counts the turn's files by type and size in its token estimate.
+  - `@nylorun/core`: `PROTOCOL_VERSION` 12, required feature `model-inputs`, `HOST_PROTOCOL` `{ min: 11, max: 12 }`, error code `attachment_unsupported`; `MODEL_INPUTS`, `ModelInputSchema`, `PutModelInputsRequestSchema`, `ModelInputsViewSchema`, `CustomModelSettings.inputs`; `mediaReferenceLine` and `mediaReferenceOf` in `/define`; `TranscriptCompactionEntry.files`.
+  - `@nylorun/agents`, `@nylorun/studio` and `nylorun` send protocol 12.
+
+- b5ea2b5: **An agent is its manifest: step middleware and capability bundles are removed from authoring.** The Runtime already refused middleware; now the local engine runs none either, and an agent is built only from the builder's own methods. No protocol change. See MIGRATION.md.
+
+  - **Removed:** `.use()`, `.capability()`, `capability()`, `CapabilityBuilder`, `middleware()`, `model()`, `StepMiddleware`, `StepRequest`, `StepResponse`, and `Implementations[id].middleware`. To reuse tools and instructions, write a function that adds them; a bundle you publish is an Agent Plugin.
+  - **`@nylorun/agents`:** the standalone `skills()`, `plugin()` and `mcp()` factories are removed; use `.skills(dir)`, `.plugin(dir)` and `.mcp(servers)`. `.skills()` takes no options: the part takes the folder's name.
+  - **`@nylorun/harness`:** each step offers the definition's tools and instructions in order. The `middleware.entered`, `middleware.completed` and `middleware.lease-violation` observe events are gone, and a model request carries no `model` directive or runtime context items.
+
+- aff9bb8: **Sessions on one Environment run their sandbox commands at the same time, and each version of a skill has its own folder.** The SandboxManager ran every call on a workspace one at a time, whichever session sent it, so parallel turns would still have queued at every command. Now each session's calls run in the order it sends them and different sessions' calls overlap; opening, stopping and removing a workspace run alone, after the calls running.
+
+  - **Skill folders.** A skill's files are mounted at `/skills/<name>@<hash>/` (`skillFolderOf` in `@nylorun/core/define`, the hash from its canonical file map), written once and never replaced, so agents with different versions of one skill share an Environment. An agent used as a tool gets its own version too. The instructions, `load_skill`'s `sandboxPath` and skill attribution on `tool.completed` follow the folder.
+
+- f44c018: **Sessions on one Environment run their turns at the same time, and egress is recorded on the Environment (protocol 14).** A second session's turn on an Environment was refused with `409 environment_busy` until the first ended. Now any session on it may start a turn while others run; one turn per session stays. Which sessions work on one disk, and when, is the app's call. See MIGRATION.md, "Parallel turns, and egress on the Environment".
+
+  - **Turns.** `checkEnvironmentTurn` no longer refuses a turn because another session's turn runs, and the flow-tree exception is gone. `environment_busy` still answers stop, reset, snapshot and restore while any turn runs, and a turn while a disk copy runs.
+  - **Egress.** Every connection through egress-gate, allowed or refused, is `environment.egress` on the Environment's stream, with `runningTurns: [{ sessionId, turnId }]`, the turns running when it opened (at most 16). `egress.connection` leaves the session event catalog, and turn traces carry no `CONNECT` span.
+  - **Reading it.** `GET /v1/environments/{id}/events` takes `types` (comma-separated), `since` and `until` (ISO times); `client.environments.events(id, { types, since, until })` in `@nylorun/agents`, and `nylorun environments events <id> --types --since --until`.
+  - `@nylorun/core`: `EgressRunningTurnSchema`, `EgressRunningTurn`; `EgressConnectionPayloadSchema` gains `runningTurns`.
+
+- c8e640b: **A tool call is traced from the log alone to its skill or MCP server and the plugin that brought it.** No protocol change beyond 13. See MIGRATION.md.
+
+  - **`tool.completed`** gains `skill` and `plugin` (`{ name, version? }`), and tool call rows (`GET /v1/sessions/{id}/calls/tool`, `session.toolCalls()`) gain `skill` and `plugin`, `null` when there is none. An MCP call gets its server's plugin. `load_skill` and `read_skill_resource` get the skill they name, and a sandbox tool whose input names `/skills/<name>/` gets that skill; both get the skill's plugin.
+  - **`kind: "harness"`** (`TOOL_CALL_KINDS`): a tool the turn's harness declared in `hello.features.tools`. Such a call said `platform` before.
+  - **`mcp.discovered`** names each server's `plugin`.
+  - `@nylorun/core`: `skillOfToolCall`, `pluginOf` and `ToolCallTrace` in `/define`.
+  - **Studio** shows each tool call's kind, server or skill, and a plugin badge, in the chat and the event details and summaries, and the plugin of each server `mcp.discovered` lists.
+
+## 0.20.0-beta
+
+### Minor Changes
+
+- e917bd6: **Bring your own harness: harness ids, harness-owned state, and who wrote each event.**
+
+  - **Harness ids and routing.** An Environment's `harness` takes any harness id (`^[a-z][a-z0-9-]{1,62}$`). It is no longer only `nylorun`.
+    - **The pin.** A session pins its harness when it opens: its Environment's harness, else `nylorun`. A flow always runs `nylorun`. `GET /v1/sessions/{id}` returns the pin as `harness`.
+    - **Routing.** Only a connection whose `hello.name` is that id takes the session's runs.
+    - **Our harness's name.** It now says `nylorun` in `hello`. A harness that says `@nylorun/harness` is refused with a message naming the new id, so an older harness image needs this Runtime's.
+    - **Placement.** It is keyed by the real harness id, and `"*": {hosts: []}` refuses any harness the map does not name.
+    - **Drift.** A turn on an Environment that now runs another harness is `409 harness_mismatch`; open a new session. For a pod Environment, a changed `harness` applies at the pod's next wake, like its image.
+  - **Per-harness tokens.** `nylorun-operate harness token put <id>` makes a custom harness container's own Harness API credential, bound to its id; `list` and `rm` manage them. `NYLORUN_HARNESS_TOKEN` stays ours, bound to `nylorun`.
+  - **A custom harness as a pod's image.** A pod Environment whose harness is not ours runs its `image` as the harness: the image's own entrypoint (`entrypoint: "image"` to the sandboxes service), with nothing copied in. It needs `image`.
+  - **Harness-owned state.** Core stores a harness's turn state as sent and never reads it. Our engine now aligns its state with the turn's manifest itself.
+    - **Limits for a custom harness.** Its state is at most 256 KiB, or its turn fails. It cannot pause for approvals in Harness API 2.
+    - **Native tools.** It may declare the tools it runs itself in `hello` (`capabilities.tools`). Their calls (capability `harness`) are journaled like built-ins, and the log records a real `tool.completed` instead of `tool.unavailable`.
+  - **Who wrote each event.** The writer sets an event's `source` and `evidence`; the event's type no longer decides them. Events written before this release still say `loop` or `api`.
+    - **`client`**: a command, with a new `principal` taken from its credential.
+    - **`harness`**: what a harness reported, with its harness id and `runId`. Evidence `claimed`.
+    - **`core`**: core's own logic. Evidence `observed`.
+  - **`effectId` on model calls.** `GET /v1/sessions/{id}/calls/model` returns each call's `effectId`, so a metered call joins the effect journal.
+  - **The published contract grows.** It adds `HarnessCheckpointSchema` (the checkpoint fields a harness reads), `NativeToolSchema`, the harness id helpers, `HARNESS_TOOLS_CAPABILITY`, `MAX_HARNESS_STATE_BYTES`, and the gate error codes `key_required` and `effect_not_journaled`. It also documents the effect context keys, the model request hash rule and how a turn's status maps to its output method.
+
+- 5165451: **A pod's disk can start prepared, and every Environment's disk has versions.** Before, a new pod volume was empty and a disk could only be kept or reset. Now:
+
+  - **Setup and input files** (pods, Host feature `environment-setup`): `PUT /v1/environments/{id}` takes `files` (versions of Tenant-wide artifacts, copied in: a file at its `path`, a folder under it) and `setup` (commands run in order with `/bin/sh -c`, `cwd` default `/workspace`, `timeout` default 10m and at most 30m, at most 16 of each). They run once per new disk, after the pod's engine joins and before its first turn, with the Environment's variables, secrets (as the sentinel) and egress. A failed command fails the pod (`observed: failed`, reason `setup: command N …`, an `environment.failed` event with the exit code and the end of the output) and the turn waiting for it; the next turn start runs the setup again. A virtual Environment refuses both with a `400`.
+  - **Disk versions** (Host feature `environment-disk-versions`): `POST /v1/environments/{id}/snapshot` keeps a version of the disk between turns (`/workspace`, and a pod's `/harness` but the engine's own files) as a version of a folder artifact the Environment owns, with modes, modification times, links and empty directories (folder manifest `nylorun.folder.v2`); each file's bytes are stored once, and an unchanged disk makes no version. `POST .../restore` puts a version back: a virtual Environment at once, a pod on a new volume seeded before its next turn (`disk.operation` in the view meanwhile; turns wait). `PUT` with `from: { environment, version }` creates an Environment from another's version. `GET .../versions` and `DELETE .../versions/{n}` list and delete them; their trees, files, diffs and zips read through `/v1/artifacts`. A lost pod volume with a version is recovered from the latest one instead of refusing turns until a reset. Snapshot and restore during a turn are `409 environment_busy`. `EnvironmentView.disk` gives the latest version and the copy in progress. Migration `0021_disk_versions`.
+  - `@nylorun/agents`: `client.environments.snapshot`, `restore`, `versions` and `deleteVersion`; `put` takes `setup`, `files` and `from`.
+
+- 35e29b7: **Environments replace sandboxes and vaults (protocol 11). This is a fresh start: upgrading deletes your sandboxes, their disks and every vault except the model's, and closes every open session (its history stays readable).** List what you have before upgrading; see "Environments replace sandboxes and vaults" in MIGRATION.md.
+
+  An Environment is where sessions run: one sandbox (kind `virtual`, `pod` or `none`) with a recipe that can change, and one vault of secrets for its shell, MCP servers and HTTP tools. The app decides who uses which Environment; the Runtime keeps it by id and holds its lifecycle.
+
+  - `@nylorun/core`: protocol 11 (the Host accepts 11 only; older clients get `426`), required feature `environments`. `PutEnvironmentRequestSchema`, `EnvironmentViewSchema` (`recipe`, `version`, `appliedVersion`, `ownerUserId`, `lastUsedAt`), `PutEnvironmentSecretRequestSchema`, `EnvironmentSecretViewSchema`, `ENVIRONMENT_EVENT_TYPES`, `TenantEnvironmentsConfigSchema`, `environmentGranted`. `PutSessionRequest.environment` replaces `sandbox`, `vaultIds` and `credentialSelections`; `SessionView.environment` replaces the session's sandbox and vault fields. Error codes `environment_busy`, `environment_unavailable`, `environment_lost`, `environment_not_granted`, `environment_owner_mismatch` and `session_closed` (the `sandbox_*` codes and `sandbox_expired` are gone); session events `environment.state`, `environment.exec` and `environment.attached`; scope `environments:write`. Credential coverage takes `environmentId` and answers `covered` or `missing`; the MCP preview takes `environmentId`. The vault Management schemas are removed.
+  - `@nylorun/runtime`: `/v1/environments/{id}` replaces `/v1/sandboxes/{id}`: `PUT` creates, finds or changes one (`kind` and `storage` fixed; a recipe change bumps `version`; a pod gets a new image or resources at its next start from stopped, a new allowlist within seconds), with list by label, events (`nylorun.environment-event/1`), stop, reset and delete. Each Environment owns one vault: `PUT|GET|DELETE /v1/environments/{id}/secrets/{name}` on the Runtime API, write-only, with a second credential for a host or URL refused at the write (`409 credential_conflict`). An optional owner guard (`ownerUserId`) is checked when a session opens and at every turn start. `lifecycle.deleteAfter` deletes an Environment unused that long; TTL and `onExpiry` are gone. Kind `none` holds secrets for MCP-only agents. `/v1/tenant/vaults`, user and installation vaults, the Tenant's default sandbox, inline sandboxes and `{ session }` sharing are removed. The Tenant setting is `environments.config` (`limits.environments`). Identity files grant `environments:` (an old `sandboxes:` key, or `sandboxes:write`, stops the Runtime with a message naming the new key). Migration `0020_environments`.
+  - `@nylorun/harness`: the Harness API claims `environment.state` and `environment.exec`, and its workspace fields name `environmentId`.
+  - `@nylorun/agents`: `client.environments` (`put`, `get`, `list`, `page`, `stop`, `reset`, `delete`, `events`, `secrets.put|list|get|delete`, `forSession`) replaces `client.sandboxes`; `createSession({ environment })`; `sessions.page({ environmentId })` filters by Environment. The AG-UI handler's session options take `environment`.
+  - `@nylorun/admin`: `admin.coverage({ agentId, environmentId })` replaces `admin.vaults`; `admin.mcp.preview({ url, environmentId })`.
+  - `@nylorun/studio`: Environments replace Sandboxes, with a create form, stop, reset, delete and their secrets; the Credentials forms write an Environment's secrets; New session picks an Environment and shows its coverage.
+  - `nylorun`: `nylorun sandbox ls|rm` list and delete Environments; `nylorun mcp inspect --environment <id>` replaces `--vault`; `nylo reset --environments` replaces `--sandboxes`; `nylo doctor sandbox` reports the Environment limits.
+
+- e917bd6: **The Harness API is a published contract.** Everything a harness sends or reads now has a schema in `@nylorun/core/harness-api`, and the Runtime validates with those same schemas:
+  - the transport and the pod join (`HARNESS_API_PATH`, `HARNESS_API_HEADER`, `HOST_JOIN_PATH`, `HostJoinRequestSchema`, `HostJoinAnswerSchema`);
+  - the Model and Tool Gate bodies (`ModelCallBodySchema`, `ToolCallBodySchema`, `HttpCallBodySchema`, the MCP bodies, `GATE_ERROR_CODES`);
+  - the MCP snapshot (`McpSnapshotSchema`);
+  - transcript entries (`TranscriptEntrySchema`);
+  - the effect id rule (`effectIdOf`, `isEffectIdOf`).
+
+  The build also writes them as one JSON Schema document, `@nylorun/core/harness-api/schema.json`, for harnesses written in other languages.
+
+  Other changes:
+  - `TurnStart` gains an optional `trace` (W3C `traceparent`) for the turn's trace context. Nothing fills it yet.
+  - Core refuses a `hello` whose `api` is not `2`.
+  - **The fixture model answers at the Model Gate.** With a Tenant's `fixtureModel` seeded, the gate answers model calls itself and meters each one, like any model: a `model_usage` row with provider `fixture` and cost 0, readable at `GET /v1/sessions/{id}/calls/model`. Our harness no longer answers it locally.
+  - The fixture model also answers scripted markers: `fixture:text`, `fixture:tool <name> <json>`, `fixture:budget` and `fixture:slow <seconds>`.
+  - **The sandboxes service can run a harness image (Go).** `PUT /v1/pods/{name}` accepts `entrypoint: "image"`: the workload image's own `ENTRYPOINT` and `CMD` run, with no engine copied in and no `harnessImage`. The default, `entrypoint: "engine"`, is unchanged. The Runtime starts sending it with the harness pin in a later change.
+
+- 3013501: **Tool calls are delivered at least once, and every one is on the record.** A gateway restart used to park the sessions it interrupted as `uncertain` until someone cancelled them, a harness could call tools with no record, and nothing listed a session's tool calls. Now every tool call ends in the log with its outcome, a crash sends it again with the same key, and the gateway runs only calls the effect journal recorded.
+
+  - **Every outcome in the log.** Each tool call ends in one `tool.completed` with `status` (`completed`: the tool answered; `failed`: the Runtime ended it, `tool.disabled`, `tool.unavailable` or `tool.interrupted`; `cancelled`), `kind` (`mcp`, `http`, `sandbox`, `platform`), `server`, `attempts` and `durationMs`. Refused and cancelled calls are in the log for the first time.
+  - **`GET /v1/sessions/{id}/calls/tool`** pages a session's tool calls from the effect journal, in the order they were first sent: tool, input, status, sends, error and timing. Same credentials and paging as `/calls/model`; `@nylorun/agents` adds `session.toolCalls()`. Host feature `tool-calls`.
+  - **At least once, with the same key.** An MCP or HTTP tool call that a crash, a shutdown or a lost gateway hop interrupted is sent again with its effect id as the key, up to 3 sends; then it fails to the model as `tool.interrupted` ("may have run") and the session continues. A gateway that restarts mid call runs the call again under its key instead of answering `uncertain`. HTTP tools get the key as `Idempotency-Key`, as before; MCP servers now get it in `_meta["nylorun/idempotency-key"]` on `tools/call`. A tool that honors the key acts once; `attempts` above 1 marks where one may have acted twice.
+  - **Sandbox commands are never run twice.** A sandbox or core-served call a crash interrupted has no key to dedupe on, so it fails to the model as `tool.interrupted` at once, and the model decides whether to run it again.
+  - **No tool call parks a session.** The `uncertain` state for tool calls, its cancel-only exit and the earlier read-only/idempotent `mcp.lost` exception are gone: a lost MCP answer is `mcp.lost` to the model for every tool. Model calls keep their own rules.
+  - **The gateway runs only journaled calls.** Under a run token, `/nylorun/v1/tool-calls` and `/nylorun/v1/http-calls` need the call's effect id as `Idempotency-Key` (`400 key_required`), and the effect journal must hold it running, for the run's turn, the same tool and the same input (`409 effect_not_journaled`). A harness that skips the journal gets nothing run.
+  - `@nylorun/harness`: `HarnessExecutors.resends(effect, error, run)` says a gate hop lost a call's answer; the harness then asks core again with the same intent and sends the call again.
+  - **Approval** stays in the manifest and our harness still asks for it. Only the Runtime's own harness asks: one built from the Harness API can skip it until tool policy moves to the gateway.
+
+- 6061a3a: **Tool approvals are the Tenant's tool policy.** An agent's manifest used to say which tool calls wait for a person, and only the Runtime's own harness asked; a harness built from the Harness API could skip it. Now the operator sets one tool policy for every agent and every harness, and the Runtime enforces it before anything is sent.
+
+  - **`GET`/`PUT /v1/tenant/tool-policy`** (the Management API; `admin.toolPolicy.get()`/`.put({ rules })`): rules `{ effect: "allow" | "ask" | "deny", tool?, server?, kind?, agent?, when?, reason? }`. A rule matches a call when every selector it sets matches (`tool` and `server` take `*` globs; `when` tests input fields by dotted path with `equals`, `in`, `gt`, `gte`, `lt`, `lte` or `matches`). The strictest matching rule decides; a call no rule matches runs.
+  - **Enforced for every harness.** Core decides an MCP or HTTP tool call as it journals it. `deny` fails it to the model as `tool.denied`, unsent. `ask` holds the call (`held` at `/calls/tool`) and pauses the turn with one `approval` interaction per held call (`turn.paused`, with the tool, its input and the reason). `approve` sends that exact call, or fails it as `tool.denied`. The Tool Gate runs only calls the journal holds running, so a held or refused call cannot run. Nothing holds a process while it waits: an approval survives a restart. A flow's HTTP stages are decided the same way.
+  - **`approval` leaves the manifest.** `PUT /v1/agents/:id` and `saveAgent()` refuse a definition that sets `approval` on an HTTP tool, an MCP server or an MCP tool's settings; `http({ approval })` and `.mcp({ … approval })` throw; a turn manifest can no longer add one. The engine never asks for an HTTP or MCP tool's approval itself. A session pinned to a manifest saved with `approval: "always"` keeps it, as an ask.
+  - `@nylorun/studio`: a paused session shows an approval card for each held call, with its tool, why it is held and its input, and **Approve** / **Deny**.
+  - Migration: move each `approval: "always"` to an `ask` rule (see MIGRATION.md).
+
+- 7d496e4: **Every connection a pod Environment makes to the internet is on the record (egress events).** egress-gate used to keep only log lines, so a session's log could not say which hosts its turn reached or what the gate refused. Now each connection through egress-gate is one event, written by the gate itself.
+
+  - **`egress.connection`** in the session log of the turn that held the Environment when the connection opened, with that turn's id even if the turn has ended by the time it closes. Source `egress-gate`, evidence `observed`.
+  - **`environment.egress`**, the same payload, on the Environment's own stream (`GET /v1/environments/{id}/events`) for traffic while no turn holds the Environment.
+  - **The payload:** `environmentId`, `host`, `port`, `outcome` (`allowed` or `refused`), `reason` and `status` for a refusal, `mode` (`tunnel` or `credential`), `credentialBound`, `bytesUp` and `bytesDown`, `startedAt` (the gate's clock at CONNECT) and `durationMs`. A host a shell credential is bound to adds `requests` and the `credentialIds` the gate set. It never carries a header value, a URL path or a body.
+  - **One event per connection:** written when it closes, or at once when the gate refuses it (a host not in `network.allowedHosts`, a port other than 443 or 80, a private address, too many tunnels, a name that does not resolve). A refusal before the Environment is known (no token, an expired or stale one) stays a log line only.
+  - **Never in the way:** a write happens after the connection closes or is answered, and a failed write is logged as `egress_record_failed` without touching the tunnel. The gateway's `egress_refused` and `egress_terminated` log lines stay.
+
+- 81c783e: **Every row that ends a call or a turn carries its own timing.** The session log said what happened but not how long it took: a model call's outcome had no time at all, a tool call's only core's window, a flow's HTTP stage had no outcome row, and a turn's end had neither its duration nor its cost. Now each one is a span on its own, ready for the traces that follow, with no protocol change.
+
+  - **Model calls.** `message.assistant`, `model.failed` and `context.compacted` carry the call's `effectId` and `durationMs` (from the intent to the outcome). When the Model Gate metered the call they also carry the gate's own `gate: { startedAt, endedAt }`, `firstTokenMs` (to the provider's first stream event) and `meteredUsage` (`inputTokens`, `outputTokens`, `totalTokens`, and `cachedTokens` and `costUsd` when not zero), beside the `usage` the harness reported. The usage ledger keeps the gate's times (migration 0022: `model_usage.started_at`, `ended_at`, `first_token_ms`).
+  - **One row per model call.** A step that said nothing (no text, no tool calls, as a structured answer) now writes `message.assistant` with `text: ""`, and each partial summary of a long compaction writes `context.compacted` with `partial: true`. The AG-UI and A2A histories skip both; `isEmptyAssistantMessage` in `@nylorun/core/contracts` tells your own UI which steps said nothing.
+  - **Tool calls.** `tool.completed` carries the call's `effectId`, the Tool Gate's own `gate: { startedAt, endedAt }` for an MCP or HTTP call it ran (absent for sandbox and core-served tools), and `policy: { decision: "ask" | "deny", reason, approvedBy? }` when the Tenant's tool policy held or refused the call.
+  - **Flow HTTP stages.** A new event type, `node.completed` (`path`, `kind`, `key`, `iterations`, `effectId`, `status`, `durationMs`, `gate`), ends each HTTP stage and HTTP verifier that `node.started` began, and a tool stage the Runtime refused to run. Clients ignore event types they do not know.
+  - **Turns.** `turn.completed`, `turn.failed` and `turn.cancelled` carry `durationMs` (from the turn's start to its end, waits for a person included), `pausedMs` (how much of that it waited paused), `agentId` and `totals: { steps, tokens, costUsd }`, the same totals `GET /v1/tenant/usage?scope=turn` returns. A turn started before this release has no `durationMs`.
+
+- 7800358: **Each turn is one OpenTelemetry trace, projected from the session log.** An operator could not see what a turn did or where its time went without grepping container logs. Now every turn is a trace with a span for each model call, tool call and egress tunnel, exported over OTLP to any collector, readable per turn from the Runtime, and joined to the trace of the app that started it. No protocol change.
+
+  - **Traces from the log.** A turn's end is its root span, `invoke_agent <agent>`; each model call is a `chat <model>` span, each tool call and flow HTTP stage an `execute_tool <tool>` span, each egress-gate tunnel a `CONNECT <host>` span, and each pause and answer a marker. A model or gate tool span is the gate's own start and end; usage and cost are the gate's (`nylorun.usage.mismatch` when the harness reported other numbers). Attribute names follow the OTel GenAI conventions at one pinned commit, recorded as `nylorun.semconv.genai` on the resource. Ids are derived from the log under a key the Tenant keeps (setting `trace.key`), so every export and read of a turn gives the same ids.
+  - **OTLP export, off until you set an endpoint.** With `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) the Runtime posts OTLP/HTTP JSON from a replication slot of its own, `nylorun_trace_export`, in batches of up to 512 spans or every 2 s; `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` work as usual. No turn waits for it. A collector that is down costs only its spans: after three retries a batch is dropped and logged as `trace_export_dropped`, and the slot moves on, so Postgres keeps no WAL for it. `nylorun start` passes these variables to the runtime container.
+  - **References by default.** Spans point at log events (`nylorun.event.cursor`) and carry no content unless you opt in per kind with `NYLORUN_TRACE_CONTENT` (`user`, `outputs`, `tool-results`, `errors`), or all of them with `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`, each cut at 8 KiB. A span never carries a credential value, a prompt, a person's id, an identity header or an idempotency key.
+  - **`GET /v1/sessions/{id}/turns/{turnId}/trace`** answers a turn's spans as OTLP JSON, the same spans the exporter posts: look at a turn without a collector, or post it to one to backfill. Application keys, as the `/calls` reads. Host feature `traces`; `@nylorun/agents` adds `session.trace(turnId)`, and `@nylorun/core/contracts` `TurnTraceSchema`.
+  - **Trace context in and out.** A `traceparent` (and `tracestate`) on `POST /v1/sessions/{id}/commands`, an AG-UI run or an A2A message puts the turn in the caller's trace; `command.message` records it as `trace`. The turn hands its context on: to the harness in `TurnStart.trace`, to HTTP tools as `traceparent` beside `Idempotency-Key`, to MCP servers as `traceparent` on the call's requests, and to sandbox commands as `TRACEPARENT`.
+  - **Harness API** (additive): the `effect.intent` answer `execute` may carry the tool call's `traceparent`. `@nylorun/harness`: `HarnessExecutors.tool` takes it as a fourth argument (`ToolCallContext`).
+
+### Patch Changes
+
+- 17a97e9: **An artifact names the Environment whose disk it holds.** `ArtifactView` (and so `ArtifactListItem` in artifact pages) gains optional `environmentId`: set on the folder artifact that holds an Environment's disk versions, absent on a session's or the Tenant's own artifacts. Before, such an artifact read as a Tenant-owned one with no way to tell whose disk it was.
+- b6214d9: Add opt-in artifact metadata pagination to `GET /v1/artifacts?limit=…`, shared
+  `ArtifactListItem`/`ArtifactPage` contracts and SDK `artifacts.page()` (default 50,
+  maximum 200). Hosts advertise `artifact-reads`. Pages order by creation time and
+  ID descending, filter by session, kind and labels, bind cursors to the Tenant and
+  filters, and reapply ownership and agent grants on each read. Legacy unpaged
+  responses remain unchanged. A Drizzle migration adds the creation-order index;
+  pages reuse the existing bounded read-only pool. Studio and every other Runtime
+  client can consume this public API without database access.
+- a0cbca1: **Clearer wording when a definition runs your code.** The refusal for a code tool or a flow's tool stage, the `hooks were removed` error and `nylo endpoints` now say that the Runtime runs agents from their manifests alone, instead of that it runs no code of yours during a session. Only the message text changed; anything matching the old wording (for example `runs no code of yours during a session`) needs the new text.
+
+## 0.19.0-beta
+
+### Minor Changes
+
+- 212364b: **Credentials for skills.** A skill's CLI in a pod sandbox authenticates with a vault credential whose value never enters the sandbox.
+
+  - `@nylorun/core`: vault credentials gain `environment_secret` (`secretName`, `secretValue`, `allowedHosts`, optional `inject: { header, format }`) and `environment_variable` (`variableName`, `variableValue`), in create, rotate and `CredentialInfo` (whose `binding.url` is now optional). `ENVIRONMENT_SECRET_SENTINEL` (`nylorun-managed`), `ENVIRONMENT_SECRET_DEFAULT_INJECT`, `isInjectFormat`, `renderInjectFormat`, `EnvironmentNameSchema` and `RESERVED_ENVIRONMENT_NAMES` are exported; `ERROR_CODES` gains `credential_conflict`; the Harness API's `RunRouting.sandbox` gains `environment`.
+  - `@nylorun/runtime`: every sandbox command gets each secret's name set to `nylorun-managed` and each variable's value. egress-gate terminates TLS for port 443 of a host an `environment_secret` of the sandbox's sessions is bound to, with a fresh leaf signed by the installation's egress CA (held by keys; its certificate reaches the pod in the join answer, and the engine points `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO` and `AWS_CA_BUNDLE` at a bundle with it), and sets the credential's header on every request from the vault, uncached. Every other host stays an opaque tunnel. Session open answers `409 credential_conflict` for two credentials with one variable name or one host, or two owners' secrets on one sandbox. No protocol change.
+  - `@nylorun/studio`: the Credentials page lists shell credentials (their variable and hosts) and deletes them; create and rotate them with the Management API.
+
+## 0.18.0-beta
+
+### Minor Changes
+
+- 7780b2f: **One client and connection layer.** The Project link and credentials are read one way, and every Runtime client shares one `/health` probe.
+
+  - `@nylorun/core`: `@nylorun/core/project` (Node only, the one Core subpath that imports Node modules) reads the Nylorun home, a local Tenant's Host root (`tenantHostRoot`), the Project root (`findProjectRoot`) and the Project link and credentials (`findLinkedProject`, `readProjectLink`, `readCredentialsFile`), validated with `ProjectLinkFileSchema` and `ProjectCredentialsFileSchema`; a broken or newer file throws `ProjectFileError`. `@nylorun/core/transport` (browser-safe) holds the `/health` compatibility probe (`checkHealth`), `parseProtocolRange` (on `ProtocolRangeSchema`, ignoring fields a newer Host adds), `describeIncompatibility`, `requestHeaders` and `readBody`.
+  - `@nylorun/agents`: `resolveConnection` and `createClient()` find the Project as every reader does: the nearest directory with `.nylorun/` from `cwd` upwards, never the home directory or above it (they used to walk to the filesystem root, and past a `.nylorun/` without a link). A link without `credentials.json`, or a link or credentials file that does not validate, is now `connection_missing` naming the file and `npx nylorun start`, instead of a raw file-system or parse error. `@nylorun/agents/client` loads the link reader only when `createClient()` resolves a connection, so it imports no Node module. The root entry re-exports `checkHealth`, `describeIncompatibility` and `parseProtocolRange`.
+  - `@nylorun/admin`: `createAdmin` reads the Project link with the same reader. A link that does not validate is now refused like one from an older nylorun (when nothing else names the Host root), and a linked Project's `credentials.json` that does not validate is `connection_missing` instead of being skipped. `@nylorun/admin/project` re-exports `@nylorun/core/project` for tools that depend on this package. The `/health` check and request headers come from `@nylorun/core/transport`.
+  - `nylorun`: reads the Project link and credentials with `@nylorun/core/project`; a credentials file whose keys are not 64 hex characters is replaced by `start`, as an unreadable one was. No command changes.
+  - `@nylorun/cli`: `nylo` reads the Project root, link and credentials through `@nylorun/admin/project` instead of its own copies, with the same messages. No command changes.
+  - `@nylorun/studio`: the server's Runtime compatibility probe is `checkHealth` from `@nylorun/agents`.
+
+- 070674d: **One source of truth for the manifest and Harness API schemas.**
+
+  - `@nylorun/core`: `Agent.from` (`agentFrom`) checks a manifest with `AgentManifestSchema`, the Runtime's own check, instead of a validator of its own, and refuses with `agent.build-failed` and the schema's messages (each prefixed with its path, such as `capabilities.0.tools.0.name: …`). It now refuses what the Runtime refuses at registration and it let through, such as unknown fields (it dropped them) or a tool or MCP server name that not every model provider accepts. The schema names a top-level `model` or `schemaVersion` and a capability's `model` as before, and the skill whose `files` are wrong (`Skill 'triage' files must include SKILL.md`). The rebuilt manifest is a frozen copy; the object passed in is no longer frozen. `AgentManifestSchema` and `WorkflowManifestSchema` are no longer force-cast to their types: the build checks that each accepts exactly `AgentManifest` and `WorkflowManifest`. `@nylorun/core/contracts` exports `McpServerManifestSchema`, `HEADER_NAME_PATTERN` and `LOOPBACK_HOSTS`. The Harness API's types (`@nylorun/core/harness-api`) are inferred from the schemas that validate its frames, so they match them: `TurnStart.manifest`, `TurnStart.checkpoint` and `RunRouting.rootManifest` are `object`, `WorkspaceCall.tool` is a sandbox tool name, `ABORT_REASONS` is a tuple, and properties are no longer `readonly` (arrays that were stay so).
+  - `@nylorun/harness`: `runDurable` checks the manifest once, when it rebuilds the agent, instead of twice. The unpublished, stale `schemas/manifest.schema.json` (manifest `schemaVersion` 2) is gone; `z.toJSONSchema(AgentManifestSchema)` is the manifest's JSON Schema.
+  - `@nylorun/agents`: a plugin's MCP servers are checked with core's `McpServerManifestSchema`, header-name pattern and loopback hosts. A server whose key is not a name every model provider accepts is skipped with a `plugin.mcp-server-skipped` warning, since the Runtime would refuse the manifest declaring it.
+  - `@nylorun/runtime`: the stack configuration reads its four listeners (`NYLORUN_LISTEN_*`, `NYLORUN_GATES_LISTEN_*`, `NYLORUN_HARNESS_LISTEN_*`, `NYLORUN_EGRESS_LISTEN_*`) with one parser; the variables and their errors are unchanged.
+
+## 0.17.0-beta
+
+### Major Changes
+
+- 50e2f7e: **Protocol 10: MCP credentials come from a session's vaults only.** Nylorun no longer signs the installation in to MCP servers with OAuth and no longer asks a credential resolver. Upgrade every package together; MIGRATION.md has the details.
+
+  - **Breaking (`@nylorun/runtime`): the MCP OAuth connect is gone.** `POST /v1/tenant/vaults/{vaultId}/oauth/start` and `GET /v1/oauth/callback` answer `404`. The vault credential type `oauth` and its refresh are gone: a credential is a `bearer` token or a `headers` map bound to a URL. Migration `0016_mcp_oauth_removed` drops the table of pending connects and deletes every `oauth` credential, writing one audit row each (actor `migration`); the Runtime logs `oauth_credential_removed` once for each, naming its vault, id and URL.
+  - **Breaking (`@nylorun/runtime`): the credential resolver is gone.** The gateway no longer asks the operator's resolver for a person's credential when the session's vaults hold none. A process that still sets a `NYLORUN_RESOLVER_*` variable logs `resolver_removed` and ignores it. Keep a person's own keys in their user vault and attach it to their sessions (`vaultIds`). `TenantConfig.resolver`, `TenantConfig.publicUrl`, `TenantConfig.vaultFetch`, `startEphemeralRuntime({ resolver })`, the `ResolverConfig` export and `VaultService`'s `fetch` option are removed; `NYLORUN_PUBLIC_URL` still sets the protected resource metadata's `resource`.
+  - **Breaking (`@nylorun/core`):** `PROTOCOL_VERSION` is 10 and `HOST_PROTOCOL` 4–10. `StartOAuthRequest`, `StartOAuthResponse`, the `oauth` variants of `CreateCredentialRequest` and `RotateCredentialRequest`, `oauth` in `CredentialInfo.type` and `CredentialInfo.expiresAt` are removed, and `ERROR_CODES` drops `oauth_client_required`, `oauth_state_invalid` and `oauth_failed`. `@nylorun/agents` and `@nylorun/cli` send protocol 10.
+  - **Breaking (`@nylorun/admin`):** `admin.vaults` loses its OAuth start method.
+  - **Breaking (`nylorun`):** the `connect` subcommand of `nylorun mcp` is removed (`nylorun mcp inspect` lists a server's tools instead), and the gateway's Compose service no longer passes the `NYLORUN_RESOLVER_*` variables.
+  - `@nylorun/studio`: the Credentials page loses the OAuth type, the Expires column and the OAuth connect hint.
+
+### Minor Changes
+
+- e0e39ff: **Header map, gateway and identity header credentials; `credential_rejected` on a `401`**. For remote MCP servers and HTTP tools alike, in installation and user vaults. MIGRATION.md (protocol 10, "Header and gateway credentials" and "Tool errors the model sees") has the details.
+
+  - `@nylorun/core`: `CreateCredentialRequest` and `RotateCredentialRequest` gain `type: "headers"` with a `headers` map, and optional `via` (where requests go, such as a gateway: `https`, or `http` to a loopback host, with no userinfo, query string or fragment) and `identity: { header }` on both kinds; a rotation may change them, and `null` removes one. `CredentialInfo` gains `headers` in its type, `headerNames`, `via` and `identity`, never a value. `ERROR_CODES` gains `credential_rejected`, and `tool.completed`'s `error` documents `server` and `vault`. The admin client's vault methods take the new bodies through these types.
+  - `@nylorun/runtime`: a `headers` credential is sealed like a token and sends every header in its map; the transport's headers, `Idempotency-Key` and `Nylorun-*` are refused (`400`), and a credential header replaces a manifest header of the same name. A credential with `via` sends the server's requests there, while the manifest's URL still picks the credential and names the tools. An identity header carries the session owner's subject from the session record, and is left out for a session owned by `installation`. A `401` from an MCP server or HTTP tool is a failed tool call with code `credential_rejected` that the model sees, never retried and never `uncertain`. `via`, `identity` and the header names are stored unsealed in the credential's binding: no migration.
+  - `@nylorun/studio`: the Credentials page adds Bearer or Headers credentials (name and value rows), with an optional gateway URL and identity header, and shows them without values.
+
+- 18f9a2f: **Model-safe MCP tool names, coded MCP tool errors and credential scrubbing**. MIGRATION.md (protocol 10, "Tool and MCP server names" and "Tool errors the model sees") has the details.
+
+  - `@nylorun/core`: a declared tool's name and an MCP server's name must match `^[A-Za-z0-9_-]{1,64}$` (`AgentManifestSchema`, so `PUT /v1/agents/{id}` refuses others). `mcp.discovered`'s server outcomes gain `renamed: [{ serverToolName, name }]`; `tool.completed` gains `redacted` and its `error` gains `retryable`. A failed `ToolOutcome` and `ToolResult` may carry `retryable`.
+  - `@nylorun/harness`: a failed tool result keeps the outcome's `retryable`, and the model sees it beside `code` and `message`.
+  - `@nylorun/runtime`: the model knows an MCP tool by `server__tool` with characters outside `[A-Za-z0-9_-]` replaced by `_`, shortened to 64 with an 8-hex SHA-256 suffix (also given to a renamed tool that collides); the server is still called by its own name. A failed MCP tool call is a failed tool result the model sees, with code `mcp.unreachable` (never sent; retryable), `credential_rejected` (`401`), `mcp.forbidden` (`403`), `mcp.error` (a JSON-RPC error) or `mcp.status` (another HTTP status); a call whose answer was lost after it was sent is `mcp.lost` for a `readOnlyHint` or `idempotentHint` tool and stays `uncertain` otherwise, as does a call lost with a gateway restart. A pooled connection whose server ended its session (`404` to its `Mcp-Session-Id`) or whose credential's `via` moved is dropped, opened again, and the call sent once more, since the tool never saw it. The credential values sent on a call (at least 8 characters, and a `Bearer` value's token) are replaced with `[redacted]` in MCP and HTTP tool results and errors before the gate records or returns them; no other field is touched.
+
+- da93711: **Preview an MCP server's tools**. MIGRATION.md (protocol 10, "Previewing a server's tools") has the details.
+
+  - `@nylorun/core`: `McpPreviewRequestSchema` and `McpPreviewSchema` (`McpPreviewTool`), and the error code `mcp_preview_failed`.
+  - `@nylorun/runtime`: `POST /v1/tenant/mcp/preview` (the Management API) connects to a remote MCP server with the installation vault's credential for its URL (headers and `via`, no identity header), under the Host's address policy and within 15 s, and answers its server info, instructions, tools (model names, annotations, schema sizes) and renames; a `401` is `authRequired`, with the server's RFC 9728 protected-resource metadata. It runs in the keys service (`Keys.previewMcp`), which holds the plaintext, and calls no tool. Both OpenAPI documents list it.
+  - `@nylorun/admin`: `admin.mcp.preview({ url, type?, name?, vaultId? })`.
+  - `nylorun`: `nylorun mcp inspect <url> [--server <name>] [--vault <id>] [--sse] [--json]` prints the running Tenant's preview: a table of tools, the renames, or that the server needs a person's sign-in. Its `connect` subcommand still says it was removed, and now points to `inspect`.
+  - `@nylorun/studio`: **Preview tools** on each credential of the Credentials page lists the tools behind its URL.
+
+- 90a817d: **MCP and HTTP tool results that fit**. MIGRATION.md (protocol 10, "Tool results that fit") has the details.
+
+  - `@nylorun/core`: a completed `ToolOutcome` may carry `files` (`ToolResultFile`: a media type and the host's reference) and `truncated`; a completed `ToolResult` carries the `files`. `artifactsCapabilityManifest({ save, read })` adds the built-in `read_artifact` (`READ_ARTIFACT_TOOL`, `READ_ARTIFACT_MAX_BYTES`), and `codeToolsOf` leaves it alone. `SessionView` gains `definitionHash`, the definition the session was opened from. Transcript edits are split at 48 KiB, down from 256 KiB, so each `transcript.updated` event stays under 64 KiB when no entry is larger.
+  - `@nylorun/harness`: a tool result's files go to the model after its output, as media parts; an outcome marked `truncated` is not checked against the tool's output schema.
+  - `@nylorun/runtime`: an agent's remote MCP or HTTP tool result past 32 KiB is stored as a file artifact of the session, and the model gets `{ truncated: true, artifactId, size, preview }` (the first 4 KiB and the last 1 KiB). Image, audio and blob resource parts become artifacts too, an image also shown to a model that reads images (a note for one that does not); each part of a mixed result is shaped alone, and a `resource_link` stays a link. One step's results share a 256 KiB budget, so many parallel results never make an event near S2's 1 MiB record: past it, a result is a stub naming its artifact. When an artifact cannot be stored, the preview stays and `dropped` says why. An MCP answer past 8 MiB is `mcp.too-large`. `read_artifact { artifactId, offset?, length? }` reads 32 KiB of the session's own artifact a call, with or without a sandbox: a session gets it for each agent with an MCP server or an HTTP tool. The session view names its `definitionHash`.
+  - `@nylorun/studio`: a session is shown as running an older manifest only when the definition it was opened from is not the registered one, not because the Runtime pinned its own tools (a sandbox's, `save_artifact`, `read_artifact`) beside it.
+
+- b8d10cb: **Per-tool MCP settings (manifest v6) and deferred tools**. MIGRATION.md (protocol 10, "Per-tool settings and manifest v6" and "Deferred tools") has the details.
+
+  - `@nylorun/core`: an MCP server takes `tools` (`McpToolSettings` by the server's own tool name, `"*"` for the rest: `enabled`, `approval`, `deferred`) and `deferred`, in manifest v6. `mcp()` and `Agent.mcp()` accept them, and the builder writes v6 only for a manifest that uses them, so other manifests keep their hashes; `AgentManifestSchema` accepts v5 unchanged and refuses the fields in v5. `mcpToolSettings` resolves a tool's settings, `manifestVersionFor` says which version a definition needs. `isVariantOf` lets a turn variant disable an MCP tool or require its approval, and nothing else. `TOOLS_CAPABILITY_ID`, `TOOL_SEARCH_TOOL`, `TOOL_CALL_TOOL`, `deferredToolsTools` and `deferredToolsInstructions` describe `tool_search` and `tool_call`. A session tool may carry instructions, read with its capability's. `mcp.discovered` gains `deferred`, `disabled` and `unknownTools` per server.
+  - `@nylorun/harness`: a session tool marked `deferred` stays out of the model's tool list; `tool_call` runs it as its own call, after checking the arguments against its `inputSchema`, and asks for approval when it needs it.
+  - `@nylorun/runtime`: discovery leaves out the tools a server's settings disable and names keys that match no tool. A session of an agent with a remote MCP server pins an empty `nylorun.tools` capability; when the agent's MCP tools pass a tenth of the model's context window (or settings say so), they are deferred for the session's life, and the model gets `tool_search` (BM25 over the deferred tools' names and descriptions, served by core) and `tool_call`, with a note naming each server and its instructions. Approval resolves per tool, and a turn variant's tightening applies to its turn. The gate's `mcp/connect` answers the server's instructions.
+
+### Patch Changes
+
+- fed5e58: **Docs: reaching a person's accounts**. The READMEs describe MCP credentials as protocol 10 has them (a `bearer` token or a `headers` map per URL, with `via` and an identity header for an MCP gateway), and point to "MCP servers and HTTP tools" in DEPLOYMENT.md: the operator's flow from credential to preview, tool settings, deferral, stored results and the error codes a model sees, with gateway recipes for Arcade, ToolHive, Obot and Nylorun Cloud and the proxy pattern for gateways that mint per person. `HttpToolTarget.credential`'s doc (`@nylorun/core`) no longer names the removed credential resolver.
+
+## 0.16.0-beta
+
+### Major Changes
+
+- cf5eb9c: **Protocol 9: the Runtime API is an OAuth 2.1 resource server for your identity provider's tokens.** Nylorun is still never the authorization server. Upgrade every package together; MIGRATION.md has the details.
+
+  - **Breaking (`@nylorun/runtime`): a refused credential is `401`, not the opaque `404`.** No `Authorization` is `401 credential_required`; an unknown key, or a token no trusted issuer signed or that fails a check, is `401 credential_invalid`. Each carries `WWW-Authenticate: Bearer` (OAuth 2.1 §5.3), naming the protected resource metadata (`resource_metadata`) on the Runtime API when the Runtime has trusted issuers; the Management API's challenge is a bare `Bearer`. `token_expired` and `issuer_unavailable` gain the challenge too. Another Tenant named, a Tenant that could not open and an unsigned capability link stay the opaque `404`.
+  - **Breaking (`@nylorun/runtime`): a request with neither `Nylorun-Protocol` nor `Authorization`** on an API route gets that route's `401` challenge instead of `426`, so a generic OAuth client learns where to sign in.
+  - `@nylorun/runtime`: a token without a route's scope still gets `403 scope_required`, now with `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"`. The `Bearer` scheme is matched in any case (RFC 9110).
+  - `@nylorun/runtime`: `GET /.well-known/oauth-protected-resource` (RFC 9728) serves the resource (`NYLORUN_PUBLIC_URL`, else the request's origin), the identity file's issuers in order and their scopes, with no key or protocol; `404` without an identity file.
+  - **Breaking (`@nylorun/runtime`): the identity file drops `maxLifetime`.** The issuer sets its tokens' lifetimes; `exp` is required, `iat` no longer is. A key the file does not define, `maxLifetime` included, is ignored and logged (`identity_file_key_ignored`) instead of stopping the boot. `subject` defaults to `{sub}`, `scopes` to `{ claim: scope }` and `allowedScopes` to every token scope but `studio`.
+  - `@nylorun/core`: `PROTOCOL_VERSION` is 9 and `HOST_PROTOCOL` 4–9, with the required feature `resource-server`; `ERROR_CODES` adds `credential_required` and `credential_invalid`. `@nylorun/agents`, `@nylorun/admin` and `@nylorun/cli` send protocol 9.
+
+### Patch Changes
+
+- 2ed5fe0: The event source `sandboxd` is now `sandboxes`, the name the sandbox lifecycle service took on 3 Oct, matching core, loop, gates, keys, egress and harness. Nothing emits it yet, so no stored event changes; the OpenAPI document's `EventSourceKind` enum shows the new name, and `--service sandboxes` is a service this release refuses as not yet shipped.
+
+## 0.15.0-beta
+
+### Major Changes
+
+- 4bd2a0b: **Flows run no code: workflow manifest v3 (manifest-only agents).** A flow agent is data: each stage gets the previous stage's output, a switch reads it, a map runs over it and a loop asks a verifier agent. See MIGRATION.md for what replaces each function.
+
+  - **Breaking (`@nylorun/core`, `@nylorun/agents`):** stage `input` functions, `switch` `on`, loop `verify` functions and `decide` are removed; a builder option that names one is refused with what replaces it. `.loop()` takes a verifier agent and a required `max`. New `.pipe(...children)` adds one stage per child; `.step()` is a deprecated alias (`NYLORUN_DEP_STEP`). `Chain`, `Switch`, `Parallel`, `Map`, `Loop`, `withInstructions`, `withoutTools`, `isSlot`, `functionKey` and the `StageArgs`, `LoopVerifyFn`, `LoopDecideArgs`, `LoopChoice` and v1 workflow types are removed. `Agent.from` for a flow takes tool nodes only.
+  - **Breaking (`@nylorun/core`):** workflow manifests are `workflowSchemaVersion: 3`; no node carries `input`, a switch has no `on`, a loop's `verify` is an agent and `max` is required. A v1 or v2 manifest is refused with a message naming the change. The `fn` and `verify` Actions and effect kinds, and the `loop.decided` event, are removed. `WorkflowManifestV2` / `WorkflowNodeV2` / `isWorkflowManifestV2` are now `WorkflowManifest` / `WorkflowNode` / `isWorkflowManifest`.
+  - **Breaking (`@nylorun/harness`):** the flow engine is `flow-3` and runs only v3 manifests; v1 and v2 engines, `agentTurnValue` and the `fn` / `verify` effect kinds are removed. A switch picks the case named by the previous output or its `route` field, a map runs over an array or an `items` array, and a loop retries with its verifier's feedback until `max`. An `agent` effect carries the flow's input as `flowInput` when the stage's input differs.
+  - **Breaking (`@nylorun/runtime`):** no `fn` or `verify` Actions are offered or delivered. An agent stage's message shows the flow's input as the original request before its own input, and each verifier verdict is recorded as `loop.verified`.
+  - `@nylorun/studio`: the workflow tree draws v3 manifests (a loop shows its verifier agent and `max`); the loop timeline drops decide outcomes, and `loop.verified` shows the feedback.
+
+- 713e676: **Remote MCP servers only.** Nylorun accepts `streamable-http` and `sse` MCP servers, declared by URL and reached through the gates; stdio servers and plugin roots are gone. See MIGRATION.md.
+
+  - **Breaking (`@nylorun/core`):** `McpServerManifest` and the manifest schema keep only `streamable-http` and `sse`. A `stdio` server is refused by `.mcp({...})` (`McpError`, code `mcp.stdio`), by `Agent.from` and by the wire schema, all with one message (`stdioMcpRefusal`): "MCP server 'x' uses stdio; Nylorun accepts remote MCP servers only (streamable-http or sse). Run the server behind an HTTP transport and declare its URL." `PutAgentRequest` loses `pluginRoots`, `CapabilityDeclaration` loses `pluginRoot`, and the Harness API's `RunRouting` loses `pluginRoots`.
+  - **Breaking (`@nylorun/agents`):** `.plugin()` and `plugin()` throw `PluginError` (code `plugin.mcp-stdio`) for a stdio server in a plugin's `mcp.json`; its remote servers and skills load as before. `saveAgent` no longer sends plugin roots. `prepareStdioLaunch`, `expandPluginPlaceholders` and `StdioLaunch` are removed.
+  - **Breaking (`@nylorun/runtime`):** no stdio MCP launcher: `PUT /v1/agents/:id` refuses a stdio server (`400`) and `pluginRoots`. `TenantConfig.childEnv`, `TenantPaths.pluginData` and `tmp`, `tenantChildEnvironment`, `startEphemeralRuntime({ baseline })` and `configForFactory`'s `baseline` and `hostConfig` are removed; the harness service no longer takes `childEnv` or `paths.pluginData`.
+  - `nylorun`: the local stack no longer mounts the Host root's `plugins/` into the runtime and harness containers, nor the Tenant's `plugin-data/`, `home/` and `tmp/` into the harness, which now mounts only `sandboxes/`.
+
+- c135267: **Action endpoints are removed (manifest-only agents).** The Runtime runs no code of yours during a session: an agent's tools are HTTP tools, remote MCP servers, agents used as tools and the Runtime's built-ins. Protocol stays 8; the `action-endpoints` feature is gone, so a client that requires it is refused. See MIGRATION.md, "Action endpoints are removed".
+
+  - **Breaking (`@nylorun/core`):** the `Action`, endpoint (`PutEndpointsRequest`, `Endpoint`, `EndpointHealth`, …) and delivery schemas, `SIGNATURE_HEADER`, `OUTCOME_HEADER`, `DELIVERY_TOKEN_TYPE` and the `action.*` events (`action.pending`, `.delivered`, `.delivery_failed`, `.completed`, `.uncertain`) are removed, and `ToolDefinition.background` with them. `ActionOutcome` is renamed `EffectOutcome`. Tenant status loses `checks.endpoints`, `agents[].registered` and `agents[].endpoint`, and `counts.pendingActions`; the session view loses `actions`. A `turn.paused` interaction carries the tool call's `callId`. New `codeToolsOf` and `codeToolRefusal` name a definition's tools that would run your code. The Harness API is v2 (`HARNESS_API_VERSION = 2`): `TurnStart.options.holdMs` and `effect.resolved` are removed.
+  - **Breaking (`@nylorun/harness`):** held runs are gone: `createHarness` loses `holdMs`, and `apiHost` its `hold` option.
+  - **Breaking (`@nylorun/agents`):** `createActionHandler`, `executeAction`, `createActionSandbox`, `definitionDeclaresSandbox`, `isActionSandboxTool` and the `Action`, `ActionOutcome`, `ActionHandler`, `ActionHandlerOptions`, `RegisterOptions`, `ExecuteActionOptions` and `ExecutableDefinition` types are removed. `saveAgent` refuses a code tool (`tool({ run })`) or a flow tool stage before sending; its `implementationVersion` is optional (`NYLORUN_IMPLEMENTATION_VERSION`, else `dev`).
+  - **Breaking (`@nylorun/runtime`):** `/v1/endpoints` and `/v1/actions/*` answer `404`; delivery tokens, the deliverer, background tools, held runs (`TenantConfig.actionHoldMs`), `DurableExecution.deliver`, the Restate `NylorunAction` object, the `action_result` wake and the gates service's `/nylorun/v1/deliveries` are removed, and a migration drops the `actions` and `endpoints` tables. `PUT /v1/agents/:id` refuses a definition with a code tool or a flow tool stage (`400`); a tool the Runtime cannot run fails with `tool.unavailable`. The fixture model answers in text when the agent offers no `lookup_order` tool.
+  - **Breaking (`@nylorun/cli`):** `nylo endpoints` is removed (a usage error that says why); `nylo status` shows uncertain effects instead of pending Actions.
+  - **Breaking (`@nylorun/create-agent`):** the starter saves its agent with `saveAgent` and runs no server: no Action endpoint, `PORT` or `NYLORUN_ACTIONS_URL`. Its assistant has no tools, with a commented `http()` tool to start from.
+  - `nylorun`: the local stack's comments speak of MCP servers and HTTP tools on this machine, not Action endpoints.
+  - `@nylorun/studio`: the `action.*` event views and delivery status are removed; the chat shows `tool.completed`, and the Agent Manifest tab lists tools without a target as code tools.
+
+- d36f0d9: **Hooks are removed; manifests are v5 (manifest-only agents).** The Runtime no longer calls the developer's code before or after a turn or a model call. See MIGRATION.md for what replaces each use.
+
+  - **Breaking (`@nylorun/core`, `@nylorun/agents`):** `.beforeTurn()`, `.beforeModel()`, `.afterModel()`, `.afterTurn()`, the deprecated `.before()` / `.after()`, a capability's `before` / `after`, and the `Patch`, `Decision`, `TurnDecision`, `BeforeHook`, `AfterHook`, `HookScope` types and `runHookPoint` / `hooksFrom` helpers are removed. A capability that still passes `before` or `after` is refused with `hooks were removed: …`.
+  - **Breaking (`@nylorun/core`):** `manifestSchemaVersion` is 5. `capabilities[].hooks` is gone; a manifest that names it, or a v3/v4 manifest, is refused with a message naming the change. The `hook` Action and the `hook` effect kind of the Harness API are removed.
+  - **Breaking (`@nylorun/harness`):** the turn loop runs no hooks; the turn state a checkpoint carries is `{ turnId }`, and the engine version is `hosted-4`, so checkpoints of earlier engines are refused.
+  - `@nylorun/runtime`: no `hook` Actions are offered or delivered.
+  - `@nylorun/studio`: the Agent Manifest tab drops the Hooks count and the turn lifecycle.
+
+- 107b07d: **Skills are files the Runtime holds and serves itself.** Breaking: a skill's manifest names every file of its folder, and the skill tools no longer run in the developer's process. The protocol stays at 8 until the track ships.
+
+  - `@nylorun/core`: `SkillManifest` gains `files`, each path of the skill's folder (`SKILL.md` required, `/`-separated, no `..`, at most 500 files) mapped to `sha256:<hex>`, so the manifest hash pins them. `skillRecords` and `SkillRecord` are gone; a declaration's `skillFiles` holds the bytes to upload (`SkillFileSource`). `load_skill` and `read_skill_resource` keep their names and input schemas but fail with `skills.runtime-only` outside a Runtime. New `DefinitionFileViewSchema`, error code `definition_files_missing`, Harness API request `definition.file`, and `definitionFilesOf`, `isSkillTool` and the definition-file limits. A top-level `functions` key is reserved and refused ("Functions are not available yet").
+  - `@nylorun/runtime`: `PUT /v1/files/sha256:<hex>` stores a definition file (application key; at most 10 MiB; a body of another hash is `400`; `201` stored, `200` held already) in the Object store at `definitions/sha256/<hex>`, and `HEAD` says whether the Tenant holds one. New tables `definition_files` and `definition_file_uses` (migration `0013_definition_files`). `PUT /v1/agents/{id}` refuses a definition, nested agents and flow agents included, that names a file the Tenant lacks (`400 definition_files_missing`). Core serves `load_skill` (the `SKILL.md` body, the other files' paths, and `sandboxPath` with a sandbox) and `read_skill_resource` (text files only) from those files, with no Action. A session's sandbox gets each skill's files read-only under `/skills/<name>/` before the first call that opens it, and the sandbox's instructions name them; pod sandboxes mount an `emptyDir` at `/skills`. Unused files are not deleted yet.
+  - `@nylorun/agents`: `.skills()`, `skills()` and `.plugin()` read every file of a skill's folder, binary included (not `.git/`, `node_modules/`, OS files or `.env` files), and hash it; a file over 10 MiB or more than 500 files fail the build. `saveAgent` uploads the files the Runtime lacks before the definition; `client.files` (`has`, `upload`, `ensure`) does it by hand.
+  - `@nylorun/harness`: tests only.
+  - `@nylorun/studio`: the agent's manifest lists each skill's files.
+
+### Minor Changes
+
+- a64aaca: **HTTP in flows (manifest-only agents).** An `http()` tool is a flow stage, and `http({ url })` is a Loop's HTTP verifier; the Runtime makes both requests through its Tool Gate, with no Action endpoint.
+
+  - `@nylorun/core`: an HTTP tool may be a stage in `.pipe()`, a switch case, a Map item or a Loop body; its tool node carries its `http` target and binds nothing. The build refuses an HTTP stage whose input is known to be the wrong type (`flow.input-mismatch`, e.g. after an agent with no `.output()`) and `approval: "always"` on one (`flow.approval-unsupported`). `http()` without a name and an input returns an `HttpTarget`, an HTTP verifier: `.loop(body, { verify: http({ url, method?, credential?, timeoutMs? }), max })`, in the manifest `loop.verify: { http }`. `fn` and `command` verify targets are refused ("Functions are not available yet"). New `flowHttpTarget()` finds an HTTP stage or verifier by stage key; `isHttpTarget()`, `WorkflowHttpVerify` and `WorkflowLoopVerify` are exported.
+  - `@nylorun/harness`: the flow engine checks an HTTP stage's input against its schema (`tool.invalid-input`), runs it as a `tool` effect and fails the stage on a failed outcome (`http.status`, `http.timeout`, `tool.invalid-output`, …). An HTTP verifier is a `tool` effect with `{ input, output, iteration }` and `context.role: "verify-http"`; a non-verdict or a failed request is `loop.verify-failed`. A Loop body that starts with an HTTP stage is retried with the Loop's input.
+  - `@nylorun/agents`: `http()` builds HTTP verifiers too.
+  - `@nylorun/runtime`: a flow's HTTP stages and verifiers are executed like an agent's HTTP tool: address policy, the flow session's vault credential, `Nylorun-Session-Id`/`-Turn-Id`/`-Agent-Id` (the flow agent's id) and the flow effect id as `Idempotency-Key`, run once at the gates service (`POST /nylorun/v1/http-calls` takes `tool: { sessionId?, stage }`) and `uncertain` when the answer is lost. An HTTP verifier's verdict is recorded as `loop.verified`.
+  - `@nylorun/studio`: the workflow tree shows HTTP stages and HTTP verifiers with their method and URL.
+
+- 40b7648: **HTTP tools and static approval (manifest-only agents).** A tool can be one HTTP request the Runtime makes through its Tool Gate, with no Action endpoint; code tools keep working.
+
+  - `@nylorun/core`: `ToolManifest` gains `http` (`url`, `method` `POST`/`PUT`/`PATCH`, `credential`, `timeoutMs` up to 300000) and `approval` (`never`/`always`, HTTP tools only); a tool is never both an agent and an HTTP request, and `fn` and `command` are refused ("Functions are not available yet"). Remote MCP servers take `approval`. `http()` builds an HTTP tool, `httpToolOf()` reads one; `SESSION_ID_HEADER`, `TURN_ID_HEADER` and `AGENT_ID_HEADER` name the headers it sends. `Agent.from` rebuilds HTTP tools without an implementation; an HTTP tool is refused as a flow stage.
+  - `@nylorun/harness`: hosted HTTP tools keep their target, and `approval: "always"` (an HTTP tool's, or `DurableSessionTool.approval` for a remote MCP server's tools) pauses each call for approval. **Breaking:** `HarnessExecutors.recovers.remoteMcp` is renamed `recovers.tool`.
+  - `@nylorun/agents`: exports `http` and the identity header constants.
+  - `@nylorun/runtime`: the Tool Gate runs HTTP tool calls (`POST /nylorun/v1/http-calls` at the gates service, or in process): the input as JSON under the Host's address policy, the session's vault credential bound to the URL, `Nylorun-Session-Id`/`-Turn-Id`/`-Agent-Id` and the effect id as `Idempotency-Key`. A keyed call runs once (`tool_crossings`), so a re-send after a takeover joins it and one lost with the gateway is `uncertain`. Non-2xx answers, timeouts, refused addresses, missing credentials and output mismatches are tool errors the model sees. The credential resolver is asked with `target.kind: "http"` and the tool's `credential` name.
+  - `@nylorun/studio`: the Agent Manifest tab lists HTTP tools with their method and URL, and marks tools and MCP servers that wait for approval.
+
+## 0.14.0-beta
+
+### Major Changes
+
+- 7f763c3: **The Admin API and the operator listener are gone (Runtime and Management APIs).** Host work moves to the machine: `nylorun` runs `nylorun-operate` inside the runtime container, and every remote client uses the Runtime API or the Management API.
+
+  - **Breaking (`@nylorun/runtime`):** `/v1/admin/*` (status, host, shutdown, keys, openapi.json) is removed; it answers like any unknown route. The operator listener, `NYLORUN_ADMIN_LISTEN_PORT`, `NYLORUN_ADMIN_LISTEN_HOST`, `NYLORUN_ADMIN_ALLOWED_HOSTS` and `host.json`'s `adminPort` are gone, and so is the `admin-openapi.json` package file. Stop the Host with SIGTERM. `nylorun-operate status [--json]` reports the version, protocol and the Tenant's id, name, state and cause, exiting 2 when the Tenant is not open. `/ready` adds `harness: { mode, connected }` while the Tenant is open. `startEphemeralRuntime` loses `operatorListener` and `adminUrl`. The admin key stays: it derives Studio's key.
+  - **Breaking (`@nylorun/admin`):** `createAdmin()` is the Management API client (`tenant`, `keys`, `models`, `vaults`, `signingKeys`, `settings`) with a management key: explicit `{ url, key }`, else `NYLORUN_RUNTIME_URL` + `NYLORUN_MANAGEMENT_KEY`, else the Project link's or the local Host root's management key. `status()`, `adminUrl`, the Admin API keys, `NYLORUN_ADMIN_URL`/`NYLORUN_ADMIN_KEY` and `OPERATOR_KEYS_FEATURE` are removed; `deriveStudioToken` and `mintStudioLoginToken` stay.
+  - **Breaking (`@nylorun/core`):** `admin-status` leaves `PROTOCOL_FEATURES` (the Host still advertises it for protocol 5–7 clients) and `operator-keys` is removed; `AdminStatusSchema`, `AdminHostStatusSchema`, `HostAggregateSchema` and `HostShutdownResponseSchema` are removed.
+  - **Breaking (`nylorun`):** no admin port: `NYLORUN_ADMIN_PORT` is no longer written or published (an existing one is ignored). `nylorun start` waits for `/ready`, and `nylorun status` reads readiness from `/ready` and the Tenant from `nylorun-operate status`.
+  - `@nylorun/cli`: `nylo status` no longer falls back to the Admin API; when the Tenant does not answer it points to `npx nylorun status`.
+
+- 98b0d37: **Protocol 8: the Runtime API and the Management API take separate keys (Runtime and Management APIs).** Upgrade every package together; `nylorun`, `@nylorun/cli` and Studio already use management keys.
+
+  - **Breaking (`@nylorun/runtime`): `/v1/tenant/*` takes only a management key.** An application key there, alone or acting for a subject, is `403 key_role_mismatch`; a management key acting for a subject is `403 subject_invalid`. This covers the Tenant's status, seed and reset, models, providers, usage and budgets, sandbox and artifact settings, application keys, vaults and signing keys. A management key on any other route but `/v1/me` and the public `/v1/access/jwks` is `403 key_role_mismatch`.
+  - **Breaking (`@nylorun/runtime`): vaults and signing keys moved.** They are at `/v1/tenant/vaults…` (including `…/oauth/start`) and `/v1/tenant/signing-keys…`; `/v1/vaults…` and `/v1/access/signing-keys…` are gone, with no alias. Opening a session with `vaultIds` is unchanged, as are `GET /v1/oauth/callback` and `GET /v1/access/jwks`.
+  - **Breaking (`@nylorun/core`, `@nylorun/runtime`): `tenant:settings` is retired.** It leaves `SUBJECT_SCOPES`; `Nylorun-Scopes` may still name it and it grants nothing. `/v1/tenant/models` and `/v1/tenant/providers` no longer admit `agents:write` subjects: apps don't read the model catalog.
+  - **Breaking (`@nylorun/agents`):** the vault methods (`createVault`, `listVaults`, `getVault`, `deleteVault`, `createCredential`, `listCredentials`, `getCredential`, `rotateCredential`, `deleteCredential`) and `client.access.signingKeys` / `SigningKeysClient` are removed; use `admin.vaults` and `admin.signingKeys` from `@nylorun/admin`'s `createManagementClient`. `client.access.jwks()` stays.
+  - `@nylorun/core`: `PROTOCOL_VERSION` is 8 and `HOST_PROTOCOL` 4–8, with the required feature `management-api`. Runtime API routes keep their request and response shapes.
+  - `@nylorun/runtime`: `startEphemeralRuntime` registers a management key (`managementKey`, the key `bootstrap`).
+
+### Minor Changes
+
+- 3b3bdc6: **The clients use management keys (Runtime and Management APIs).** The protocol stays at 7; every client keeps working against a protocol 7 Runtime's routes.
+
+  - `nylorun`: `nylorun start` keeps an application key (`project`) and a management key (`project-management`) for a Project, in `<Host root>/project-credentials.json` and the Project's `.nylorun/credentials.json` (still format 1, with new `managementKey` and `managementPrincipalId` fields). A credentials file holding only an application key gains a management key at the next start. Commands outside a project keep `cli` and `cli-management`. Keys are issued through `nylorun-operate` in the runtime container instead of the Admin API, and `nylorun key put <id> --management` puts a management key. Seeding the Tenant and `nylorun mcp connect` use the management key (`/v1/tenant/vaults`). Studio reaches the Runtime's public listener.
+  - `@nylorun/cli`: `status`, `reset`, `configure`, `doctor` and `access signing-keys` use the Management API through `@nylorun/admin` with the Project's management key, or `NYLORUN_MANAGEMENT_KEY`.
+  - `@nylorun/studio`: local Studio needs no login. A request on the published loopback address (`localhost` or `127.0.0.1` at Studio's port) acts as signed in; hosts behind a sign-in proxy and embedding keep their login, and state-changing requests still need Studio's own `Origin`. Studio learns its Tenant from `GET /v1/tenant` with its key instead of the Admin API, and its Connections page manages vaults through `@nylorun/admin/client` at `/v1/tenant/vaults`.
+  - **Breaking (`@nylorun/admin`, `@nylorun/runtime`): Studio's key is derived from the admin key alone.** `deriveStudioToken(adminKey)` takes no Tenant id (HMAC-SHA256 over `nylorun/studio/v2`). The Host registers the new key's hash at its next start, replacing the old one; an app that embeds Studio and derives its key must update.
+  - `@nylorun/core`: `ProjectCredentialsFileSchema` gains optional `managementKey` and `managementPrincipalId`.
+
+- 6576e12: **Key roles and management keys (Runtime and Management APIs).** Additive; the protocol stays at 7. Application keys keep reaching every route they reach today.
+
+  - `@nylorun/runtime`: a key now has a role. `application` keys are unchanged. A new **management key** (role `management`) reaches the Management API (`/v1/tenant/*`) and `/v1/me` only, as itself: `Nylorun-Subject` or `Nylorun-Scopes` with it is `403 subject_invalid`, an `Origin` is `403 origin_rejected`, and any other route is `403 key_role_mismatch`. `/v1/me` reports it as `via: management:<id>` with no scopes and no agents. Studio's derived key has role `studio`, which reaches both. Migration `0011_key_roles` gives the existing `studio` principal its role.
+  - `@nylorun/runtime`: management keys are issued only on the Tenant's machine, with the new `nylorun-operate` command in the runtime image (`nylorun-operate keys list | put <id> [--role application|management] | rm <id>`), or from `NYLORUN_MANAGEMENT_KEY_FILE` (64 hex characters), which the Host registers as the key `bootstrap` at every start and replaces when the file changes. `bootstrap` is reserved like `studio`. Rotating a key keeps its role; putting an id that holds the other role is refused.
+  - `@nylorun/core`: `KEY_ROLES`, `KeyRole`, `BOOTSTRAP_KEY_ID` and the error code `key_role_mismatch`.
+
+- b28bdd7: **Local MCP servers work on a local Tenant, and a server that does not connect shows.** Additive; the protocol stays at 7.
+
+  - `@nylorun/runtime`: remote MCP servers (`streamable-http`, `sse`) are reached under the Host's address policy, as Action endpoints are (`NYLORUN_ENDPOINT_*`, `tenant/outbound.ts`). In the local Docker stack `localhost`, `127.0.0.1` and `[::1]` now mean the machine that runs Docker (`host.docker.internal`), so `.mcp({ x: { type: "streamable-http", url: "http://localhost:3002/x" } })` connects where it used to fail with `fetch failed`. With `NYLORUN_ENDPOINT_PRIVATE=refuse` a server on a private address is refused; with `NYLORUN_ENDPOINT_HTTP=refuse` an `http` server is refused. Redirects are still not followed. A connection failure now names its cause (`connect ECONNREFUSED …`) instead of `fetch failed`. This applies in the gateway, a harness process and an in-process Tenant. `guardedFetch` takes `stream: true`: the answer streams, unbounded, with no timeout but the caller's signal.
+  - `@nylorun/core`: new session event `mcp.discovered`, recorded once on the session's first turn with the MCP snapshot: one entry per declared server with `outcome` (`connected`, `refused`, `failed`), `message` and the number of `tools` it added (`McpDiscoveredPayloadSchema`, `McpServerOutcomeSchema`). A server that does not connect adds no tools for the session's life; this is where that shows in the event log, beside `mcpDiagnostics`.
+  - `@nylorun/agents`: `.plugin()` and `plugin()` emit a process warning (`NylorunPluginWarning`, the diagnostic's code) for each part of the package they skip, so building or registering the agent says when a plugin's MCP server was dropped. The `plugin.mcp-server-skipped` message now says why: for example, plain `http` is accepted only for `localhost`, `127.0.0.1` or `[::1]`.
+  - `@nylorun/studio`: the event list labels `mcp.discovered` and summarizes each server's outcome.
+
+- c66d8ed: Add optional session reads and a resumable model-ledger export: pinned manifests, usage totals, model calls, and opt-in session/history/sandbox pages (Host feature `session-reads`), and `GET /v1/tenant/calls/model` on the Management API (Host feature `calls-export`). Usage and model calls take an application key acting as itself; the export takes a management key. Runtime reads use a separate bounded, read-only Drizzle pool. The additive migration `0012_session_reads` preserves unknown legacy creation times and usage quality; the export uses safe transaction order without skipping committed rows. `@nylorun/agents` adds `client.sessions.page()`, `session.manifest()`, `session.usage()`, `session.modelCalls()`, `session.history({ limit })` and `client.sandboxes.page()`; `@nylorun/admin` adds `models.exportCalls()`. Legacy unpaged responses are unchanged.
+
+### Patch Changes
+
+- cc107b1: **Named agents work as flow children.** An Agent with a `name` (for example `Agent({ id: "a", name: "Named A" })`) used in `.step()`, `.switch()`, `.parallel()`, `.map()`, `.loop()` or in `Chain`/`Switch`/`Parallel`/`Map`/`Loop` was mistaken for a tool, because a builder has a string `name` and an `.input()` method, and the build threw `tool.invalid: Tool 'Named A' must provide run() or execute()`. Agents, agent builders and flows are no longer classified as tools.
+
+## 0.13.0-beta
+
+### Major Changes
+
+- bd478ee: **Subject tokens, browser keys and derived principals leave open source (protocol 7).** Upgrade these with the Runtime: they speak protocol 7, which this Runtime serves beside 4, 5 and 6; protocol 6 clients keep working on every route that remains. Browsers and apps present a trusted issuer's token, servers an operator key, and a person's own credentials come from the operator's credential resolver. See MIGRATION.md.
+
+  - **Breaking (`@nylorun/runtime`, `@nylorun/core`): subject tokens are gone.** `POST /v1/tokens`, `POST /v1/access/revocations`, subject-token verification, revocation epochs and the `subject.revoked` stream signal are removed; the routes answer `404`, and a JWT no trusted issuer signed is the opaque `404`. A stream opened with a token now ends only at its expiry (`event: nylorun.closed`, reason `token_expired`; `StreamClosedFrame` loses `revoked`). Migration `0010_oss_auth_removals` drops the `subject_epochs`, `subject_usage` and `publishable_keys` tables. The `token` caller is a trusted issuer's token only: it loses `role`, `limits` and `epoch`, and `issuer` is always set; `GET /v1/me` no longer reports `via: token`. Core drops `SUBJECT_TOKEN_TYPE`, `SUBJECT_TOKEN_AUDIENCE`, `subjectTokenIssuer` (the Runtime's own tokens use `tenantTokenIssuer`, same value), `CreateTokenRequest`/`Response`, `RevokeSubject*`, `SubjectTokenClaims`, `TOKEN_TTL_MIN_SECONDS` and `TOKEN_TTL_DEFAULT_SECONDS`; `TOKEN_SCOPES` is `agents:read`, `sessions:own`, `sandboxes:write`.
+  - **Breaking (`@nylorun/runtime`, `@nylorun/core`): the access policy and role limits are gone.** `GET`/`PUT /v1/access/policy` answer `404`, a turn is never refused with `429 limit_exceeded` for a role (limit requests at your proxy), and an existing `access.policy` setting is ignored. Core drops `AccessPolicy*`, `AccessRole*`, `RoleLimits*`, `DEFAULT_ACCESS_POLICY`, `PutAccessPolicyRequest` and `ROLE_NAME_PATTERN`.
+  - **Breaking (`@nylorun/runtime`, `@nylorun/core`): publishable keys and the Runtime's CORS are gone.** `/v1/access/publishable-keys*` answer `404`, `Nylorun-Key` is ignored, `NYLORUN_BROWSER_ACCESS` and `browserAccess` (host.json, `createHost`, `startEphemeralRuntime`) are removed, and the Runtime sends no CORS headers. A request with `Origin` reaches the Tenant routes of the public listener with no toggle: a trusted issuer's token is served, an application key or delivery token is `403 origin_rejected`; admin routes, `/health`, `/ready` and the operator listener still refuse `Origin`. Any `OPTIONS` request is `204` with `Allow` and no CORS header: the operator's proxy answers preflights. Route declarations lose `browser` (`x-nylorun-browser` leaves the OpenAPI document) and the `publishable` credential; the token security scheme is `issuerToken`. Core drops `PUBLISHABLE_KEY_HEADER`, `PUBLISHABLE_KEY_PATTERN`, `PUBLISHABLE_KEY_ID_PATTERN`, `tenantOfPublishableKey`, `newPublishableKey`, `newPublishableKeyId`, `PublishableKey*`, `OriginEntrySchema`, `originAllowed` and `LOOPBACK_ORIGIN_WILDCARDS`.
+  - **Breaking (`@nylorun/runtime`, `@nylorun/core`, `@nylorun/agents`): vault routes are application-only, and `vaults:own` is retired.** Every `/v1/vaults` route takes an application key acting for no one (operator keys, Studio); a request acting for a subject or a trusted issuer's token gets `403 scope_required`. `vaults:own` leaves `SUBJECT_SCOPES`, `TOKEN_SCOPES` and the issuer scopes; `Nylorun-Scopes` may still name it and it grants nothing. Existing user vaults stay attachable to their own owner's sessions. `client.createVault` takes `{ scope: "installation" }` or `ownerUserId`, and `client.listVaults()` takes an optional owner.
+  - **Breaking (`@nylorun/runtime`, `@nylorun/core`, `@nylorun/admin`, `nylorun`): derived principals are gone.** Only Studio's key is derived from the admin key. `NYLORUN_DERIVED_PRINCIPALS` is ignored and no longer written, `hostPrincipals` takes no `derived`, `startEphemeralRuntime` no `derivedPrincipals`, and `@nylorun/admin` drops `deriveTenantKey`, `PROJECT_PRINCIPAL_ID` and `admin.deriveTenantKey`. Keys an earlier Host derived stay in the database and keep working as ordinary keys; replace them with operator keys. Core renames `DERIVED_PRINCIPAL_ID_PATTERN` to `APPLICATION_KEY_ID_PATTERN`.
+  - **Breaking (`@nylorun/agents`):** `createTokenEndpoint`, `createBrowserClient` and the `@nylorun/agents/browser` entry, `client.tokens`, `TokensClient`, `PublishableKeysClient`, `client.access.getPolicy`/`putPolicy`/`revokeSubject`/`publishableKeys` and `Destination.publishableKey` are removed. `client.access.signingKeys` and `client.access.jwks()` stay, and `Destination.token` takes a trusted issuer's tokens.
+  - **Breaking (`@nylorun/cli`):** `nylo access policy|keys|revoke|token` are removed and name what replaces them; `nylo access signing-keys list|rotate|revoke` stays.
+  - **Breaking (`@nylorun/core`, `@nylorun/agents`, `@nylorun/studio`): the Studio embed message `open.babai` is now `open.session`** (`{ sessionId }`): it asks the embedding app to open that session in its own UI. Studio sends no such message itself.
+  - **Breaking (`nylorun`): Studio embedding is opt-in.** No origin may frame Studio by default; list your app's origins with `nylorun start --studio-embed-origin <origin>`. A Tenant's `.env` from an earlier nylorun keeps the origins it had until `--studio-embed-origin-reset`.
+  - `PROTOCOL_VERSION` is 7 and `HOST_PROTOCOL` 4–7; the Host features `subject-tokens`, `browser-access` and `derived-principals` are removed. `@nylorun/studio` and `@nylorun/create-agent` speak protocol 7.
+
+### Minor Changes
+
+- 8773586: **Installation vaults and a credential resolver.** A session's MCP credential now comes from its attached vaults, then from the operator's own credential resolver; nothing changes for existing vaults, and the protocol stays at 6.
+
+  - Installation vaults: `POST /v1/vaults` takes `scope: "installation"` (no `ownerUserId`) from an application key acting for no one; a request acting for a subject gets `403`. The vault is owned by `installation`, now a reserved subject like `host`. Any session may attach one and select its credentials. `GET /v1/vaults` from an application key lists them after the named person's vaults, and lists only them without `ownerUserId`; a request acting for a subject never sees one (the opaque `404`). The host model vault stays hidden and unattachable. Migration 0008 adds the scope.
+  - The credential resolver: `NYLORUN_RESOLVER_URL` and `NYLORUN_RESOLVER_TOKEN` on the gateway (`TenantConfig.resolver` and `startEphemeralRuntime({ resolver })` in process). When the session's vaults hold nothing for a remote MCP server's URL, the Runtime POSTs `{ owner, session, turn, target: { kind: "mcp", server, agent, url } }` with the resolver's bearer: `200 { headers, expiresAt? }` is used, `404` goes without a credential, and anything else or no answer within 5 s refuses the server with `credential_unavailable`. Owner and turn come from the session row. Answers are cached per owner and URL until `expiresAt`, at most 5 minutes (60 s without one), and concurrent misses share one request. See DEPLOYMENT.md, Credentials.
+  - `nylorun`: the gateway's Compose service passes `NYLORUN_RESOLVER_URL` and `NYLORUN_RESOLVER_TOKEN` from the shell that runs `nylorun start` (unset by default).
+  - Studio: the Vault page is now **Connections**, and creates installation vaults.
+
+- e1bfb4b: **MCP OAuth connect for installation vaults.** The installation can sign in once to a remote MCP server that uses OAuth, and every session that attaches the vault uses the credential. Additive; the protocol stays at 6.
+
+  - `POST /v1/vaults/{vaultId}/oauth/start` (application keys acting for no one, installation vaults only) takes `{ url, server, clientId? }` and answers `{ authorizeUrl, expiresAt }`. The Runtime discovers the server's authorization server (RFC 9728, then RFC 8414), registers itself (RFC 7591) unless `clientId` names a registered client, and starts an S256 PKCE sign-in whose `state` works once, for ten minutes. A server without registration and no `clientId` is `400 oauth_client_required`.
+  - `GET /v1/oauth/callback` takes the browser back: anonymous and unversioned like an artifact link, it exchanges the code and stores an `oauth` credential bound to the URL, named after `server` (connecting again rotates it), and answers a small HTML page. An unknown, used or expired `state` is `oauth_state_invalid`; the authorization server's refusal is `oauth_failed`. The callback's base is `NYLORUN_PUBLIC_URL` (`TenantConfig.publicUrl`), else the start request's origin.
+  - Every OAuth step runs in the gateway's keys module: the runtime container never sees a token, the PKCE verifier or a client secret, and makes no outbound call. Migration 0009 adds `oauth_pending`, with the verifier and secret sealed under the vault key. `Keys` gains `startOAuth` and `finishOAuth`.
+  - OAuth requests, including refresh of every OAuth vault credential, now go through `guardedFetch` (`tenant/outbound.ts`): the `NYLORUN_ENDPOINT_*` address policy checked on the address connected to, no redirects, a bounded answer. With `NYLORUN_ENDPOINT_PRIVATE=refuse` a token endpoint on a private address is refused, where refresh used to call it.
+  - `@nylorun/core`: `ERROR_CODES` adds `oauth_client_required`, `oauth_state_invalid` and `oauth_failed`; `StartOAuthRequestSchema` and `StartOAuthResponseSchema`.
+  - `nylorun mcp connect <url> --server <name> [--vault <id>] [--client-id <id>]`: creates the installation vault `mcp` if needed, opens the sign-in page and waits up to 10 minutes for the credential. See DEPLOYMENT.md, "Connecting a remote MCP server with OAuth".
+
+- 5cfaed9: **Operator keys, and project links on them.** The Admin API manages the Tenant's application keys by name: `PUT /v1/admin/keys/{id}` creates a key or rotates it and returns it once, `GET /v1/admin/keys` lists every key's id, role and issue time (never the keys), and `DELETE /v1/admin/keys/{id}` removes one. A rotated or deleted key stops authenticating on its next request. Ids follow `^[a-z][a-z0-9-]{0,31}$`; `studio` (derived from the admin key) is refused. Keys keep today's format (64 hex) and only their SHA-256 is stored, in the existing principals table (no migration). Host feature `operator-keys` (additive, protocol unchanged); core adds the `OperatorKey`, `ListOperatorKeysResponse`, `PutOperatorKeyResponse` and `DeleteOperatorKeyResponse` schemas.
+
+  - `@nylorun/admin`: `admin.keys.put(id)`, `admin.keys.list()` and `admin.keys.delete(id)`; they refuse with `incompatible_host` when the Host lacks `operator-keys`.
+  - `nylorun key put|list|rm <id>` manages a running local Tenant's keys; `put` prints the key once on stdout.
+  - `nylorun start` no longer derives the project's key. It keeps `.nylorun/credentials.json` while its key still reaches the Tenant (one authenticated read); otherwise it gives the project the operator key `project`, which the Host root keeps in `project-credentials.json` (0600) so every checkout linked to the Tenant shares it. An existing derived project key keeps working and is adopted.
+  - `nylorun sandbox` uses the linked project's key, or the operator key `cli` it puts once and keeps in `<Host root>/cli-credentials.json` (0600).
+  - The ephemeral Runtime (`startEphemeralRuntime`) no longer registers the derived `project` principal; pass `derivedPrincipals: ["project"]` to keep it. Derived principals (`NYLORUN_DERIVED_PRINCIPALS`, `deriveTenantKey`) still work on a Host.
+
+- c0b604e: **Trusted issuers.** The Tenant API accepts JWTs from the operator's own identity provider as bearers, configured in an identity file: `NYLORUN_IDENTITY_FILE` names a YAML file listing each issuer's `name`, `issuer`, `audience`, `jwks` URL or static PEM `keys`, a `subject` template over scalar claims (`u:{sub}`), `scopes` from a claim or a fixed list, `allowedScopes`, an optional `agents` allowlist, optional `sandboxes` grant templates (`{org_id}/*`) and `maxLifetime`. A malformed file stops the boot, naming the issuer and the field; a subject template without a claim is malformed. A bearer whose unverified `iss` names an issuer is verified with RS256, ES256 or EdDSA only, up to 16 KiB, `aud` matching, `exp` and `iat` required and `exp − iat` within `maxLifetime`, and becomes a token caller (`role: issuer:<name>`) with the issuer's scopes, agents and rendered sandbox grants; subject revocation does not reach it. JWKS keys are fetched only from the configured URL (no redirects), cached by `kid`, refetched at most once a minute for an unknown `kid`; while a JWKS is unreachable cached keys keep working and a new `kid` is `401 issuer_unavailable` (new error code). A browser request with an issuer token needs no publishable key (CORS comes from the operator's proxy). New: `GET /v1/me` reports the subject, scopes, agents, sandbox grants and `via` (`application:<id>`, `subject`, `token` or `issuer:<name>`) of any credential; the issuer-only scope `studio`; `ISSUER_SCOPES`, `CALLER_SCOPES` and `MeResponseSchema` in `@nylorun/core/contracts`; `parseIdentityFile` and `createTrustedIssuers` in `@nylorun/runtime`, and an `issuers` option on `startEphemeralRuntime`; Host feature `trusted-issuers` (additive, protocol unchanged). `nylorun start` sets `NYLORUN_IDENTITY_FILE=/nylorun/identity.yaml` on the runtime container when `<Host root>/identity.yaml` exists.
+
+## 0.12.0-beta
+
+### Major Changes
+
+- b352feb: **File artifacts, message parts and capability links (protocol 6).** Upgrade these with the Runtime: they speak protocol 6, which this Runtime serves beside 4 and 5. See MIGRATION.md.
+
+  - **`@nylorun/runtime`: file artifacts.** A file is an artifact: an `af_` id, a name and numbered immutable versions, with rows in the new `artifacts` and `artifact_versions` tables (migration `0004_artifacts`) and bytes in the Object store (`BlobStore`). `POST /v1/artifacts?name=&sessionId=` uploads a file in one streamed request and `POST /v1/artifacts/{id}/versions` adds a version, within the Tenant's limits (`GET`/`PUT /v1/tenant/artifacts`: 100 MiB per file and 10 GiB in all by default); a body past either is `413 limit_exceeded`, refused mid-stream with nothing stored. `GET /v1/artifacts` lists them (by session), `GET /v1/artifacts/{id}` reads one with its versions, `GET /v1/artifacts/{id}/versions/{n|latest}/content` downloads through the Runtime with HTTP Range (`206`, `Content-Range`, `416`), and `DELETE /v1/artifacts/{id}` deletes it with its bytes. A session's artifacts go with it on a sessions reset, and appear in its history as `artifact.created`, `artifact.version.created` and `artifact.deleted` (new in the event catalog). A subject reaches only the artifacts of their own sessions.
+  - **`@nylorun/runtime`: capability links.** `POST /v1/artifacts/{id}/links` mints a short-lived path, `/v1/artifact-links/<token>`, that downloads one version (with Range) with no credential and no `Nylorun-Protocol`: an ES256 JWT (`typ: nylorun-artifact+jwt`) signed with the Tenant's signing key, at most 15 minutes, and dead once the artifact is deleted. The Host logs its path without the token.
+  - **Breaking (`@nylorun/core`, `@nylorun/runtime`): message `parts`.** A user message may carry `parts`: `text`, and `file` by `artifactId` (and `version`, else the latest, pinned when the message is accepted). Model-gate reads the file from the Object store: an image goes to the model as image input, a text file as text, and any other file fails the call (`invalid_request`). The record and the transcript hold only the reference. The gateway builds its `BlobStore` from `NYLORUN_OBJECT_STORE_*` (the Tenant's `fs` store without it). `PROTOCOL_VERSION` is 6; `HOST_PROTOCOL` is 4–6 and protocol 6 clients require the feature `artifacts`.
+  - **`@nylorun/runtime`: `save_artifact`.** A session with a sandbox gets the `nylorun.artifacts` capability, whose `save_artifact` tool saves a sandbox file (`path`) or text (`content`) as an artifact of the session, carrying the turn and tool call on its event.
+  - **Breaking (`@nylorun/runtime`): `MediaStore` is removed.** `MediaStore` and `localMedia` leave `@nylorun/runtime/node`, and `piModel` takes `files` (a resolver from an artifact reference to its bytes) instead of `media`; images are file artifacts. The image checks (`decodeImageBase64`, `validateImageBytes`, `IMAGE_MEDIA_TYPES`, `MAX_IMAGE_BYTES`) stay.
+  - **`@nylorun/agents`:** `client.artifacts` (`upload`, `uploadVersion`, `list`, `get`, `download` with a range, `link`, `delete`), also on `BrowserClient`, and `session.inputParts(parts)`. A request with a body of its own type keeps it.
+  - `@nylorun/admin`, `@nylorun/cli`, `nylorun`, `@nylorun/studio`: speak protocol 6.
+
+### Minor Changes
+
+- 6077272: **Folder artifacts and the turn-end outputs export.** Part of protocol 6, with file artifacts.
+
+  - **`@nylorun/runtime`: the turn-end export.** When an agent's turn completes, the Runtime reads `/workspace/outputs` of the session's sandbox and keeps it as a version of the session's folder artifact `outputs`: the first export creates it, and each later turn whose outputs changed adds a version (`artifact.created` / `artifact.version.created` with `kind: "folder"`, `source: "export"`, `fileCount` and `claimed: true`, since the listing and bytes are what the sandbox supplied). Nothing is exported without a sandbox or without outputs. An export past 10,000 files, 1 GiB, the per-file limit or the Tenant total stores nothing and records `artifact.export.skipped` with its reason; a failure records `artifact.export.failed`. Neither fails the turn. Core reads the workspace through one seam, `WorkspaceReader`, which the Harness API and pod sandboxes will implement later.
+  - **`@nylorun/runtime`: folder artifacts.** A folder version is a manifest of paths to content-addressed files: each file's bytes are stored once at `blobs/sha256/<hex>`, so an unchanged file is never stored again, and the Tenant total (`GET /v1/tenant/artifacts` `usedBytes`) counts it once. New routes: `GET /v1/artifacts/{id}/versions/{n|latest}/tree` (the manifest), `…/files/{path}` (one file by its percent-encoded path, with Range), `…/diff?from=n` (files added, removed and changed) and `…/zip` (a streamed zip). `POST /v1/artifacts/{id}/links` takes `file` to link one file of a folder; a folder's link without it opens the zip. A folder's `/content`, a new version uploaded to a folder, and a message part naming a folder are `400`. Deleting a folder removes the files no other version names. Migration `0006_folder_artifacts` allows the `folder` kind and adds the `artifact_content` table.
+  - **`@nylorun/core`:** `ArtifactKindSchema` (`file`, `folder`), the `export` source, `FolderEntrySchema`, `FolderManifestSchema`, `ArtifactTreeSchema`, `ArtifactDiffSchema`, the `artifact.export.skipped` and `artifact.export.failed` events, and `fileCount` and `claimed` on `artifact.created` / `artifact.version.created`.
+  - **`@nylorun/agents`:** `client.artifacts.tree()`, `file()`, `diff()` and `zip()`, and `link(id, { file })`.
+
+- b6bf1f5: **Harness API v1, in process.** Every segment now runs in a harness: the advance takes the session's lease and offers the segment as a run, and the Tenant's own harness, in the same process, runs the engine and reports how it ended. Core settles it exactly as before. Nothing changes on the wire: protocol 5, durable checkpoint 1, engine `hosted-3` and the Action endpoint wire are the same.
+
+  - `@nylorun/core/harness-api`: the protocol (messages, Zod schemas, the effect request hash, transcript edits, an RPC channel with an in-process memory transport).
+  - `@nylorun/harness/api`: `createHarness({ channel, executors })`, a harness that leases runs, renews their leases, replays a run's recorded outcomes without asking, keeps transcripts by record cursor, and runs model, MCP and sandbox calls through the executors it is given.
+  - `@nylorun/runtime`: the Harness API server per Tenant (`TenantHandle.attachHarness`), the in-process harness, and the journal as the Record seam. A model call's journal row now stores the request's hash without its prompt, so a replay never sends a prompt twice. `NYLORUN_HARNESS_API=0` runs the engine in the advance as before, until a later release removes it. A Runtime older than this one may fail a turn that was in flight across a downgrade with drift.
+
+- 8ed4ea6: **Harness service over WebSocket, with the workspace capability.** A Runtime started with `NYLORUN_HARNESS=remote` runs no harness of its own: it opens the Harness API listener (`NYLORUN_HARNESS_LISTEN_HOST`/`_PORT`, default port 4200, `NYLORUN_HARNESS_ALLOWED_HOSTS`), which accepts only the harness credential (`NYLORUN_HARNESS_TOKEN`) on `/nylorun/harness/v1`. The runtime image's `--service harness` connects to it (`NYLORUN_HARNESS_URL`, `NYLORUN_HARNESS_TOKEN`, `NYLORUN_GATES_URL`, `NYLORUN_HARNESS_ROOT`) and runs the Tenant's segments, MCP servers and sandboxes with no store; it refuses to start with a database, the gates' or keys' credential, or Restate settings, and presents only run tokens at the gates. The in-process harness stays the default.
+
+  - `@nylorun/core/harness-api`: the `workspace.*` requests core sends to a harness that serves workspaces, `tenantId` in the `hello` answer, a workspace record on `sandbox.state` claims, and `TurnStart.options.holdMs`. Tenant and admin status report the Tenant's harnesses (`harness`).
+  - `@nylorun/harness/api`: `createHarness` declares capabilities, reports grants (`onGrant`) and the `hello` answer, readies MCP through `executors.prepare` (`session.mcp`), and holds a run while its Action is pending until core sends the outcome (`effect.resolved`).
+  - `@nylorun/runtime`: the WebSocket listener and client, `--service harness`, the workspace capability (`ctx.sandbox` is a `WorkspacePort`; sandbox tool routes, `save_artifact`, sweep and reset reach the harness's workspaces), the SandboxManager's records port, and held runs (`actionHoldMs`, default 5 minutes). `save_artifact` runs in core. `NYLORUN_HARNESS_API` and the engine run in the advance are removed; tests run with `NYLORUN_TEST_HARNESS=memory|json|ws`.
+
+- 678e085: **Pod sandboxes.** With `nylorun sandbox enable`, a sandbox resource of kind `pod` (`PUT /v1/sandboxes/{id}` with `kind: "pod"`, an `image`, `*.suffix` hosts, `storage` and `lifecycle.ttl`) is an agent-sandbox pod on the Tenant's cluster, created at once. The turns of the sessions attached to it run in the pod: the engine is copied from the Runtime image into the pod (the Runtime image now carries tini for it), waits until the pod's NetworkPolicy is in force, exchanges its join token for a host token at the Harness API listener (`POST /nylorun/harness/v1/host/join`, published for pods on the Docker host's address, with the gates), and serves its sandbox alone. New: `POST /v1/sandboxes/{id}/stop` and `/reset`; the Tenant's `limits.ttl`, `lifecycle.onExpiry`, `lifecycle.stopGrace` and `placement`; idle stop; lifecycle events `sandbox.running`, `.suspended`, `.expired`, `.relaunched`, `.lost`, `.reset` and `.failed`; error codes `placement_refused`, `sandbox_lost` and `sandbox_expired`; `cluster` in `GET /v1/tenant/sandbox`; Host feature `sandbox-pods` (additive, protocol unchanged). Without a cluster, kind `pod` is `409 sandbox_unavailable` (it was 400). Migration `0007_sandbox_pods` adds the pod lifecycle columns to `sandbox_resources`.
+- 926711b: **Sandboxes are a resource (Host feature `sandboxes`).** A sandbox has its own id, a kind, a spec and labels, and outlives the sessions attached to it. Additive: protocol 5 is unchanged.
+
+  - `PUT /v1/sandboxes/{id}` creates a sandbox or finds the one with that id (get-or-create in one call); `GET /v1/sandboxes/{id}`, `GET /v1/sandboxes?label=key=value` (repeatable), `GET /v1/sandboxes/{id}/events` and `DELETE /v1/sandboxes/{id}`. Ids are `/`-separated segments (`team-a/proj-42`), sent percent-encoded as one path segment. Only kind `virtual` runs; `pod` is refused with `sandbox_unavailable`. The spec is resolved against the Tenant's limits and fixed once the sandbox exists; labels can change.
+  - A session attaches with `sandbox: { id }` and shares the sandbox's `/workspace` with every other session attached to it. Turns are serial per sandbox: a second session's turn is refused with `409 sandbox_busy` while another runs. Deleting a session (a sessions reset) only detaches it. Deleting a sandbox is refused while a turn runs in it; afterwards an attached session's next turn is refused with `sandbox_unavailable` until a sandbox with that id exists again.
+  - Subject tokens carry an `sbx` claim: `POST /v1/tokens` takes `sandboxes`, exact ids or prefixes ending in `/*` (at most 16). A token reaches only the sandboxes they match, checked when a session attaches and at every turn start (`403 sandbox_not_granted`); any other sandbox is the 404 of a missing one. The new scope `sandboxes:write` lets a role create and delete the sandboxes its grants reach. Application keys reach every sandbox.
+  - The Tenant holds at most `limits.sandboxes` sandboxes (`PUT /v1/tenant/sandbox`, default 100); one more is `409 limit_exceeded`.
+  - Lifecycle events (`sandbox.created`, `sandbox.attached`, `sandbox.detached`, `sandbox.deleted`) go to the sandbox's own stream in the record, through the record module; the session's log records `sandbox.attached`. The sandbox stream is not relayed to S2.
+  - New error codes `sandbox_not_granted`, `sandbox_busy` and `sandbox_unavailable`; the session view gains `sandboxId` and `sandboxSource: "sandbox"`. Migration `0004_sandbox_resources` adds `sandbox_resources`, `nylorun_streams.sandbox_events` and the sessions' `sandbox_id` column.
+  - `@nylorun/agents`: `client.sandboxes` with `ensure(id, spec)`, `get`, `list({ labels })`, `delete`, `events`, and `forSession({ session, spec })`, which creates a sandbox for one session, opens the session on it, and deletes it with `release()`. It replaces sharing through another session (`sandbox: { session }` and the view's `sandboxOwnerId`, now deprecated). `client.tokens.create` takes `sandboxes`.
+  - `nylorun sandbox ls [--label key=value]... [--json]` and `nylorun sandbox rm <id>` list and delete the running local Tenant's sandboxes.
+
+## 0.11.0-beta
+
+### Minor Changes
+
+- 4b9906f: **Breaking: "Tenant" replaces "stack", and `nylorun start` works anywhere.** Each local installation holds one Tenant, and its name is the Tenant's name, so help, output, errors and docs say Tenant. See MIGRATION.md.
+
+  - **Breaking (`nylorun`): selection.** Every command acts on the Tenant `--tenant <name>` names (replaces `--name`, which is removed), else `NYLORUN_TENANT` (replaces `NYLORUN_STACK`), else the Project link's `tenant`; `start` in a project names a new one after the project directory. Outside a project, or with `start --no-link`, commands act on the Tenant `default`. In a project without a link, commands other than `start` exit 2 and list the machine's Tenants. A name starting with `tn_` (a Tenant id) is refused.
+  - **Breaking (`nylorun`): files.** Host roots are under `~/.nylorun/tenants/<name>/` (was `~/.nylorun/stacks/<name>/`) with `tenant.json` (was `stack.json`); the `.env` key is `NYLORUN_TENANT_NAME` (was `NYLORUN_STACK_NAME`); `NYLORUN_COMPOSE_PROJECT` replaces `NYLORUN_STACK_PROJECT`. Compose projects stay `nylorun-<name>`. Every command first moves 0.4 Host roots from `~/.nylorun/stacks/` to `~/.nylorun/tenants/` (renaming `stack.json` and the `.env` key), so they keep their volumes and keys. `nylorun ls` lists only directories with `tenant.json`.
+  - **Breaking (`nylorun`): removed.** `nylorun legacy` and all handling of the single stack of releases before 0.4; the hidden `nylorun stack <cmd>` alias; `nylorun doctor stack|runtime`. Output says Tenant: `ls` prints `TENANT` and JSON `{ "tenants": [...] }`, `status` prints the Tenant id on its own line, and `doctor`'s row is `tenant`.
+  - **Breaking: Project link format 3.** `.nylorun/link.json` is `{ "format": 3, "tenant", "tenantId", "hostUrl", "hostId" }`; `tenant` replaces `stack`. `@nylorun/agents`, `@nylorun/cli` and `@nylorun/admin` refuse an older link and name `npx nylorun start`, which rewrites it. `@nylorun/core`'s `ProjectLinkFileSchema` parses formats 0–3 with `tenant`.
+  - **Breaking (`@nylorun/admin`):** `createAdmin({ tenant })` replaces `{ stack }`, `tenantHostRoot(name)` replaces `stackHostRoot(name)`, and local resolution reads `NYLORUN_TENANT` and the link's `tenant`.
+  - `@nylorun/cli`: `status` and `endpoints` drop the `stack` line and JSON key; messages say Tenant. `@nylorun/agents`: a Runtime too old for the client says "update the Runtime (npx nylorun@latest start)". `@nylorun/studio`: setup hints say Tenant. `@nylorun/create-agent`: the next steps describe `npx nylorun@beta start` as this project's Tenant and its link.
+
+## 0.10.0-beta
+
+### Major Changes
+
+- 5ca1923: **Clients for one Tenant per installation: a stack per project, nothing selects a Tenant.** Upgrade these with the Runtime; they speak protocol 5. Existing stacks are left as they are: see MIGRATION.md.
+
+  - **Breaking (`nylorun`): one stack per project.** `nylorun start` in a project creates the project's stack (named after the project directory, or `--name`; Host root `~/.nylorun/stacks/<name>/`, Compose project `nylorun-<name>`, its own free ports and volumes), waits for its Runtime to create the stack's Tenant, writes the Project link (`.nylorun/link.json` format 2: `stack`, `hostUrl`, `hostId`, `tenantId`) and `.nylorun/credentials.json` (the key of the derived principal `project`, derived from the stack's admin key), and seeds the model provider from the project's `.env`. `nylorun ls` lists the machine's stacks and `nylorun delete <name>` removes one with its volumes and Host root. `nylorun status` shows the stack's Tenant; `nylorun studio` opens it. The old single stack under `~/.nylorun` is never touched: `start` notes it, and `nylorun legacy stop|delete` handles it. Every stack command takes `--name <stack>` (or `NYLORUN_STACK`, or the Project link's stack); `start --no-link` starts a stack without linking the directory; `nylorun reset` resets the selected stack only. The runtime container's healthcheck is now `/health`, so a Tenant that cannot open is reported by `start` from the Admin status at once instead of after a 300 s wait. `NYLORUN_HOME` still overrides the Host root. Stacks start and stop only when you say so.
+  - **Breaking (`@nylorun/cli`): no Tenant commands.** `nylo tenant create|use|list|current|delete` are removed; `nylo status`, `nylo reset` and `nylo endpoints` replace `nylo tenant status|reset|endpoints` on the linked installation. `nylo env` prints `NYLORUN_RUNTIME_URL` and `NYLORUN_SERVER_KEY` only. `nylo` no longer writes Project links.
+  - **Breaking (`@nylorun/agents`): no Tenant to name.** The `tenant` option (`createClient`, `Transport`, `resolveConnection`, `createActionHandler({ runtime })`, `JwksCache`) and `NYLORUN_TENANT` are gone, and no request sends `Nylorun-Tenant`; a connection is a URL and a key. A Project link of format 0 or 1 is refused with `connection_missing`, naming `npx nylorun start`. `verifyDeliveryToken`'s `tenantId` is optional: without it any Tenant issuer is accepted, since the installation's keys bind it. `TENANT_HEADER` is no longer re-exported.
+  - **Breaking (`@nylorun/admin`): status only.** `createTenant`, `listTenants`, `getTenant` and `deleteTenant` are removed; `status().tenant` names the Host's Tenant, and `deriveTenantKey` / `deriveStudioToken` derive its keys. Local Host resolution reads the stack's Host root (`stack` option, `NYLORUN_STACK`, or the Project link's `stack`); `NYLORUN_HOME` and `home` still override it. `stackHostRoot(name)` is exported.
+  - **Breaking (`@nylorun/studio`): Studio serves its installation's Tenant.** The Tenant picker, list and create are gone, with `/_studio/tenants`; `/` opens `/tenants/<id>`. The `/tenants/:tenant` routes and the login token's `tenant` claim stay for embedders and must name that Tenant. The proxy sends no `Nylorun-Tenant`.
+  - **`@nylorun/create-agent`:** the next steps are `npx nylorun start`, then `npm run dev`.
+  - `@nylorun/core`: `ProjectLinkFileSchema` accepts format 2 with `stack`, and `tenantId` is optional; `ERROR_CODES` loses `tenant_conflict` and `active_work`.
+
+- 5ca1923: **One Tenant per installation: a database per Tenant, protocol 5.** A Runtime serves exactly one Tenant, the one its Postgres database holds. Two Tenants are two installations.
+
+  - **Breaking: fresh start.** The Tenant's state is in the fixed schema `nylorun` of its own database and its record in `nylorun_streams`, keyed by session (no `tenant_id`). A database written by an earlier Runtime (`tenant_<id>` schemas, or a record keyed by Tenant) is refused: the Host stays up but not ready, and `/v1/admin/status` names the cause `database-layout-old`. Point the Runtime at a new database (with the local stack, a new stack); the old one is never changed.
+  - **The Host creates its Tenant** on first start, in the migration transaction: `NYLORUN_TENANT_ID` (default a new id), `NYLORUN_TENANT_NAME` (default `default`), the Studio principal and the derived principals of `NYLORUN_DERIVED_PRINCIPALS` (comma-separated, default `project`), whose keys the admin key derives (`deriveTenantKey`). Later starts open the same Tenant and add derived principals configured since.
+  - **Breaking: no Tenant catalog.** `/v1/admin/tenants` and `/v1/admin/tenants/{tenantId}` are gone (404). `AdminStatus.tenants[]` is replaced by `AdminStatus.tenant` (`id`, `name`, `state: open | unavailable`, `envelope`, and `cause` when it could not be opened). `CreateTenantRequestSchema`, `AdminTenantSchema`, `AdminTenantStatusSchema`, `AdminTenantListSchema` and `QuarantineSchema` leave `@nylorun/core`; `HostTenantSchema` and `TenantCauseSchema` replace them. `@nylorun/admin`'s `listTenants`, `getTenant`, `deleteTenant` and `createTenant` are removed (see below).
+  - **Readiness instead of quarantine.** A Tenant that cannot be opened (`schema-too-new`, `kek-missing`, `migration-failed`, `envelope-invalid`, `database-layout-old`, …) fails `/ready` (check `tenant`, which replaces `discovery`) and is reported with its repair in `/v1/admin/status` and the log; every Tenant request gets the opaque 404. A failure outside it (Postgres unreachable) is retried.
+  - **Protocol 5.** `PROTOCOL_VERSION = 5`; the Host serves protocols 4 and 5 for one release. Clients no longer require `runtime-tenants`; the Host still advertises it. No request needs `Nylorun-Tenant`: a request without it reaches the Host's Tenant, and one naming another Tenant (or a malformed one), or a publishable key of another Tenant, gets the opaque 404. The OpenAPI documents drop the header parameter and the Admin Tenant routes.
+  - **Paths.** The Tenant directory is `<Host root>/tenant/` (was `tenants/<id>/`); `trash/` and the SQLite move to it are gone. The gates service serves its database's Tenant, and its `Nylorun-Tenant` header is optional (when sent, it must name that Tenant).
+  - **Breaking: `startEphemeralRuntime` needs a database; the in-memory Session Store is removed.** `StartEphemeralRuntimeOptions.database` is required: a Postgres URL, for which the Runtime opens a pool and ends it on `close()`, or a pool the caller ends. It creates its Tenant in that database through the same bootstrap as a Host, or serves the Tenant the database already holds; the data stays after `close()`, so give each test Tenant a database of its own. Durable Streams and scheduling stay in process. See `MIGRATION.md`.
+
+### Minor Changes
+
+- fed780d: **Hard caps on model spend.** A Tenant can cap what its model calls use, per turn, per agent per UTC day or month, or for the whole Tenant per day or month, in USD, tokens or both. Before each call the model gate checks the scope's recorded spend, plus its calls in flight, against the cap. Once a cap is reached the call fails with the new `budget_exhausted` code, which is never retried, and the turn fails with `model.budget_exhausted`. A runaway loop stops there, at most one call over its cap.
+
+  - `PUT /v1/tenant/budgets` replaces the budgets and `GET /v1/tenant/budgets` reads them. Both need the application key or `tenant:settings`.
+  - `@nylorun/core` adds `budget_exhausted` to `ModelFailureCode` and `MODEL_FAILURE_CODES`, plus `ModelBudgetSchema`, `PutModelBudgetsRequestSchema` and `ModelBudgetsSchema`. Code that switches over failure codes exhaustively needs the new case.
+  - Custom endpoints are priced at $0, so only a token limit stops them.
+  - Budgets survive a `sessions` reset. A reset of scope `all` clears them.
+
+- fed780d: **Every model call is recorded in the Tenant's usage ledger.** The model gate writes one row per call that answers: the session, turn and agent, the provider and model, the tokens (input, output, cached, cache write, reasoning) and pi-ai's price in USD. Custom endpoints count as $0. A call the gateway ran twice after a restart is recorded twice and flagged as a duplicate, since the provider billed both.
+
+  - `GET /v1/tenant/usage?scope=tenant|agent|turn&id=&period=day|month|total` totals the ledger. It needs the application key or `tenant:settings`, like the other Tenant settings.
+  - `@nylorun/core/contracts` adds `ModelUsageScopeSchema`, `ModelUsageQuerySchema` and `ModelUsageTotalsSchema`.
+  - The ledger survives a `sessions` reset. A reset of scope `all` clears it.
+  - The gateway and the runtime must run the same build, as before.
+
+- 7f4c3f1: **One history: a session's transcript is folded from its record.** The own loop's model-facing transcript is no longer stored on the session row, where up to three copies of it lived (`state`, `turnStartState` and the checkpoint). After each segment that keeps its state, the Runtime records the change as an internal `transcript.updated` event: the new entries, or a snapshot after compaction. Each segment folds the transcript back from the record, and a cancelled or failed turn's entries are undone, as before.
+
+  - **Internal events.** `transcript.updated` is in the event catalog with `visibility: "internal"`. SSE, history, AG-UI and A2A never serve it. Served events can therefore skip the seq numbers internal events hold; cursors resume as before. `TranscriptUpdatedPayloadSchema` is exported from `@nylorun/core/contracts`, and catalog entries may declare `visibility`.
+  - **No checkpoints table.** Every settle used to write a copy of the session's checkpoint to a `checkpoints` table that nothing read; it is gone. The checkpoint a session resumes from stays on the session row.
+  - **Storage.** A long session's row no longer grows with its transcript (a 10-turn, 300-step session on a 16k window: under 16 KB instead of up to 196 KB).
+
+## 0.9.0-beta
+
+### Major Changes
+
+- c121144: **Definitions no longer declare a sandbox.** `.sandbox()` on ReAct and flow agents, and the `sandbox`, `SandboxError`, `SandboxOptions` and `SandboxCapability` exports, are removed. Open the session with one instead, `createSession({ sandbox: { … } })`, or set the Tenant's default; see `MIGRATION.md`.
+
+  - **Build and registration.** A capability that still carries `sandbox` fails the build (`sandbox.in-definition`), and `PUT /v1/agents/:id` refuses such a definition with a `400` that names it. Definitions stored before this release keep their sandbox.
+  - **Trees.** `sandbox.mismatch` and `workflow.sandbox-mismatch` are gone, with the workflow manifest's derived `sandbox`: a tree shares the sandbox its session was opened with.
+  - **Executors.** The action claim reports whether the session has a sandbox (`ActionClaim.sandbox`), and `ctx.sandbox` follows it.
+
+- 9546ac7: **Postgres is the record of every session event; S2 delivers it.** Durable Streams v1.
+
+  - **The record.** Each event is written to `nylorun_streams.session_events` in the transaction that causes it, with the session's log head. The per-Tenant outbox, its relay, its drain in the Tenant sweep and `StreamGapError` are gone: losing S2's data, the relay or its replication slot now costs delay, never events.
+  - **The stream relay.** With S2, every `api` or `all` Runtime process runs the relay; its Postgres replication slot (`nylorun_stream_relay`) lets exactly one be active. It appends with `matchSeq`, acknowledges the slot only after S2 has the events, refills gaps from the record, and reconciles the record with S2 after a new or lost slot. Without S2 (a local development Host), each Tenant relays its own commits.
+  - **Postgres needs logical replication.** The Runtime refuses to start an `api` or `all` process with S2 unless `wal_level = logical` and its role may replicate; the error names the setting. The local stack is configured for it. See `DEPLOYMENT.md`.
+  - **No incarnations.** A session's stream is `sessions/<id>`. A sessions reset moves the Tenant to a new **basin generation**: the old basin gets a `sessions.reset` signal, every process moves its readers, and the old basin is deleted after a grace period. Tenant deletion deletes every generation's basin and the Tenant's record rows.
+  - **Status.** Tenant status `streams` reports `generation` and the Tenant's `relay` instead of the outbox; the Host aggregate reports the process's `relay` (with its slot lag in bytes) instead of `outboxDepth` and `relayLagMs`.
+  - **Session history does not survive the upgrade.** Installs are in beta, so Tenant schema migration 8 is a fresh start for session data: a Tenant with sessions loses them, with their commands, checkpoints, effects, Actions and links, as a sessions reset does, and moves to basin generation 1; its settings, agents, Action endpoints, keys, policy and vaults stay. Clients holding cursors start again.
+
+- 9546ac7: **Protocol 4: every session event is typed, on the `nylorun.event/2` envelope.**
+
+  - **The catalog.** `EVENT_CATALOG` in `@nylorun/core/contracts` lists every event type the Runtime writes, with its payload schema, its schema version and its source. `SessionEventSchema` is their union, discriminated on `type`; `parseSessionEvent` types a known event and returns an unknown one as the bare envelope.
+  - **The envelope.** Events carry `schema`, `seq`, `epoch`, `runId`, `incarnation`, `schemaVersion`, `source`, `evidence`, `visibility`, `retention` and an optional `trace`. `createdAt` is renamed `time`. The envelope is no longer strict, so later fields never break a client.
+  - **Validated writes.** `Tx.event` is typed by the catalog, and both Session Stores check each event against it before it commits (`InvalidEventError`). Workflow `action.pending` payloads may carry `path` and `key`.
+  - **OpenAPI.** Each event type is a component (`MessageAssistantEvent`, …), `SessionEvent` is their union, and the session SSE and history responses refer to them.
+  - **Clients.** `@nylorun/agents` reads events with `parseSessionEvent`, so a newer Runtime's event types reach your code instead of failing the stream. Studio reads `time`.
+
+  See `MIGRATION.md`.
+
+### Minor Changes
+
+- c7614a4: **A2A: serve agents to other agents (v1, gateway mode).** The Runtime answers [A2A](https://a2a-protocol.org) 1.0 over JSON-RPC for the Tenant's agents (optional Host feature `a2a-endpoint`), and the app server publishes them with `createA2aHandler`.
+
+  - **Runtime.** `POST /v1/a2a/agents/:agent` acts for a subject with `sessions:own`. It serves `SendMessage` (blocking up to 5 minutes, or `returnImmediately`), `GetTask` and `CancelTask`. A context is one session per subject, agent and `contextId`, and a task is one turn. A question pauses the task as `TASK_STATE_INPUT_REQUIRED` until the caller replies on the same task. The `messageId` is the idempotency key. `ListTasks`, streaming, push notifications and the extended card answer with their A2A errors, and approvals cannot be answered over A2A yet. `GET /v1/a2a/agents/:agent/card` returns the card built from the manifest, without interfaces. `observeSession` lets in-process readers join a session's shared event feed.
+  - **Agents SDK.** `@nylorun/agents/a2a`: `createA2aHandler({ agents, subject, publicUrl, card })` forwards each partner's JSON-RPC request to the Runtime as that partner's subject, and serves the Agent Card with its own URL, provider and security schemes. It loads no A2A package. `Transport.forward` returns the Runtime's raw response.
+
+- 679c488: **Action endpoints: the Runtime delivers Actions (Host feature `action-endpoints`).** For an agent with a registered endpoint, each tool call, hook and workflow `fn`, `verify` or tool node is POSTed to the endpoint and the answer settles it. Agents without one keep their executors.
+
+  - **The request.** `{ type: "action", action, sandbox }`, with a delivery token in `Nylorun-Signature` (for this Tenant, URL, Action, generation and body) and the Action id as `Idempotency-Key`. Deliveries of one Action never overlap, and at most `maxConcurrent` are in flight per endpoint.
+  - **The answer.**
+    - `200` with `Nylorun-Outcome: 1` is the outcome. A plain `200` is a tool's output, or what an `fn` or `verify` returned; the tool's output schema still applies.
+    - `202` means the result comes later.
+    - `429` and `503` (honouring `Retry-After`), a version mismatch (`409`) and anything that never reached the endpoint are retried, backing off from 250 ms to 30 s. The failure is reported as `action.delivery_failed` at most every 10 s.
+    - Any other `4xx`, or a `3xx` (redirects are not followed), fails the Action with `endpoint.rejected`.
+    - No answer after sending (timeout, reset, `5xx`) loses it: a tool becomes `uncertain`; a hook, `fn` or `verify` is delivered again. A delivery whose deadline passes (a Worker died) is lost the same way, by the Tenant sweep.
+  - **Cancel.** A cancelled turn aborts the request at once. The code may have run, so the Action becomes `uncertain`, as a claimed one does.
+  - **Events and health.** `action.delivered` and `action.delivery_failed` are new events. Endpoint health records successes and failures.
+  - **Ping.** `POST /v1/endpoints/:agentId/ping` sends a signed ping and records what the endpoint serves. It answers `502` when the endpoint doesn't answer.
+  - **Host settings.**
+    - `NYLORUN_ENDPOINT_LOOPBACK=docker-host`: in the local stack, `localhost` means the Docker host.
+    - `NYLORUN_ENDPOINT_PRIVATE` (`allow`/`refuse`): checked on the address actually connected to.
+    - `NYLORUN_ENDPOINT_HTTP` (`allow`/`refuse`).
+  - **Executors unchanged.** Executor results and deliveries record outcomes through one function, so the two paths behave the same.
+
+- c85cd9e: **Action endpoints: register them (nothing is delivered yet).** An application registers, for each agent, the URL that will run its Actions. The Runtime stores the registration and its health; deliveries follow in a later release.
+
+  - **Routes (application key only).**
+    - `PUT /v1/endpoints` registers or updates up to 64 endpoints: `agentId`, `url` (http or https, no credentials or fragment), `implementationVersion`, optional `manifestHash`, `timeoutMs` (default 60 000, at most 840 000) and `maxConcurrent` (default 16).
+    - `GET /v1/endpoints` lists them with their health: last delivery, last success, last error, consecutive failures, and what the last ping reported.
+    - `DELETE /v1/endpoints/:agentId` removes one.
+    - Subjects, subject tokens and executors are refused.
+  - **One path per agent.** Registering an endpoint removes the agent's executor and ends its streams. `PUT /v1/executors` for an agent with an endpoint is `409`, naming the endpoint to remove first.
+  - **Health.** Registering the same URL again keeps an endpoint's health; a new URL starts with none.
+  - **Store.** Postgres migration 5 adds the `endpoints` table and a `deadline_at` column on Actions.
+  - **Core.** Adds `DeleteEndpointResponseSchema`. The endpoint response schemas are strict.
+
+- 4282d5f: **Breaking: executors are removed; protocol 3.** The Runtime delivers every Action (tool, hook, `fn`, `verify`) to the Action endpoint an agent registers. It no longer offers Actions for executors to claim. See `MIGRATION.md`, "Action endpoints replace executors".
+
+  - **Core.** `PROTOCOL_VERSION` is 3 and a Host serves only protocol 3. `action-endpoints` is a protocol feature instead of an optional Host feature. Removed:
+
+    - the executor, claim and Action-list schemas;
+    - `action_result` from `SessionCommandSchema`;
+    - the `claimed` Action status, `claimId` and `leaseExpiresAt`.
+
+    New: `ActionResultReceiptSchema`, the receipt of `POST /v1/actions/:id/result`, which is `AcceptedResponse` without `requestId`.
+
+  - **Runtime.** Removed:
+
+    - `PUT`/`GET /v1/executors`, `DELETE /v1/executors/:agentId`, `GET /v1/executors/connect`;
+    - `GET /v1/actions`, `POST /v1/actions/:id/claim`, and the executor form of `POST /v1/actions/:id/heartbeat`;
+    - the `tenant/work` stream;
+    - claim expiry;
+    - executor credentials.
+
+    `POST /v1/actions/:id/sandbox/:tool` takes the delivery token only. Tenant summaries report `inFlightDeliveries` instead of `connectedExecutors`. Tenant status lists each agent's endpoint and has an `endpoints` check instead of `executors`.
+
+    Postgres migration 6 drops the `executors` table. Actions an executor had claimed are handled like lost deliveries: a tool becomes `uncertain`, and a hook, `fn` or `verify` is delivered again.
+
+  - **Agents.** Removed: `connectAgents`, the `@nylorun/agents/executor` subpath, derived executor keys and `NYLORUN_EXECUTOR_KEY`. Serve agents with `createActionHandler` and call `register({ url })`.
+  - **CLI.** Executor keys are gone from Project credentials. `nylo tenant endpoints` shows each endpoint and its health.
+
+- 82d95ef: **Action endpoints: background tools, CLI and Studio.**
+
+  - **Background tools (core, agents).** `tool({ …, background: true })` marks a tool that runs longer than an endpoint's timeout. The option is code-only and never serialized into the manifest. `createActionHandler` answers its delivery at once with `202`, runs the tool, heartbeats on the deadline the Runtime returns (each time with the newest delivery token), and posts the outcome. A heartbeat answered `409` (cancelled, lost or sent again) aborts the tool's `ctx.signal`, and nothing is posted. The new `waitUntil` option hands the background work to platforms that end a request's work with its response.
+  - **CLI.** `nylo tenant endpoints [--json]` lists each agent's Action endpoint and how it is doing, and `nylo tenant endpoints ping <agent>` pings one through the Runtime.
+  - **Studio.** Shows `action.delivered` ("Action delivered") and `action.delivery_failed` ("Delivery failed", with the endpoint's error and when it retries).
+
+- f48f12f: **Action endpoints: contracts (groundwork, not served yet).** `@nylorun/core` adds the wire shapes for Actions the Runtime will deliver over HTTP to a URL the application registers, in place of executors. No Runtime serves them yet, and the Host does not advertise a feature for them.
+
+  - **Contracts.** `EndpointRegistrationSchema`, `PutEndpointsRequestSchema`, `EndpointSchema` with `EndpointHealthSchema`, `ListEndpointsResponseSchema`, `ActionDeliverySchema` (an Action or a ping), `EndpointPingResponseSchema`, `DeliveryHeartbeatResponseSchema`, and the `action.delivered` and `action.delivery_failed` payload schemas. `Action.status` gains `delivering`, and Actions gain an optional `deadlineAt`.
+  - **Constants.** `DELIVERY_TOKEN_TYPE` (`nylorun-delivery+jwt`), `DELIVERY_TOKEN_MAX_TTL_SECONDS` (900, the subject-token maximum), `ENDPOINT_TIMEOUT_DEFAULT_MS` (60 000), `ENDPOINT_TIMEOUT_MAX_MS` (840 000), `ENDPOINT_MAX_CONCURRENT_DEFAULT` (16), and in `@nylorun/core/compatibility` the headers `SIGNATURE_HEADER` (`Nylorun-Signature`) and `OUTCOME_HEADER` (`Nylorun-Outcome`).
+
+- 50d0fb5: **AG-UI in the Runtime.** The Runtime serves AG-UI itself at `/v1/ag-ui/agents/:agent` (optional Host feature `ag-ui-endpoint`), and pages reach it directly with a subject token. `@nylorun/agents` no longer contains or depends on any AG-UI package.
+
+  - **Runtime.** `POST /v1/ag-ui/agents/:agent` runs (a `RunAgentInput` in, server-sent AG-UI events out); `GET …/threads/:thread/messages`, `GET …/threads/:thread/events` (reattach) and `POST …/threads/:thread/cancel`. For a person named by a subject token (limited to the role's agents) or by subject headers; an application key alone is `400`. A thread's session (`sessionIdFor`, unchanged, so existing threads keep their sessions) is created on its first run with `forwardedProps.nylorun.session` (`vaultIds`, `credentialSelections`, and `info` from app servers only) and never changed afterwards. Limits and a busy session are streamed as `RUN_ERROR`. A stream opened with a token ends at the token's expiry or revocation with `CUSTOM nylorun.stream_closed`. The translation moves here from `@nylorun/agents`, and `@ag-ui/core` becomes a Runtime dependency.
+  - **Agents SDK.** `createAgUiHandler` keeps its options and routes and forwards each request to the Runtime acting for the signed-in person; it now needs a Runtime with `ag-ui-endpoint` (`502 runtime_feature_missing` otherwise). `session()` options apply when a thread's session is created; whatever the browser sends in `forwardedProps.nylorun` is replaced. `@ag-ui/core` is no longer a dependency. `@nylorun/agents/browser` adds `agUi(agentId)`, a `{ url, fetch }` for `HttpAgent` that adds the key and a current token and reattaches a run the Runtime ended at token expiry, so the agent sees one run, and `agUiHistory()`. The transport gains `forward()`, which returns the Runtime's response as it is.
+
+- 50d0fb5: **Browser access: web pages and apps call the Runtime with a publishable key.** A page ships a publishable key and gets subject tokens from its app server; the Runtime answers it directly, with CORS (optional Host feature `browser-access`).
+
+  - **Publishable keys.** `nr_pub_<tenantId>_…`, sent in `Nylorun-Key`, name the Tenant and one app, with an origin allowlist (exact origins, or `http://localhost:*` and `http://127.0.0.1:*` for development; none for native apps). `GET`/`POST /v1/access/publishable-keys`, `PUT`/`DELETE …/:id`. A key alone grants the policy's `anon` role, at most the public agent list, and reaches no session or vault. Postgres migration 4.
+  - **Host.** With browser access on, requests with an `Origin` reach Tenant routes; `/health`, `/ready` and admin routes still refuse them. Preflights for browser routes (agents, sessions, vaults, AG-UI, JWKS) are answered from the route alone and grant no credentials; the actual request must carry a publishable key whose allowlist names the origin, and only then do responses (JSON, errors, `401`, `429`, event streams) carry CORS headers. A disallowed origin or unknown key gets the opaque `404`. Tenant and executor keys sent with an `Origin` are refused before they are looked up. `Nylorun-Tenant` may be left out when `Nylorun-Key` names the Tenant; both must agree when both are sent. Browser access is on in the stack (`NYLORUN_BROWSER_ACCESS=off` turns it off) and off for a Host started from `host.json` unless `browserAccess` is true.
+  - **JWKS.** `GET /v1/access/jwks` is readable by any caller that reaches the Tenant.
+  - **Agents SDK.** `@nylorun/agents/browser`: `createBrowserClient({ url, publishableKey, token })` keeps subject tokens in memory, refreshes them a minute before expiry or after `401 token_expired`, one fetch at a time, and creates sessions and vaults owned by the token's subject; it loads no Node module. `createTokenEndpoint()` is the app server's token route. `client.access.publishableKeys` manages keys. The transport accepts a `token` source and a `publishableKey`, and event streams the Runtime ends at token expiry reconnect at once. The Tenant API client classes move to a module with no Node imports; `@nylorun/agents` and `/client` export the same names.
+  - **CLI.** `nylo access keys list|create|set-origins|revoke`.
+
+- 6ab4c59: **Long sessions on any model: compaction.** A session whose history outgrows the model's context window keeps going, on a 16k local model as on a 1M hosted one.
+
+  - **Compaction.**
+    - **When.** Before each model call the engine estimates the prompt: the last reported usage, plus about four characters per token for what came after. If the estimate would not leave room for the reply, the engine first compacts: it asks the model to summarize the older history, then keeps about the newest 20,000 tokens (at most 30% of the window) verbatim.
+    - **What it keeps.** The cut never separates a tool call from its result. The current turn's request is always kept. A later compaction merges with the earlier summary.
+    - **Overflow.** If a provider still reports a context overflow, the engine compacts once and asks again.
+    - **Storage.** The summary is a `compaction` transcript entry that replaces the older entries in the session state; the event log keeps the full history. The summary call is a journaled model effect, so replays are deterministic.
+    - **New event.** `context.compacted` (`trigger`, `tokensBefore`, `tokensAfter`).
+  - **Custom endpoints.**
+    - **Settings.** Model Settings take `settings: { contextWindow, maxTokens, reasoning, compat }` for a custom OpenAI-compatible provider (vLLM, SGLang, llama.cpp, Ollama, LM Studio). `compat` is passed to pi-ai: `thinkingFormat`, `thinkingTokenBudgetField`, `chatTemplateKwargs` and the rest.
+    - **Defaults.** Without settings, a custom endpoint is assumed to have a 32k window and an 8k output limit. They used to be 128k and 16k.
+    - **Where to set them.** `nylo configure` asks for the window and output limit. Studio's Model Settings shows all four fields.
+  - **Storage.**
+    - Model effects no longer journal the model request next to the call, so each call's prompt is stored once.
+    - When a turn ends, its model effects are slimmed to their identity and status; the transcript holds the answers.
+    - Session storage now grows with the window, not with the square of the session's length.
+  - **Core.**
+    - `TranscriptEntry` adds `compaction` (`TranscriptCompactionEntry`).
+    - `ModelAdapterContext.compaction` marks a summary call.
+    - `CustomModelSettings` / `CustomModelSettingsSchema` describe the custom endpoint settings.
+
+- 6ab4c59: **Model calls don't strand sessions.** A model provider failure is now a known outcome, not a lost call. The Runtime retries what can be retried, and otherwise fails the turn with `model.<code>`, so the session accepts the next message instead of sitting `uncertain` until it is cancelled.
+
+  - **Runtime.**
+
+    - **Upgrade.** The model adapter moves to pi-ai 0.99.1 and always streams.
+    - **Per-call settings.**
+      - Every call carries the session id, so OpenAI and other providers reuse the prompt cache and route to the same backend.
+      - Provider auth no longer reads the process environment.
+      - Rate limits, overloads, timeouts and transient errors are retried: 3 attempts with backoff, honouring `Retry-After`.
+      - A stream that produces nothing for 300 s is aborted and retried. `TenantConfig.modelCall` sets attempts, backoff, the idle timeout and the request timeout.
+    - **Failures.** Anything else fails the turn with one of these codes:
+
+      - `model.context_overflow`, `model.rate_limited`, `model.overloaded`, `model.timeout`, `model.transient`
+      - `model.content_policy`, `model.auth` (whose message says where to fix the credential)
+      - `model.invalid_request`, `model.invalid_output`
+
+      Only a call whose outcome was lost, such as a Worker dying mid-call, is still `uncertain`.
+
+    - **Structured output.** A structured final answer is repaired (control characters, a Markdown code fence) before it is parsed.
+    - **Model history.** Replayed history keeps the model that produced each message, so a model switch no longer sends one model's signatures or tool-call ids to another. Reasoning from OpenAI-compatible servers (`reasoning_content`, `reasoning`) is sent back only within the turn that produced it.
+
+  - **Events.**
+    - `message.assistant` adds `model` (`provider`, `model`), `finishReason` and `usage`.
+    - A new `model.failed` transcript event (`code`, `message`, `retryable`) is written instead of `message.assistant` when a call fails.
+  - **Core and harness.**
+    - New types and helpers: `ModelFailureOutcome`, `ModelFailureCode`, `MODEL_FAILURE_CODES`, `isModelFailureOutcome`, `ModelProducer`.
+    - `PromptItem` assistant messages may carry `producer`.
+    - `ModelUsage` adds `cacheWriteTokens`.
+    - A model adapter may return a failure outcome.
+    - The durable engine version is `hosted-3`: a turn that is running when the Runtime is upgraded fails once with `execution.incompatible`, and the next message works.
+  - **CLI.**
+    - `nylo configure` passes a stable installation id to OAuth logins that need one (OpenAI "Sign in with ChatGPT"), stored as `cli-installation-id` in the Host root.
+    - A custom OpenAI-compatible provider now prompts for its API key instead of failing.
+
+- 2ab8ed1: **Schemas for every Runtime answer.** `@nylorun/core/contracts` now has a Zod schema for each successful response of the Tenant and Admin APIs that lacked one, so clients can validate what they receive and the Runtime's OpenAPI document can be generated from them.
+
+  - **Agents:** `ListAgentsResponseSchema` (`AgentDefinitionViewSchema`), `ListPublicAgentsResponseSchema` (`PublicAgentSchema`) and `PutAgentResponseSchema`.
+  - **Sessions:** `ListSessionsResponseSchema` (`SessionSummarySchema`, `SESSION_STATUSES`) and `SessionViewSchema`.
+  - **Executors and actions:** `ListActionsResponseSchema`, `ActionHeartbeatResponseSchema`, `DeleteExecutorResponseSchema` and `SandboxToolOutcomeSchema`.
+  - **Tenant settings:** `ResetTenantResponseSchema`, `HostModelCatalogSchema`, `ListProvidersResponseSchema` (`HostModelProviderInfoSchema`), and `TenantSandboxViewSchema` with `EffectiveSandboxConfigSchema` (the configuration with defaults applied, sizes in MiB).
+  - **Vaults:** `VaultInfoSchema`, `CredentialInfoSchema`, `ListVaultsResponseSchema`, `ListCredentialsResponseSchema` and `DeletedResponseSchema`. `VaultInfo`, `CredentialInfo` and `HostModelProviderInfo` are now inferred from their schemas; their fields are no longer `readonly`.
+  - **Access:** `AccessPolicyResponseSchema` and `ListPublishableKeysResponseSchema`.
+  - **Admin:** `AdminTenantListSchema` and `HostShutdownResponseSchema`.
+  - **Streams:** `StreamClosedFrameSchema` (the `nylorun.closed` frame) and `AgUiRunErrorCodeSchema` (codes of an AG-UI `RUN_ERROR`, which add `session_busy` and `runtime_error`).
+
+  `ERROR_CODES` gains `request_rejected`, `invalid_request`, `subject_required` and `internal_error`, codes the Runtime already sends. `RejectedResponseSchema` now accepts every rejection the Runtime makes. An exhaustive `switch` over `ErrorCode` needs the new cases.
+
+- c121144: **Choose a session's sandbox when you open it.** `createSession({ sandbox })` (`PutSessionRequest.sandbox`) now takes `false`, `{ session }` to share, or an inline sandbox: `image`, `network.allow` and `resources`. Omit it for the Tenant's default. The agent definition needs no `.sandbox()`: the Runtime resolves the request against the Tenant's limits, pins it on the session and adds the six sandbox tools to that session only (capability `nylorun.sandbox`). The registered definition is unchanged.
+
+  - **Tenant configuration.** `GET /v1/tenant/sandbox` adds `config`; `PUT /v1/tenant/sandbox` sets `default` (`none`, `virtual` or an inline sandbox) and `limits` (`network` ceiling, `resources` maximum, `defaultResources`, `idle`). Unset, a Tenant's default is `none` and its ceiling is the package registries and code hosts of today's `dev` preset. `SeedTenantConfigRequest.sandbox.config` seeds it.
+  - **Checks at open.** A request outside the limits is a `400` that lists every problem. An inline sandbox from a caller acting for a subject is a `403`; such callers get the Tenant default or `false`. An `image` is refused: the virtual sandbox has no images. The sandbox is fixed for the session's life: a different one on a later `PUT` is a `409`.
+  - **Trees inherit.** The agent sessions of a flow agent, the agents a session uses as tools, and sessions attached with `{ session }` use the sandbox the session was opened with, and get its tools.
+  - **Compatible.** An agent that declares `.sandbox()` keeps working as before; opening its session with a `sandbox` value is a `400` that says to remove `.sandbox()` from the agent.
+
+- 9d52189: **Studio embedding contract.** `@nylorun/core/contracts` defines the contract between Studio and an app that embeds it in an iframe, and `@nylorun/agents/studio-embed` re-exports it for Studio's web app and embedders such as Babai Desktop.
+
+  - `StudioEmbedMessageSchema`: every `postMessage` between the two, on the envelope `{ type: "nylorun.studio", protocol, kind }`. Kinds: `ready`, `init`, `token.refresh`, `theme.changed`, `navigate`, `session`, `token.expiring`, `route.changed`, `open.external`, `open.babai`, `error`. `STUDIO_EMBED_PROTOCOLS` is `[1]`.
+  - `StudioLoginTokenRequestSchema` and `StudioLoginTokenResponseSchema` for `POST /_studio/login-tokens` (now with optional `tenant` and `subject`), and `StudioSessionRequestSchema` and `StudioSessionResponseSchema` for `POST /_studio/sessions`.
+  - `parseFrameAncestors` and `isFrameAncestor` validate `NYLORUN_STUDIO_FRAME_ANCESTORS`: exact origins only, no wildcards, keywords, scheme-only entries or paths.
+
+- 50d0fb5: **Subject tokens: a person's own credential for the Runtime.** An app server mints a short-lived token for one signed-in person, and their app calls the Runtime directly (optional Host feature `subject-tokens`). Requests with application keys and subject headers are unchanged.
+
+  - **Runtime.** `POST /v1/tokens` (application key only) mints an ES256 JWT for a subject and a role, valid 60–900 seconds. The Tenant API accepts it as a bearer and resolves its scopes and agents from the role on every request. Forged, foreign or malformed tokens get the opaque `404`; an expired token, a revoked subject, a revoked key or a removed role gets `401 token_expired` with `WWW-Authenticate`. Tokens carry only `agents:read`, `sessions:own` and `vaults:own`; they may not set session `info`, send `message.manifest` or store OAuth refresh credentials, and `GET /v1/agents` shows them `{ agentId, name, description }` of their role's agents only.
+  - **Access policy.** `GET`/`PUT /v1/access/policy`: roles with token scopes, an agent allowlist and limits (`turnsPerHour`, `concurrentTurns`, answered with `429 limit_exceeded` and `Retry-After`). Without roles nothing is minted.
+  - **Signing keys.** Per Tenant, the private key sealed with the vault KEK: `GET /v1/access/signing-keys`, `POST …/rotate` (refused while the previous key may still verify live tokens; `force` for incidents), `POST …/:kid/revoke`, `GET /v1/access/jwks`. A Tenant with signing keys and no KEK is quarantined `kek-missing`.
+  - **Revocation.** `POST /v1/access/revocations` ends a subject's tokens; their open event streams end with `event: nylorun.closed` on every process. A stream opened with a token also ends when the token expires.
+  - Postgres migration 3 adds `signing_keys`, `subject_epochs`, `subject_usage` and an index on the session owner and status. New error codes `token_expired` and `limit_exceeded`.
+  - **Agents SDK.** `client.tokens.create()`, `client.access.getPolicy()`/`putPolicy()`/`revokeSubject()`/`jwks()` and `client.access.signingKeys.list()`/`rotate()`/`revoke()`, each checking the Host feature first.
+  - **CLI.** `nylo access policy get|set|init`, `nylo access signing-keys list|rotate|revoke`, `nylo access revoke <subject>` and `nylo access token` for trying the API.
+
+### Patch Changes
+
+- 18468d9: **Tenant routes start moving to Hono.** The executor and Action routes and session commands (`/v1/executors/connect`, `/v1/actions/**`, `/v1/executors`, `/v1/executors/:agentId` and `POST /v1/sessions/:id/commands`) are declared as Hono routes (`api/http/routes/executors.ts`). Each says who may call it: its credentials, subject scopes and browser access. The Runtime's OpenAPI document shows this, and the executor routes are marked deprecated there, since Action endpoints replace them. Answers are unchanged. A path the new routes don't match exactly still goes to the router they replace, so its answer is unchanged too.
+
+  **Core:** the recursive contract schemas (JSON values, workflow nodes and manifests, and an agent used as a tool) carry a Zod `id`, so documents generated from them refer back to the named schema instead of recursing. Parsing is unchanged.
+
+## 0.8.0-beta
+
+### Minor Changes
+
+- e537a82: **One `Agent` builder: named methods and flow agents.** Every capability has its own method, and deterministic workflows are written on the same builder. ReAct agent manifests are unchanged: the new syntax compiles to exactly what the old syntax produced.
+
+  - ReAct agents: `.instructions()`, `.tools()`, `.subagents()`, `.mcp()` (a server's `name` defaults to its key; calls merge), `.skills()`, `.plugin()`, `.capability()`, `.sandbox()`, `.beforeTurn()`, `.beforeModel()`, `.afterModel()`, `.afterTurn()`, `.output()`. `capability({ id })` returns a builder with the same methods.
+  - Flow agents: `.step()`, `.switch({ ...cases, default }, { on })`, `.parallel()`, `.map()` (runs over its input), `.loop(body, { verify, max | decide })`, plus `.input()`, `.output()`, `.sandbox()`, `flow()` for nested sequences and `.withId()`. Functions receive `{ input, results, flowInput }`, typed from each step's output schema. A flow agent compiles to a workflow manifest (v2, see the flow-manifest-v2 changeset).
+  - Build diagnostics: `agent.mixed-body`, `flow.no-model`, `agent.single-value`, `flow.empty`, `loop.max-required`, `loop.invalid-max`, `mcp.duplicate-server`, `delegation.flow-unsupported`.
+  - `sandbox()` and `mcp()` move to `@nylorun/core/define` (still exported from `@nylorun/agents`).
+  - Deprecated, warning once each: options-form `instructions`/`tools`/`outputSchema` (`NYLORUN_DEP_AGENT_OPTIONS`), `.use(capability)` (`NYLORUN_DEP_USE`), `.before()`/`.after()` (`NYLORUN_DEP_HOOKS`), and `capability({ tools, instructions, … })` (`NYLORUN_DEP_CAPABILITY_OPTIONS`). See MIGRATION.md.
+
+- 5278b4e: **Flow agents on workflow manifest v2.** A flow agent compiles to `workflowSchemaVersion: 2` and runs on the new `flow-2` engine; v1 workflows (`Chain`, `Switch`, `Parallel`, `Map`, `Loop`) keep running on `flow-1`, so in-flight runs finish as they began.
+
+  - **Manifest (core).** Any node may carry `id` and `input`; there are no slots. `chain` and `parallel` are bare collections, a Map is `{ map: { each } }` over its input, and a Loop has `max?` and `decide?`. The header adds `name`, `description`, `metadata`, `inputSchema` and `outputSchema`, and `agents` embeds every agent the flow runs, so one manifest hash covers the whole flow. `Agent.from(json, { nodes, agents })` rebuilds a flow agent. Path and key helpers (`leafPath`, `stageKey`, `forEachFlowNode`, `embeddedAgent`, …) are exported from `@nylorun/core/define`.
+  - **Paths (harness).** Linked agent sessions are named by the agent: its id, `[i]` per Map item, and a nested flow agent's id in front. Control stages add nothing, so wrapping a step in a Loop keeps its session. Functions are bound under stage keys (`route:on`, `@1.default.1:input`) and all receive `{ input, results, flowInput }`; `flowInput` works inside nested `flow()`. A Loop without `decide` retries with the verifier's feedback up to `max` and then fails with `loop.exhausted`. Nested flow agents run inline.
+  - **Runtime.** Leaves of a v2 workflow resolve from its embedded `agents` (with the workflow's plugin roots, keyed `<agent>/<capability>`) instead of the registry. `loop.iteration` is emitted only for a Loop's own agent turns.
+  - **Agents SDK.** `saveAgent(flowAgent)` PUTs one document; application mode registers the flow's executor with its manifest hash. An executor leaves `fn`, `verify` and tool actions of a v2 flow unclaimed when they belong to another manifest hash, because stage keys can shift between deploys; it reports each skipped action once through `onError`.
+  - **Studio.** Draws v2 manifests: agents and tools at their session paths, control stages at their stage keys, nested flow agents inline, and lights a Map's agent from its item sessions.
+  - Build diagnostics: `flow.duplicate-leaf`, `flow.duplicate-id`, `flow.agent-conflict`, `flow.v1-workflow`, `loop.invalid-verify`, `workflow.flow-agent-child`. Also fixes v1 flows passing an agent step's output to the next step still wrapped in the runtime's turn marker.
+
+- 426fd27: **Flow agents as subagents.** `.subagents(flowAgent)` lets a ReAct agent delegate to a flow agent. The flow's workflow manifest v2 is inlined in the delegating tool (`ToolManifest.agent` may be a workflow manifest), so it is saved with the parent and served by the parent's executor, plugin roots included (`<flow>/<agent>/<capability>`).
+
+  - **Engine (harness).** A call to a flow subagent is one durable `agent` effect (`role: "delegate"`) between the delegation's start and settle points; the flow's output is the tool result, and a failed flow is a failed tool result. Local `run()` refuses flow subagents, which need the Runtime.
+  - **Runtime.** The effect starts a linked flow session from the parent's pinned manifest, fresh per call, and settles when the flow's turn ends. Cancelling any session now cascades to the linked sessions it started, not only a workflow's.
+  - **Core.** `delegation.flow-unsupported` now only reports a workflow built with `Chain`, `Switch`, `Parallel`, `Map` or `Loop`. New helpers: `flowDelegatesOf`, `flowDelegateManifest`, `isFlowDelegate`; `delegatesOf` lists only the ReAct agents run in-process.
+
+### Patch Changes
+
+- 8cda500: **Workflow functions and tool steps reach the executor.** Several workflow nodes asked the executor for a key that core never registered, so the executor never found the function and the turn waited forever.
+
+  - A Map's `over` and a slot's `input` now use the keys core registers (`<path>/over`, `<path>/input`), as Switch's `on` already did.
+  - A slot `input` that wraps a Map or Switch gets its own effect id, so it no longer collides with the `over` or `on` effect on the same path.
+  - A slot `id` that renames a nested workflow now renames the keys inside it too.
+  - A verifier slot's `input` is keyed under the verifier's path (`<loop>/<part>/input`).
+  - A tool step passes its output to the next step, not the `{ kind: "completed", output }` outcome around it. A denied tool call fails the flow with `tool.denied`.
+
+## 0.7.0-beta
+
+### Minor Changes
+
+- a322696: **Derived principals** (optional Host feature `derived-principals`): a client that holds the admin key no longer needs to store an application key.
+
+  - `admin.createTenant({ name, principals: ["babai"] })` registers each named principal by the hash of its derived key, and `admin.deriveTenantKey(tenantId, principalId)` (or `deriveTenantKey(adminKey, tenantId, principalId)`) recomputes the key when needed.
+  - `POST /v1/admin/tenants` accepts `derivedPrincipals: [{ id, credentialHash }]`. Ids match `^[a-z][a-z0-9-]{0,31}$` and `studio` is reserved; duplicate ids or credentials answer `400`. A retried create must name the same principals.
+  - `createTenant` with `principals` throws `incompatible_host` before sending anything to a Host without the feature.
+
+- 844bff3: **Act for a person: `Nylorun-Subject` and `Nylorun-Scopes`.** An app server that holds the Tenant key can name the person each request is for, and the Runtime enforces it (optional Host feature `subject-headers`).
+
+  - `client.as(subject, { scopes })` in `@nylorun/agents` sends both headers on every call, event streams included. Scopes: `agents:read`, `agents:write`, `sessions:own`, `vaults:own`, `tenant:settings`; default `["sessions:own"]`.
+  - The Runtime limits a subject to the routes its scopes allow (`403 scope_required`) and to its own sessions and vaults: another owner's session, vault or sandbox is the same `404` as a missing one, including `PUT` on its session id (was `409`). Reset, config seed, executors, actions and the sandbox tool routes are open to no subject. Only application keys may send the headers.
+  - The AG-UI handler calls the Runtime as each person and requires `subject-headers`; new optional `scopes` option. The host's `session()` parameters can no longer replace a session's id, agent or owner.
+  - Core exports `SUBJECT_HEADER`, `SCOPES_HEADER`, `SUBJECT_SCOPES` and `parseSubjectHeaders`. Postgres Tenant schemas migrate to version 2 (an indexed session owner column).
+
+  Requests without `Nylorun-Subject` are unchanged.
+
+- a322696: **The session log now carries what a chat UI shows** (optional Host feature `transcript-events`).
+
+  - `message.assistant` for each completed model step: `{ invocationId, text, toolCalls: [{ callId, name, input }], agent? }`.
+  - `tool.completed` for an MCP or sandbox tool: `{ invocationId, callId, capabilityId, toolName, output }`, or `error: { code, message }` for a tool error.
+  - Tool `action.pending` and `action.completed` events, and `delegation.started` / `delegation.completed`, carry the model's `callId` (and `invocationId` on actions).
+  - Events are written in the transaction that completes the effect, so a replay writes none.
+  - `@nylorun/core/contracts` adds payload schemas and `parseTranscriptEvent(event)`; `LiveEvent.payload` stays `unknown`.
+
+  Fix: a tool with both `approval` and an `output` schema now pauses for approval. The Runtime validated its `interaction-required` result against the output schema and failed the tool with `tool.invalid-output`; `denied`, `interaction-required` and `deferred` results are no longer validated.
+
+## 0.6.0-beta
+
+### Minor Changes
+
+- bf1c2da: **`nylorun dev --ephemeral` runs on the Docker stack, with a Tenant-level fixture model (breaking beta).**
+
+  - `nylorun dev --ephemeral` creates a temporary Tenant through `@nylorun/admin` (no Project link written), seeds it from `.env` with the fixture model, opens Studio on it and runs the watcher; the Tenant is deleted with its active work cancelled when the watcher ends, Ctrl-C included. It needs a Runtime that advertises `tenant-fixture-model`.
+  - `PUT /v1/tenant/config/seed` accepts `fixtureModel: true`, stored as Tenant setting `model.fixture`: that Tenant's model calls use the Runtime's fixture model while other Tenants on the Host keep theirs. `HOST_PROTOCOL` advertises the new optional feature `tenant-fixture-model` (`OPTIONAL_HOST_FEATURES` in `@nylorun/core/compatibility`); clients do not require it.
+  - `startEphemeralRuntime()` keeps its signature but its Tenants live in memory instead of SQLite under the Host root; nothing survives `close()`.
+  - Closing a Tenant waits for running advances at most the advance grace period (30 s by default) and then abandons them; their lease lapses and the next advance takes over.
+  - A Worker stop, Tenant close or ended Restate attempt no longer fails or cancels the turn it interrupts: outcomes already returned are recorded, nothing is settled, and the next advance resumes the turn from its checkpoint. Only a user cancel settles `cancelled`; an advance deadline fails the turn with the deadline's message.
+
+- bf1c2da: **The microsandbox backend is removed; the Runtime runs sandbox tools on the virtual backend only.** The optional `microsandbox` dependency is gone. `sandbox.backend` and `NYLORUN_SANDBOX` accept `auto` or `virtual`, and `auto` selects `virtual`. A Tenant that stored `microsandbox` reads it as `auto`. `nylorun doctor sandbox` and the `nylorun dev` banner report only the virtual shell.
+- bf1c2da: **Tenants are Postgres schemas only; SQLite and the `nylorun-runtime` launcher are removed (breaking beta).**
+
+  - The Runtime runs on Postgres (the Session Store, one schema per Tenant), Restate (Durable Session Execution: one advance per session, fenced by an ownership epoch, and a per-Tenant sweep) and S2 (Durable Streams: every event is written to a Postgres outbox and relayed to the session's stream, which history and SSE read). `--role api|worker|all` selects the process role; `/ready` covers Postgres, Restate and S2.
+  - SQLite Tenants are not migrated. On first start the Runtime moves every `tenants/<id>/` directory that holds a `tenant.sqlite` to `trash/<id>-sqlite-<time>/` and logs `sqlite_tenant_moved_to_trash`; recreate those Tenants.
+  - `@nylorun/runtime` has no bin: the `nylorun-runtime` launcher and `host-state.json` are gone. The Runtime runs as the `ghcr.io/nylorun/runtime` image (`nylorun start`); its Host entry requires `NYLORUN_DATABASE_URL`.
+  - `openTenantRuntime(config, hooks)` requires the Tenant's opened `store` and `envelope`; `OpenTenantRuntime` receives them from the Tenant store. `HostStateFile` is no longer exported.
+  - `@nylorun/core`: `LAUNCHER_PROTOCOL` and the launcher error codes are removed; `QuarantineSchema` drops `locked`, `lockPath` and `lockPid`; `TenantStatusSchema.checks.sqlite` is now `checks.store`. `TenantStatusSchema` gains optional `execution` (stuck invocations) and `streams` (basin, outbox depth, relay lag); `HostAggregateSchema` gains optional `outboxDepth` and `relayLagMs`.
+
+- bf1c2da: **Tenants can register a Studio principal.** `CreateTenantRequest` gains optional `studioCredentialHash` behind the new protocol feature `studio-principal`; the Runtime stores it as application principal `studio`, and idempotent create compares it too. `@nylorun/admin` exports `deriveStudioToken(adminKey, tenantId)` (HMAC-SHA256 over `nylorun/studio/v1`, NUL, Tenant id) and `createTenant` sends the hash of that key, so Studio can reach any Tenant's API with a key derived from the admin key. Clients require the new feature, so upgrade the Runtime with them.
+
+### Patch Changes
+
+- ba1b239: **`nylorun` sets up the local stack; `@nylorun/cli` becomes the Runtime client `nylo` (breaking beta).**
+
+  - New unscoped package **`nylorun`**: `npx nylorun up` sets up the Docker stack on the first run and starts it after that, from any directory; `npx nylorun down` stops it (volumes are kept). `up` and `down` are aliases of `start` and `stop`. It also owns `status`, `logs`, `studio`, `reset` and `doctor`, pins the Runtime and Studio images (`package.json` `nylorun.runtime` / `nylorun.studio`), depends on `@nylorun/core` only, and never creates Tenants.
+  - **`@nylorun/cli`** is the Runtime client with the command **`nylo`**: `nylo tenant create [name]` (creates the Tenant; in a project, writes the Project link and seeds the model provider and sandbox from `.env`), `nylo tenant current|list|use|status|reset|delete`, `nylo configure`, `nylo env` (was `nylorun status --env`) and `nylo doctor sandbox`. It no longer provides the `nylorun` command or the stack commands.
+  - **Removed:** `nylorun dev` and `nylorun dev --ephemeral`. Link once with `nylo tenant create`, then run the project's own `npm run dev`. Moved commands exit 2 and name their replacement.
+  - **Starter:** the generated project depends on `@nylorun/agents` only (no Nylorun devDependency); `dev` is `tsx watch --env-file-if-exists=.env src/main.ts`. `npm create @nylorun/agent` installs the project and prints the next steps (`npx nylorun up`, `npx @nylorun/cli tenant create`, `npm run dev`) instead of starting development; `--no-open` is accepted and ignored.
+  - `connectAgents` names those steps when it finds no Runtime connection. Runtime repair hints, model errors and core's sandbox message name `nylo` and `nylorun up`.
+
+## 0.5.0-beta
+
+### Minor Changes
+
+- c49efed: **Runtime Clients and Admin API (supporting packages).**
+
+  - **core:** `AdminStatusSchema`, Project-link schemas, `ERROR_CODES` (launcher codes include `platform_unsupported`, `launcher_failed`, `downgrade_refused`), `admin-status` feature, `newPrincipalId`, `compareVersions`.
+  - **runtime:** `/v1/admin/status` (alias `/v1/admin/host`), loopback/`Origin`/content-type checks; the launcher ships as this package's `nylorun-runtime` bin (source under `src/launcher/`, not in `exports`) and runs the Host on the Node it runs on.
+  - **studio:** `nylorun-studio` binary; connects via `resolveConnection`; waits for `dev`; never calls Admin API or writes `.nylorun/`.
+
+  **Prerequisites:** developers install Node 24+ and `@nylorun/runtime` (`npm install --global @nylorun/runtime`) themselves; no package downloads Node or the Runtime, and there are no per-platform Runtime packages. Launcher commands: `version`, `up`, `down`, `restart`, `run`, `status`, `logs` (launcher protocol 1).
+
+- c49efed: **Breaking (pre-1.0 minor):** Replace a single SQLite Runtime per Project or home directory with a **Runtime Host** that serves isolated **Tenants**, selected by `Nylorun-Tenant` and negotiated with `Nylorun-Protocol` (protocol `2`, feature `runtime-tenants`). Vocabulary: Host root + Tenant + Project link.
+
+  - **core:** `PROTOCOL_VERSION = 2`, `HOST_PROTOCOL`, `TENANT_HEADER`, `PROTOCOL_HEADER`, `newTenantId` / `isTenantId`, `checkCompatibility`; health schema gains `hostId` + `protocol` (`service: "nylorun-runtime"`); Tenant/admin wire schemas; Tenant model routes under `/v1/tenant/*`.
+  - **runtime:** Host process + Tenant module; Tenant model routes under `/v1/tenant/*`; `startEphemeralRuntime` for tests/embeds; executors via `PUT /v1/executors`; sandbox prefix `nylorun-<tenant-id>-`.
+  - **agents:** `createClient({ url, key, tenant })`; Transport sends Tenant + protocol headers; `/health` compatibility cache; `IncompatibleRuntimeError` with upgrade remedies.
+  - **cli:** Host root lifecycle (`runtime up|down|status|logs|restart|run`); Project link (`.nylorun/link.json` + `credentials.json`); `tenant` commands; `runtime status --env` exports `NYLORUN_RUNTIME_URL`, `NYLORUN_SERVER_KEY`, `NYLORUN_TENANT`; removed Project/home SQLite selectors.
+  - **studio:** `startStudio({ …, tenant: { id, name } })`; proxy forwards Tenant + protocol headers; UI shows Tenant name/short id.
+
+- fd9fd87: Add workflows: compose agents and `tool()` with `Chain`, `Switch`, `Parallel`, `Map`, and `Loop`. A workflow is a registered runnable (`kind: "workflow"`) with the same session API as an agent — `export const agents`, `saveAgent` (saves referenced agents first), `createSession`, `input` (`content` or `data`), `observe({ follow })`, `pending`, `approve`, `cancel`. Slots (`{ run, id?, input? }`) reshape data between nodes. The flow engine (`runFlowDurable`) returns effects only; `harness/src/loop/` and `runDurable` are unchanged.
+
+  HostEffect gains flow kinds `agent`, `tool` (node), `fn`, and `verify`, each with `path`, `key`, and `iterations`. The Runtime drives agent nodes through the public session contract (linked sessions, shared sandbox via `PutSession.sandbox`), offers `fn` / `verify` again on lease expiry, and routes executor Actions by `(workflowId, key)` with claim-scoped `ctx.sandbox`. Optional `message.manifest` is a turn-only variant of the session pin (turn manifests). Studio shows the manifest tree, live node status, and session links. Examples under `examples/agents/{chain,switch,parallel,map,loop,ship-feature}/`.
+
+## 0.4.0-beta
+
+### Minor Changes
+
+- 1cd7dc7: Add subagents: put an agent in another agent's `tools` (`Agent({ tools: [lookupOrder, researcher] })` or `.use({ tools: [researcher] })`) and the model can delegate to it. The tool is named after the agent's id, takes `{ task: string }`, and its description is the agent's `description`, which is now required for an agent used as a tool. The engine runs the child inside the parent's turn as a durable branch: fresh context, its own tools and hooks served by the root agent's executor, its own MCP servers, the session's sandbox, and only its final output (or `outputSchema` result) returned. Empty output, failures (with partial output marked as evidence), and requests for input or approval inside a child reach the parent as failed tool results. Parallel delegation calls run concurrently, completed child work is never re-run on replay, and cancelling the session cancels every child.
+
+  v1 is one level deep and non-interactive. Nested delegation, child tools that declare `approval`, and differing sandboxes across the tree fail the build with a named diagnostic. The manifest adds an optional `agent` body on a tool (schema version unchanged), actions and effects carry `agent: { id, path, delegationId }`, tool context gains `ctx.agent`, the durable host resolves a new `delegation` effect kind, and the Runtime emits `delegation.started` / `delegation.completed` events and filters history with `?agent=` (`session.history({ agent })`). Studio shows delegations, labels child actions with their agent, and filters events by agent.
+
+## 0.3.0-beta
+
+### Minor Changes
+
+- b8d822a: Studio Model Settings lists multiple vault-stored providers, adds credentials through a sheet, and switches the active provider/model via Runtime host vault APIs.
+- b8d822a: Let a running Runtime learn its executors instead of receiving them all at startup.
+  `PUT /v1/executors` registers or rotates scoped executor credentials with the application
+  credential, `DELETE /v1/executors/:agentId` removes one, and `GET /v1/executors` lists them
+  without disclosing secrets. Registrations persist in SQLite with the token hashed at rest and
+  are restored on the next start; scopes supplied through `NYLORUN_EXECUTORS_JSON` still apply
+  to that process, take precedence for their agent, and are never written to the database. An
+  unchanged registration is idempotent and keeps open streams, while a rotation ends the
+  replaced token's work stream and stops it authorizing. Unauthenticated `/health` now also
+  reports the Runtime version, a non-reversible scope digest of the database path, and the
+  process id; all three are optional in the contract so an older host still parses. Token
+  hashing is adequate only because these credentials are high-entropy values minted by the
+  host; it is not a password derivation.
+- b8d822a: Add `sandbox()`: one `.use(sandbox())` gives an agent Runtime-executed `bash`, `read`, `write`, `edit`, `grep` and `glob` tools on an isolated machine with a persistent `/workspace`. The Runtime selects a microsandbox microVM where available, otherwise an in-process virtual shell, enforces deny-by-default egress presets, owns sandbox lifecycle, and reports its choice through `GET /v1/host/sandbox`, the `nylorun dev` banner and `nylorun doctor sandbox`.
+- b8d822a: Breaking beta: replace `beforeModelCall` / `afterModelCall` with scoped hooks. Register `before("turn" | "step", fn)` and `after("step" | "turn", fn)` on the agent, or `before: { turn, step }` / `after: { step, turn }` on a capability. `before("turn")` runs once per turn and its `Patch` applies to every model call in the turn; the new `after("turn")` returns a `TurnDecision` for the final answer. `after` hooks take one argument and receive `attempt`, and `retry` now retries instead of failing the run. The manifest moves to `manifestSchemaVersion: 4` with `capabilities[].hooks`, and `BeforeModelCallFn`, `AfterModelCallFn` and the `beforeModelCall` / `afterModelCall` action kinds are removed. Every capability registered at a hook point now runs in one `hook` executor action, an expired hook claim is offered again instead of becoming uncertain, and the durable engine version is `hosted-2`. Hook toggles now hide a capability's tools, or one tool of a multi-tool capability, instead of having no effect or failing. Studio lists each capability's hooks with how often they run and labels hook actions. See MIGRATION.md.
+
+## 0.2.0-beta
+
+### Minor Changes
+
+- 3a88f51: Ship Agent-Plugins (`plugin()` / `loadPlugin`), Skills (`load_skill` / skill resources), Runtime MCP pool + vault credentials, and manifest v3 capability fields. Validate completed tool `output` against the tool output schema so ordinary tools with `outputSchema` no longer false-fail as `tool.invalid-output`.
+
+## 0.1.1-beta
+
+### Patch Changes
+
+- 2898d02: Extract shared definitions and contracts into core and local orchestration into
+  CLI. Harness becomes execution-only; the SDK no longer installs the engine and
+  Runtime no longer depends on the SDK. Author applications through agents and
+  install cli for the unchanged nylorun commands. See the package architecture and
+  migration guide. Cloud installs published packages from npm independently.
+
+## 0.1.0-beta.1
+
+Initial package extraction.

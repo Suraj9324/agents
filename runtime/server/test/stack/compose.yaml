@@ -1,0 +1,107 @@
+# Test stack for the runtime tests: `npm test` uses its Postgres (and starts it when it is
+# down), `npm run test:integration -w @nylorun/runtime` all of it.
+#
+#   npm run test:stack:up -w @nylorun/runtime
+#   NYLORUN_TEST_STACK=1 npm run test:integration -w @nylorun/runtime
+#   npm run test:stack:down -w @nylorun/runtime
+#
+# The BlobStore suite runs against its RustFS when NYLORUN_TEST_S3_ENDPOINT is set
+# (http://127.0.0.1:59000 by default; CI's integration job sets it).
+#
+# The tracing end-to-end test's stock OpenTelemetry Collector is in the `traces` profile, so the other jobs
+# do not start it: `NYLORUN_TEST_PROFILES=traces npm run test:stack:up -w @nylorun/runtime`. It
+# writes what it receives to NYLORUN_TEST_OTEL_DIR (default /tmp/nylorun-test-otel), which
+# `up.mjs` creates writable for it.
+#
+# Throwaway state: no volumes, and s2-lite keeps streams in memory. Every
+# service publishes on loopback only. Ports can be overridden with the
+# NYLORUN_TEST_*_PORT variables, which the integration tests read too.
+name: nylorun-test
+
+services:
+  postgres: # Session Store
+    image: postgres:17.11
+    # Logical replication for the stream relay. Every test file has its
+    # own database and pool, and files run in parallel: room for many connections.
+    # wal_sender_timeout=24s: Postgres asks for a keepalive reply every 12s (half of it), and a
+    # caught-up relay confirms past WAL that holds none of its rows (other test databases,
+    # autovacuum, the running-transactions record) only then. At the default 60s a slot can
+    # trail pg_current_wal_lsn() for 30s, longer than the tests wait for no lag (20s). A relay
+    # holding rows S2 does not have answers no keepalive, and Postgres drops it after the whole
+    # timeout: that must outlast the 10s S2 outage of test/failure/durable-streams.
+    command:
+      [
+        "postgres",
+        "-c",
+        "wal_level=logical",
+        "-c",
+        "max_slot_wal_keep_size=1GB",
+        "-c",
+        "max_connections=500",
+        "-c",
+        "wal_sender_timeout=24s",
+      ]
+    environment:
+      POSTGRES_USER: nylorun
+      POSTGRES_PASSWORD: nylorun
+      POSTGRES_DB: nylorun
+    ports:
+      - "127.0.0.1:${NYLORUN_TEST_POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nylorun -d nylorun"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  restate: # Durable Session Execution
+    image: docker.restate.dev/restatedev/restate:1.7.12
+    command: ["--node-name=restate-test"]
+    ports:
+      - "127.0.0.1:${NYLORUN_TEST_RESTATE_INGRESS_PORT:-58080}:8080" # ingress
+      - "127.0.0.1:${NYLORUN_TEST_RESTATE_ADMIN_PORT:-59070}:9070" # admin and UI
+    # Restate calls Worker endpoints that tests serve on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9070/health"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # The s2 image has no shell or HTTP client, so `up.mjs` polls /health from
+  # the host instead of a Compose health check.
+  s2: # Durable Streams (in-memory s2-lite)
+    image: ghcr.io/s2-streamstore/s2:0.43.0
+    command: ["lite"]
+    ports:
+      - "127.0.0.1:${NYLORUN_TEST_S2_PORT:-58090}:80"
+
+  rustfs: # the Object store (BlobStore suite), on tmpfs; the same image as the local stack
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+    environment:
+      RUSTFS_ACCESS_KEY: nylorun
+      RUSTFS_SECRET_KEY: nylorun-test-secret
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_OBS_LOG_DIRECTORY: "" # log to stdout
+    ports:
+      - "127.0.0.1:${NYLORUN_TEST_S3_PORT:-59000}:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    tmpfs:
+      - /data:uid=10001,gid=10001,mode=0700 # the image runs as rustfs (10001)
+
+  otel-collector: # the tracing end-to-end test's stock collector (profile `traces`), file exporter
+    image: otel/opentelemetry-collector:0.161.0
+    profiles: [traces]
+    command: ["--config=/etc/otelcol/nylorun.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/nylorun.yaml:ro
+      - ${NYLORUN_TEST_OTEL_DIR:-/tmp/nylorun-test-otel}:/out
+    ports:
+      - "127.0.0.1:${NYLORUN_TEST_OTEL_PORT:-54318}:4318" # OTLP/HTTP
+      - "127.0.0.1:${NYLORUN_TEST_OTEL_HEALTH_PORT:-54133}:13133" # health

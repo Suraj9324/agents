@@ -1,0 +1,446 @@
+/**
+ * A local Tenant (Docker Compose) for repository smokes, acceptance and
+ * `npm run dev`.
+ *
+ * - `ensureImages` builds the Runtime and Studio images from this checkout, or
+ *   reuses the ones `NYLORUN_RUNTIME_IMAGE` / `NYLORUN_STUDIO_IMAGE` name (CI
+ *   builds those with buildx before the smoke runs).
+ * - `withStack` starts `nylorun start` under a temporary `NYLORUN_HOME` with a
+ *   unique `NYLORUN_TENANT` (and `NYLORUN_COMPOSE_PROJECT`), hands the Tenant
+ *   to a callback, and always ends with `nylorun local reset --yes` (containers and
+ *   volumes) and removes the temporary Host root. Its commands run from the
+ *   Host root, which is not a project, so `start` links nothing; a check that
+ *   wants a Project link runs `nylorun start` in its project directory
+ *   (`cwd`), which attaches to the same Tenant through `NYLORUN_TENANT`.
+ */
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { root, run } from "./repo.mjs";
+
+/** Tags `ensureImages` builds when no image is named in the environment. */
+export const LOCAL_IMAGES = Object.freeze({
+  runtime: "nylorun-runtime:local",
+  studio: "nylorun-studio:local",
+  sandboxes: "nylorun-sandboxes:local",
+});
+
+const IMAGE_ENV = {
+  runtime: "NYLORUN_RUNTIME_IMAGE",
+  studio: "NYLORUN_STUDIO_IMAGE",
+  sandboxes: "NYLORUN_SANDBOXES_IMAGE",
+};
+const DOCKERFILES = {
+  runtime: "runtime/Dockerfile",
+  studio: "studio/Dockerfile",
+  sandboxes: "sandboxes/Dockerfile",
+};
+
+/** The workspace `nylorun` (`npm run build` first). */
+export const WORKSPACE_CLI = join(root, "cli", "nylorun", "dist", "cli.js");
+
+/** The image id for `tag`, or undefined when Docker has no such image. */
+export async function imageId(tag) {
+  try {
+    return await run("docker", ["image", "inspect", "--format", "{{.Id}}", tag], {
+      capture: true,
+      timeout: 30_000,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The Runtime and Studio images for a Tenant. An image named in the
+ * environment is reused as is and must exist; otherwise the default tag is
+ * built from this checkout with `docker build` (quick when nothing changed,
+ * since the layers are cached).
+ */
+export async function ensureImages({
+  env = process.env,
+  defaults = LOCAL_IMAGES,
+  only = ["runtime", "studio"],
+  log = console.log,
+} = {}) {
+  const images = {};
+  for (const name of only) {
+    const named = env[IMAGE_ENV[name]]?.trim();
+    if (named) {
+      if (!(await imageId(named)))
+        throw new Error(
+          `${IMAGE_ENV[name]}=${named} is not a local image. Build it (docker build -f ${DOCKERFILES[name]} -t ${named} .) or unset ${IMAGE_ENV[name]}.`,
+        );
+      log(`[images] Using ${named} (${IMAGE_ENV[name]})`);
+      images[name] = named;
+      continue;
+    }
+    images[name] = await buildImage(name, defaults[name], { log });
+  }
+  return images;
+}
+
+/** `docker build` one image from the repository root; returns the tag. */
+export async function buildImage(name, tag, { log = console.log } = {}) {
+  log(`[images] Building ${tag} from ${DOCKERFILES[name]}`);
+  const started = Date.now();
+  await run("docker", ["build", "--quiet", "--file", DOCKERFILES[name], "--tag", tag, "."], {
+    cwd: root,
+    capture: true,
+    timeout: 1_200_000,
+  });
+  log(`[images] Built ${tag} in ${Math.round((Date.now() - started) / 1000)}s`);
+  return tag;
+}
+
+/** Run a command with stdout captured (and echoed) and stderr inherited. */
+function exec(command, args, { env, cwd = root, echo = true, timeout = 600_000 }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (echo) process.stdout.write(chunk);
+    });
+    // Captured for assertions, and still shown as it arrives.
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      process.stderr.write(chunk);
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeout);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? (signal ? 1 : 0), stdout, stderr });
+    });
+  });
+}
+
+/** A Tenant (and Compose project) name: `<prefix>-<random>`. */
+export function stackProjectName(prefix) {
+  const base = prefix.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^[^a-z0-9]+/, "");
+  return `${base || "nylorun"}-${randomBytes(3).toString("hex")}`;
+}
+
+/**
+ * One Tenant under a temporary Host root. `cli` is the `nylorun` entry to
+ * drive it with (the workspace build by
+ * default, or packed installs).
+ * `baseEnv` replaces `process.env` as the environment the Tenant's commands
+ * start from (the release smoke passes one without publishing credentials).
+ * The Tenant's name (`NYLORUN_TENANT`) doubles as its Compose project.
+ */
+export async function createStack({
+  name = "nylorun-tenant",
+  cli = WORKSPACE_CLI,
+  images,
+  baseEnv = process.env,
+  env: extraEnv = {},
+  log = console.log,
+} = {}) {
+  const home = await mkdtemp(join(tmpdir(), `${name}-`));
+  const project = stackProjectName(name);
+  const env = {
+    ...baseEnv,
+    ...extraEnv,
+    NYLORUN_HOME: home,
+    NYLORUN_TENANT: project,
+    NYLORUN_COMPOSE_PROJECT: project,
+    ...(images?.runtime ? { NYLORUN_RUNTIME_IMAGE: images.runtime } : {}),
+    ...(images?.studio ? { NYLORUN_STUDIO_IMAGE: images.studio } : {}),
+    ...(images?.sandboxes ? { NYLORUN_SANDBOXES_IMAGE: images.sandboxes } : {}),
+  };
+  const composeArgs = (...args) => [
+    "compose",
+    "--project-name",
+    project,
+    "--file",
+    join(home, "docker", "compose.yaml"),
+    "--env-file",
+    join(home, "docker", ".env"),
+    ...args,
+  ];
+
+  const stack = {
+    home,
+    project,
+    env,
+    cli,
+    runtimeUrl: undefined,
+    /**
+     * Run `nylorun <args>` against this Tenant (`entry`: another CLI install).
+     * `cwd` defaults to the Host root, outside any project; pass a project
+     * directory to link it.
+     */
+    async nylorun(args, { check = true, echo = true, cwd = home, timeout, entry = cli } = {}) {
+      log(`$ nylorun ${args.join(" ")}`);
+      const result = await exec(process.execPath, [entry, ...args], { env, cwd, echo, timeout });
+      if (check && result.code !== 0)
+        throw new Error(`nylorun ${args.join(" ")} exited with ${result.code}`);
+      return result;
+    },
+    /**
+     * `nylorun start` (in `cwd`: a project directory links it); returns the
+     * Runtime URL and Studio login URL it prints.
+     */
+    async start(args = [], { cwd } = {}) {
+      const { stdout } = await stack.nylorun(["start", ...args], cwd ? { cwd } : {});
+      const runtimeUrl = /^Runtime\s+(\S+)/m.exec(stdout)?.[1];
+      assert.ok(runtimeUrl, `nylorun start prints the Runtime URL:\n${stdout}`);
+      stack.runtimeUrl = runtimeUrl;
+      return { runtimeUrl, studioUrl: /^Studio\s+(\S+)/m.exec(stdout)?.[1] };
+    },
+    /** `docker compose` on this Tenant's Compose project; returns stdout. */
+    async compose(args, { check = true, echo = false } = {}) {
+      const result = await exec("docker", composeArgs(...args), { env, echo });
+      if (check && result.code !== 0)
+        throw new Error(`docker compose ${args.join(" ")} exited with ${result.code}`);
+      return result.stdout;
+    },
+    /**
+     * One SQL statement through `psql` in the postgres container; rows as
+     * text. The Tenant's state is in schema `nylorun` of database `nylorun`.
+     */
+    async psql(sql) {
+      return (
+        await stack.compose([
+          "exec",
+          "-T",
+          "postgres",
+          "psql",
+          "--username",
+          "nylorun",
+          "--dbname",
+          "nylorun",
+          "--no-align",
+          "--tuples-only",
+          "--set",
+          "ON_ERROR_STOP=1",
+          "--command",
+          sql,
+        ])
+      ).trim();
+    },
+    /** A fresh single-use Studio login URL (`nylorun studio --no-open`). */
+    async studioLogin(args = []) {
+      const { stdout } = await stack.nylorun(["studio", "--no-open", ...args], { echo: false });
+      const url = /^Studio\s+(\S+)/m.exec(stdout)?.[1];
+      assert.match(url ?? "", /^http:\/\/localhost:\d+\/login\?token=/, stdout);
+      return url;
+    },
+    /**
+     * The Runtime's `GET /ready` (no key): `{ status, checks, harness? }`, 503 while not ready.
+     * `checks.tenant` is true while the Tenant is open.
+     */
+    async ready() {
+      assert.ok(stack.runtimeUrl, "start the Tenant first (stack.start)");
+      const response = await fetch(`${stack.runtimeUrl}/ready`, { signal: AbortSignal.timeout(10_000) });
+      return await response.json();
+    },
+    /**
+     * `nylorun-operate status --json` in the runtime container: `{ version, protocol, tenant: {
+     * id, name, state, cause?, message? } }`. It answers (exit 2) when the Tenant is not open too.
+     */
+    async operateStatus() {
+      const result = await exec(
+        "docker",
+        composeArgs("exec", "-T", "runtime", "nylorun-operate", "status", "--json"),
+        { env, echo: false, timeout: 60_000 },
+      );
+      if (result.code !== 0 && result.code !== 2)
+        throw new Error(`nylorun-operate status exited with ${result.code}`);
+      return JSON.parse(result.stdout);
+    },
+    /**
+     * The checks' management key (`checks-management`): `nylorun tenant keys put --management` on the
+     * machine (the only way to issue one), once per Tenant in this process and reused after.
+     * Putting it again would rotate it; a linked project's `project-management` is never touched.
+     */
+    async managementKey() {
+      const cached = `${home} ${project}`;
+      let key = managementKeys.get(cached);
+      if (!key) {
+        key = stack
+          .nylorun(["tenant", "keys", "put", CHECKS_MANAGEMENT_KEY_ID, "--management", "--tenant", project], {
+            echo: false,
+          })
+          .then(({ stdout }) => {
+            const issued = stdout.trim();
+            assert.match(issued, /^\S+$/, "nylorun tenant keys put --management prints the key alone");
+            return issued;
+          });
+        managementKeys.set(cached, key);
+        key.catch(() => managementKeys.delete(cached));
+      }
+      return key;
+    },
+    /**
+     * The Tenant's id, the checks' application key (see `hostTenant`) and their management key
+     * (`managementKey`, for `/v1/tenant/*`).
+     */
+    async tenant() {
+      const tenant = await hostTenant(stack);
+      return { ...tenant, managementKey: await stack.managementKey() };
+    },
+    async logs(tail = 200) {
+      if (!existsSync(join(home, "docker", "compose.yaml"))) return;
+      await stack.nylorun(["local", "logs", "--tail", String(tail)], { check: false });
+    },
+    /** Delete containers and volumes, then the temporary Host root. */
+    async dispose() {
+      const reset = await stack
+        .nylorun(["local", "reset", "--yes"], { check: false, echo: false })
+        .catch(() => ({ code: 1 }));
+      // Without compose files (start failed early) Compose finds the
+      // containers by project label.
+      if (reset.code !== 0)
+        await exec("docker", ["compose", "--project-name", project, "down", "--volumes", "--remove-orphans"], {
+          env,
+          echo: false,
+        }).catch(() => {});
+      await rm(home, { recursive: true, force: true });
+    },
+  };
+  return stack;
+}
+
+/**
+ * Run `fn(stack)` on a fresh Tenant and always reset it afterwards. With
+ * `start: false` the callback starts it (e.g. `nylorun start` in a project). Logs
+ * are printed when the callback fails; Ctrl-C still resets.
+ */
+export async function withStack(options, fn) {
+  const stack = await createStack(options);
+  const interrupt = (signal) => {
+    console.error(`[tenant] ${signal}: resetting ${stack.project}`);
+    void stack.dispose().finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
+  };
+  const onInt = () => interrupt("SIGINT");
+  const onTerm = () => interrupt("SIGTERM");
+  process.once("SIGINT", onInt);
+  process.once("SIGTERM", onTerm);
+  try {
+    if (options?.start !== false) await stack.start(options?.startArgs ?? []);
+    return await fn(stack);
+  } catch (error) {
+    await stack.logs().catch(() => {});
+    throw error;
+  } finally {
+    process.off("SIGINT", onInt);
+    process.off("SIGTERM", onTerm);
+    await stack.dispose();
+  }
+}
+
+/**
+ * Redeem a Studio login URL like a browser: `303` with a session cookie.
+ * Returns `get(path)` for authenticated Studio requests.
+ */
+export async function studioSession(loginUrl) {
+  const redeemed = await fetch(loginUrl, { redirect: "manual" });
+  assert.equal(redeemed.status, 303, `Studio login redirects (${redeemed.status})`);
+  const cookie = redeemed.headers.get("set-cookie")?.split(";")[0];
+  assert.ok(cookie, "Studio login sets a session cookie");
+  const origin = new URL(loginUrl).origin;
+  return {
+    origin,
+    location: redeemed.headers.get("location"),
+    cookie,
+    get: (path, init = {}) =>
+      fetch(`${origin}${path}`, { ...init, headers: { ...init.headers, cookie } }),
+  };
+}
+
+/** Poll `check` until it returns a truthy value; fail with `describe()` on timeout. */
+export async function eventually(check, { timeout = 60_000, interval = 250, message = "condition" } = {}) {
+  const deadline = Date.now() + timeout;
+  let last;
+  for (;;) {
+    try {
+      const value = await check();
+      if (value) return value;
+    } catch (error) {
+      last = error instanceof Error ? error.message : String(error);
+    }
+    if (Date.now() > deadline)
+      throw new Error(`Timed out waiting for ${message}${last ? ` (${last})` : ""}`);
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+}
+
+/** The application key the checks use; `project` stays the linked projects' own. */
+export const CHECKS_KEY_ID = "checks";
+/** The checks key per Host root and Tenant id, put once in this process. */
+const checksKeys = new Map();
+/**
+ * The management key the checks use for the Management API (`/v1/tenant/*`), which takes no
+ * application key; `project-management` stays the linked projects' own.
+ */
+export const CHECKS_MANAGEMENT_KEY_ID = "checks-management";
+/** The checks' management key per Host root and Tenant, put once in this process. */
+const managementKeys = new Map();
+
+/**
+ * The Host's one Tenant from `nylorun-operate status`, once it is open, with a key for the
+ * checks: the application key `checks`, put with `nylorun tenant keys put checks` once per
+ * Tenant in this process and reused after. Putting it again would rotate it, and a linked
+ * project's `project` key is never touched. It reaches the Runtime API only; `/v1/tenant/*`
+ * takes the management key (`stack.managementKey()`, or `stack.tenant()` for both).
+ * @param {{ home: string, project: string, operateStatus(): Promise<{ tenant: { id: string | null, state: string, cause?: string } }>, nylorun(args: string[], options?: object): Promise<{ stdout: string }> }} stack
+ * @returns {Promise<{ id: string, key: string }>}
+ */
+export async function hostTenant(stack) {
+  const { tenant } = await stack.operateStatus();
+  if (tenant.state !== "open" || !tenant.id)
+    throw new Error(
+      `The Host's Tenant is not open (${tenant.state}${tenant.cause ? `: ${tenant.cause}` : ""}${tenant.id ? `, ${tenant.id}` : ""}).`,
+    );
+  const cached = `${stack.home} ${tenant.id}`;
+  let key = checksKeys.get(cached);
+  if (!key) {
+    key = stack
+      .nylorun(["tenant", "keys", "put", CHECKS_KEY_ID, "--tenant", stack.project], { echo: false })
+      .then(({ stdout }) => {
+        const issued = stdout.trim();
+        assert.match(issued, /^\S+$/, "nylorun tenant keys put prints the key alone");
+        return issued;
+      });
+    checksKeys.set(cached, key);
+    key.catch(() => checksKeys.delete(cached));
+  }
+  return { id: tenant.id, key: await key };
+}
+
+/** The protocol the checks speak: the Host accepts 16 only (protocol 16, agents from one manifest). */
+export const PROTOCOL = "16";
+
+/**
+ * Headers for the Tenant's APIs (an application key for the Runtime API, a management key for
+ * `/v1/tenant/*`): the Host's one Tenant, so nothing selects it.
+ */
+export function runtimeHeaders(key, extra = {}) {
+  return {
+    authorization: `Bearer ${key}`,
+    "Nylorun-Protocol": PROTOCOL,
+    ...extra,
+  };
+}
+
+/** GET a path on the Tenant's APIs as JSON (throws on a non-2xx status). */
+export async function runtimeGet(runtimeUrl, key, path) {
+  const response = await fetch(`${runtimeUrl}${path}`, {
+    headers: runtimeHeaders(key),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`GET ${path}: HTTP ${response.status} ${text.slice(0, 300)}`);
+  return JSON.parse(text);
+}

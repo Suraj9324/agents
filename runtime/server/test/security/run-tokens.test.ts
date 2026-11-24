@@ -1,0 +1,231 @@
+/**
+ * Run tokens (`tenant/run-token.ts`): what core mints for an advance's lease, and what the
+ * gateway accepts as one. Everything else is refused: another family's token, another Tenant's
+ * or audience's, an expired one, one signed by a revoked key, an oversized one, and a header
+ * that could name another key. The live check follows the session's lease.
+ */
+import { MAX_TOKEN_BYTES } from "../../src/tenant/jwt.js";
+import { beforeAll, describe, expect, it } from "vitest";
+import { decodeProtectedHeader } from "jose";
+import { newTenantId } from "@nylorun/core/compatibility";
+import {
+  ARTIFACT_LINK_TOKEN_TYPE,
+  tenantTokenIssuer,
+} from "@nylorun/core/contracts";
+import {
+  RUN_TOKEN_AUD,
+  RUN_TOKEN_TYP,
+  mintRunToken,
+  staleRun,
+  verifyRunToken,
+} from "../../src/tenant/run-token.js";
+import { createRunGrants, grantRun, renewRunGrant } from "../../src/tenant/run-grants.js";
+import { runFixture, type RunFixture } from "../support/run-tokens.js";
+import { DEFAULT_HOST_TUNING, hostTuningOf, useHostTuning } from "../../src/tuning.js";
+
+const RUN_TOKEN_TTL_SECONDS = DEFAULT_HOST_TUNING.keys.runTokenTtlSeconds;
+
+let runs: RunFixture;
+beforeAll(async () => {
+  runs = await runFixture();
+});
+
+const verify = (raw: string) => verifyRunToken(runs.store, runs.tenantId, raw);
+
+/** Signs `claims` over a valid run token's, with the Tenant's key, as `typ`. */
+async function signed(overrides: Record<string, unknown> = {}, typ = RUN_TOKEN_TYP): Promise<string> {
+  const iat = Math.floor(Date.now() / 1000);
+  const { token } = await runs.keys.sign({
+    typ,
+    claims: {
+      iss: tenantTokenIssuer(runs.tenantId),
+      aud: RUN_TOKEN_AUD,
+      sub: "session-x",
+      trn: "turn-1",
+      agt: "bot",
+      epc: 1,
+      iat,
+      exp: iat + 60,
+      jti: "j",
+      ...overrides,
+    },
+  });
+  return token;
+}
+
+describe("run tokens", () => {
+  it("live as long as the Host tuning's keys.runTokenTtlSeconds says", async () => {
+    useHostTuning(hostTuningOf({ keys: { runTokenTtlSeconds: 120, runTokenRenewSeconds: 60 } }));
+    try {
+      const grant = await runs.run("rt-short", { agentId: "bot", turnId: "turn-1" });
+      const left = grant.claims.expiresAt - Date.now();
+      expect(left).toBeLessThanOrEqual(120_000);
+      expect(left).toBeGreaterThan(110_000);
+    } finally {
+      useHostTuning(DEFAULT_HOST_TUNING);
+    }
+  });
+
+  it("round-trips: the claims name the lease's session, turn, root agent and epoch", async () => {
+    const grant = await runs.run("rt-session", { agentId: "bot", turnId: "turn-7" });
+    expect(decodeProtectedHeader(grant.token)).toMatchObject({ alg: "ES256", typ: RUN_TOKEN_TYP });
+    expect(Buffer.byteLength(grant.token)).toBeLessThan(1024);
+    expect(grant.claims.expiresAt - Date.now()).toBeGreaterThan((RUN_TOKEN_TTL_SECONDS - 5) * 1000);
+    expect(await verify(grant.token)).toEqual({
+      ok: true,
+      claims: {
+        tenantId: runs.tenantId,
+        sessionId: "rt-session",
+        turnId: "turn-7",
+        agentId: "bot",
+        epoch: grant.claims.epoch,
+        expiresAt: grant.claims.expiresAt,
+      },
+    });
+  });
+
+  it("refuses a wrong typ, aud or iss", async () => {
+    expect(await verify(await signed({}, "JWT"))).toEqual({ ok: false, reason: "run_token_header" });
+    expect(await verify(await signed({ aud: "nylorun" }))).toEqual({ ok: false, reason: "run_token_invalid" });
+    expect(await verify(await signed({ iss: tenantTokenIssuer(newTenantId()) }))).toEqual({
+      ok: false,
+      reason: "run_token_invalid",
+    });
+    // A valid token of this Tenant, checked as another Tenant's.
+    expect(await verifyRunToken(runs.store, newTenantId(), await signed())).toMatchObject({ ok: false });
+  });
+
+  it("refuses a capability link presented as a run token", async () => {
+    const link = await signed({ aud: "nylorun-artifact", ver: 1 }, ARTIFACT_LINK_TOKEN_TYPE);
+    expect(await verify(link)).toEqual({ ok: false, reason: "run_token_header" });
+  });
+
+  it("refuses missing or malformed claims and an overlong lifetime", async () => {
+    const iat = Math.floor(Date.now() / 1000);
+    for (const claims of [
+      { trn: undefined },
+      { agt: 7 },
+      { epc: 0 },
+      { epc: 1.5 },
+      { sub: "" },
+      { exp: iat + RUN_TOKEN_TTL_SECONDS * 2 },
+    ])
+      expect(await verify(await signed(claims))).toEqual({ ok: false, reason: "run_token_claims" });
+  });
+
+  it("accepts an expiry within the 30 s tolerance, and refuses one past it", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    expect(await verify(await signed({ iat: now - 120, exp: now - 20 }))).toMatchObject({ ok: true });
+    expect(await verify(await signed({ iat: now - 120, exp: now - 40 }))).toEqual({
+      ok: false,
+      reason: "run_token_expired",
+    });
+  });
+
+  it("refuses a token longer than a request's headers may be, and a header that could name another key", async () => {
+    expect(await verify(await signed({ pad: "x".repeat(MAX_TOKEN_BYTES) }))).toEqual({
+      ok: false,
+      reason: "run_token_malformed",
+    });
+    const [header, payload, signature] = (await signed()).split(".");
+    for (const extra of [{ jku: "https://evil.invalid/jwks" }, { jwk: {} }, { x5u: "https://evil.invalid" }, { crit: ["exp"] }]) {
+      const forged = Buffer.from(
+        JSON.stringify({ ...JSON.parse(Buffer.from(header!, "base64url").toString()), ...extra }),
+      ).toString("base64url");
+      expect(await verify(`${forged}.${payload}.${signature}`)).toEqual({ ok: false, reason: "run_token_header" });
+    }
+    expect(await verify(`${header}.${payload}.${"A".repeat(86)}`)).toEqual({ ok: false, reason: "run_token_invalid" });
+    expect(await verify("not-a-token")).toEqual({ ok: false, reason: "run_token_malformed" });
+  });
+
+  it("refuses a token whose key was revoked, and verifies under a rotated key at once", async () => {
+    const before = await signed();
+    expect(await verify(before)).toMatchObject({ ok: true });
+    // current → previous → revoked.
+    await runs.keys.rotateSigningKeys({ maxTtlSeconds: 60, force: true, by: { principal: "test-management", source: "api" } });
+    expect(await verify(before)).toMatchObject({ ok: true });
+    expect(await verify(await signed())).toMatchObject({ ok: true });
+    await runs.keys.rotateSigningKeys({ maxTtlSeconds: 60, force: true, by: { principal: "test-management", source: "api" } });
+    expect(await verify(before)).toEqual({ ok: false, reason: "run_token_key_revoked" });
+  });
+
+  it("is live while the lease, the turn and the status are the token's", async () => {
+    const grant = await runs.run("live-1");
+    expect(await staleRun(runs.store, grant.claims)).toBeUndefined();
+    await runs.update("live-1", { activeTurnId: "turn-2" });
+    expect(await staleRun(runs.store, grant.claims)).toMatch(/turn/);
+    await runs.update("live-1", { activeTurnId: "turn-1", status: "cancelled" });
+    expect(await staleRun(runs.store, grant.claims)).toMatch(/cancelled/);
+    await runs.update("live-1", { status: "running" });
+    const owner = await runs.takeOver("live-1");
+    expect(await staleRun(runs.store, grant.claims)).toMatch(/another advance/);
+    expect(await staleRun(runs.store, owner.claims)).toBeUndefined();
+    expect(await staleRun(runs.store, { ...owner.claims, sessionId: "gone" })).toMatch(/gone/);
+  });
+
+  it("refuses to mint for a session with no active turn", async () => {
+    await expect(
+      mintRunToken(
+        { keys: runs.keys, config: { tenantId: runs.tenantId } },
+        { sessionId: "s", owner: "w", epoch: 1 },
+        { agentId: "bot", activeTurnId: null },
+      ),
+    ).rejects.toThrow(/no active turn/);
+  });
+});
+
+describe("run grants", () => {
+  it("keeps a newer advance's grant over an older one's, and drops only its own", async () => {
+    const grants = createRunGrants();
+    const older = await runs.run("grants-1");
+    const newer = await runs.takeOver("grants-1");
+    grants.set(newer);
+    grants.set(older);
+    expect(grants.token("grants-1")).toBe(newer.token);
+    grants.drop("grants-1", older.claims.epoch);
+    expect(grants.token("grants-1")).toBe(newer.token);
+    grants.drop("grants-1", newer.claims.epoch);
+    expect(grants.token("grants-1")).toBeUndefined();
+  });
+
+  it("re-mints a grant only when less than five minutes remain", async () => {
+    const grants = createRunGrants();
+    const grant = await runs.run("grants-2");
+    const lease = { sessionId: "grants-2", owner: "test-worker", epoch: grant.claims.epoch };
+    const ctx = { keys: runs.keys, config: { tenantId: runs.tenantId }, runGrants: grants } as never;
+    const run = { agentId: "bot", activeTurnId: "turn-1" };
+    grants.set(grant);
+    await renewRunGrant(ctx, lease, run);
+    expect(grants.get("grants-2")).toBe(grant);
+    grants.set({ ...grant, claims: { ...grant.claims, expiresAt: Date.now() + 60_000 } });
+    await renewRunGrant(ctx, lease, run);
+    const renewed = grants.get("grants-2")!;
+    expect(renewed.token).not.toBe(grant.token);
+    expect(renewed.claims).toMatchObject({ sessionId: "grants-2", turnId: "turn-1", epoch: grant.claims.epoch });
+    expect(await verify(renewed.token)).toMatchObject({ ok: true });
+    // Once the advance has ended, a token minted late is not registered.
+    grants.drop("grants-2", grant.claims.epoch);
+    await renewRunGrant(ctx, lease, run, () => false);
+    expect(grants.get("grants-2")).toBeUndefined();
+  });
+
+  it("never stops an advance whose mint fails; the heartbeat mints the grant later", async () => {
+    const grants = createRunGrants();
+    const grant = await runs.run("grants-3");
+    const lease = { sessionId: "grants-3", owner: "test-worker", epoch: grant.claims.epoch };
+    const run = { agentId: "bot", activeTurnId: "turn-1" };
+    const warnings: string[] = [];
+    const logger = { info() {}, warn: (message: string) => void warnings.push(message), error() {} };
+    const failing = {
+      keys: { sign: async () => Promise.reject(new Error("keys service down")) },
+      config: { tenantId: runs.tenantId, logger },
+      runGrants: grants,
+    } as never;
+    await expect(grantRun(failing, lease, run)).resolves.toBeUndefined();
+    expect(grants.get("grants-3")).toBeUndefined();
+    expect(warnings).toEqual(["advance could not mint its run token"]);
+    const ctx = { keys: runs.keys, config: { tenantId: runs.tenantId, logger }, runGrants: grants } as never;
+    await renewRunGrant(ctx, lease, run);
+    expect(grants.get("grants-3")?.claims).toMatchObject({ sessionId: "grants-3", epoch: grant.claims.epoch });
+  });
+});

@@ -1,0 +1,283 @@
+import { describe, expect, it } from "vitest";
+import {
+  ERROR_CODES,
+  HOST_PROTOCOL,
+  OPTIONAL_HOST_FEATURES,
+  PROTOCOL_FEATURES,
+  PROTOCOL_VERSION,
+  TENANT_ID_PATTERN,
+  PRINCIPAL_ID_PATTERN,
+  checkCompatibility,
+  compareVersions,
+  isArtifactId,
+  isPrincipalId,
+  isTenantId,
+  newArtifactId,
+  newPrincipalId,
+  newTenantId,
+} from "../src/compatibility.js";
+import {
+  DeleteOperatorKeyResponseSchema,
+  HostTenantSchema,
+  ListOperatorKeysResponseSchema,
+  PutOperatorKeyResponseSchema,
+  ProjectCredentialsFileSchema,
+  ProjectLinkFileSchema,
+  ReadyResponseSchema,
+  RejectedResponseSchema,
+} from "../src/contracts.js";
+import { MODEL_FAILURE_CODES } from "../src/define.js";
+
+const CROCKFORD = /^[0-9a-hjkmnp-tv-z]+$/;
+
+describe("tenant ids", () => {
+  it("uses the Crockford alphabet, tn_ prefix and length 29", () => {
+    const id = newTenantId(1_700_000_000_000);
+    expect(id).toMatch(/^tn_/);
+    expect(id).toHaveLength(29);
+    expect(id.slice(3)).toMatch(CROCKFORD);
+    expect(id).toMatch(TENANT_ID_PATTERN);
+    expect(isTenantId(id)).toBe(true);
+  });
+
+  it("rejects malformed ids", () => {
+    expect(isTenantId("tn_00000000000000000000000000")).toBe(true);
+    expect(isTenantId("tn_iiiiiiiiiiiiiiiiiiiiiiiiii")).toBe(false);
+    expect(isTenantId("tn_OOOOOOOOOOOOOOOOOOOOOOOOOO")).toBe(false);
+    expect(isTenantId("tn_short")).toBe(false);
+    expect(isTenantId("host_00000000000000000000000000")).toBe(false);
+    expect(isTenantId(null)).toBe(false);
+  });
+
+  it("keeps a monotonic time prefix for a fixed clock", () => {
+    const earlier = newTenantId(1_000);
+    const later = newTenantId(2_000);
+    expect(earlier.slice(3, 13) < later.slice(3, 13)).toBe(true);
+  });
+
+  it("stays lexicographically monotonic within the same millisecond", () => {
+    const ids = Array.from({ length: 32 }, () => newTenantId(42));
+    for (let i = 1; i < ids.length; i++) {
+      expect(ids[i]! > ids[i - 1]!).toBe(true);
+      expect(ids[i]!.slice(3, 13)).toBe(ids[0]!.slice(3, 13));
+    }
+  });
+});
+
+describe("principal ids", () => {
+  it("uses the Crockford alphabet, pr_ prefix and length 29", () => {
+    const id = newPrincipalId(1_700_000_000_000);
+    expect(id).toMatch(/^pr_/);
+    expect(id).toHaveLength(29);
+    expect(id.slice(3)).toMatch(CROCKFORD);
+    expect(id).toMatch(PRINCIPAL_ID_PATTERN);
+    expect(isPrincipalId(id)).toBe(true);
+  });
+});
+
+describe("compareVersions", () => {
+  it("orders SemVer including prereleases", () => {
+    expect(compareVersions("0.9.0-beta", "0.9.0")).toBe(-1);
+    expect(compareVersions("0.9.0", "0.9.0-beta")).toBe(1);
+    expect(compareVersions("1.0.0-alpha", "1.0.0-alpha.1")).toBe(-1);
+    expect(compareVersions("1.0.0-alpha.1", "1.0.0-alpha.beta")).toBe(-1);
+    expect(compareVersions("1.0.0-beta", "1.0.0")).toBe(-1);
+    expect(compareVersions("1.0.0+build.1", "1.0.0")).toBe(0);
+    expect(compareVersions("2.0.0", "1.9.9")).toBe(1);
+  });
+});
+
+describe("Wave 0 schemas", () => {
+  it("parses /ready with the open Tenant's harnesses, and without them", () => {
+    const ready = { status: "ready", service: "nylorun-runtime", checks: { listener: true, tenant: true } };
+    expect(ReadyResponseSchema.parse(ready).harness).toBeUndefined();
+    expect(ReadyResponseSchema.parse({ ...ready, harness: { mode: "remote", connected: 2 } }).harness).toEqual({
+      mode: "remote",
+      connected: 2,
+    });
+    expect(() => ReadyResponseSchema.parse({ ...ready, harness: { mode: "pod", connected: 0 } })).toThrow();
+  });
+
+  it("reports a Tenant that could not be opened, with its cause", () => {
+    const tenant = HostTenantSchema.parse({
+      id: null,
+      name: null,
+      state: "unavailable",
+      envelope: null,
+      cause: {
+        code: "database-layout-old",
+        message: "The database holds Tenant schemas of an older Runtime",
+        repair: "point the Runtime at a new database",
+      },
+    });
+    expect(tenant.cause?.code).toBe("database-layout-old");
+    expect(() => HostTenantSchema.parse({ ...tenant, state: "quarantined" })).toThrow();
+  });
+
+  it("defaults Project link format to 0", () => {
+    const link = ProjectLinkFileSchema.parse({
+      hostUrl: "http://127.0.0.1:7432",
+      hostId: "host_1",
+      tenantId: "tn_00000000000000000000000000",
+    });
+    expect(link.format).toBe(0);
+  });
+
+  it("parses a format 3 Project link that names its local Tenant and no Tenant id", () => {
+    const link = ProjectLinkFileSchema.parse({
+      format: 3,
+      tenant: "my-app",
+      hostUrl: "http://127.0.0.1:7432",
+      hostId: "host_1",
+    });
+    expect(link).toMatchObject({ format: 3, tenant: "my-app" });
+    expect(link.tenantId).toBeUndefined();
+  });
+
+  it("parses a format 2 Project link so readers can refuse it", () => {
+    expect(
+      ProjectLinkFileSchema.parse({
+        format: 2,
+        stack: "my-app",
+        hostUrl: "http://127.0.0.1:7432",
+        hostId: "host_1",
+      }).format,
+    ).toBe(2);
+  });
+
+  it("parses Project credentials", () => {
+    expect(
+      ProjectCredentialsFileSchema.parse({
+        format: 1,
+        applicationKey: "a".repeat(64),
+        principalId: "pr_00000000000000000000000000",
+      }).format,
+    ).toBe(1);
+  });
+
+  it("parses RejectedResponseSchema with registry codes", () => {
+    expect(
+      RejectedResponseSchema.parse({
+        status: "rejected",
+        code: "host_rejected",
+        message: "bad Host",
+        details: { header: "evil.example" },
+      }).code,
+    ).toBe("host_rejected");
+  });
+});
+
+describe("checkCompatibility", () => {
+  it("serves protocol 16 to 18 clients; they require Agents, 17 the session queue, 18 usage by kind", () => {
+    expect(PROTOCOL_VERSION).toBe(18);
+    // Protocol 8 clients require the Management API (key roles); protocol 9 clients the OAuth
+    // resource server's 401 challenges; protocol 12 clients model inputs; protocol 13 clients the
+    // flat manifest (v7); protocol 15 clients the harness boundary; protocol 16 clients agent
+    // manifests and Agents.
+    expect(PROTOCOL_FEATURES).toContain("management-api");
+    expect(PROTOCOL_FEATURES).toContain("resource-server");
+    expect(PROTOCOL_FEATURES).toContain("artifacts");
+    expect(PROTOCOL_FEATURES).toContain("model-inputs");
+    expect(PROTOCOL_FEATURES).toContain("flat-manifest");
+    expect(PROTOCOL_FEATURES).toContain("agents");
+    expect(PROTOCOL_FEATURES).not.toContain("environments");
+    expect(PROTOCOL_FEATURES).not.toContain("environment-manifests");
+    expect(PROTOCOL_FEATURES).toContain("harness-boundary");
+    expect(HOST_PROTOCOL).toMatchObject({ min: 16, max: 18 });
+    // Protocol 18 is additive: usage reads carry the cost by token kind and the calls' timing.
+    expect(PROTOCOL_FEATURES).toContain("usage-by-kind");
+    // A gateway's tool prefix is an optional Host feature: no client requires it.
+    expect(PROTOCOL_FEATURES).not.toContain("gateway-credentials");
+    expect(HOST_PROTOCOL.features).toContain("gateway-credentials");
+    expect(checkCompatibility({ version: 18, required: [...PROTOCOL_FEATURES] }, HOST_PROTOCOL)).toMatchObject({ ok: true });
+    // Protocol 17 is additive: the session queue, whose refusal has a code.
+    expect(PROTOCOL_FEATURES).toContain("session-queue");
+    expect(checkCompatibility({ version: 17, required: [...PROTOCOL_FEATURES] }, HOST_PROTOCOL)).toMatchObject({ ok: true });
+    for (const code of ["session_busy", "queue_full"]) expect(ERROR_CODES).toContain(code);
+    expect(HOST_PROTOCOL.features).toContain("flat-manifest");
+    expect(checkCompatibility({ version: 16, required: ["agents", "harness-boundary"] }, HOST_PROTOCOL)).toMatchObject({ ok: true });
+    // Protocol 15: a message may name any file; the harness decides how the model sees it.
+    expect(ERROR_CODES).not.toContain("attachment_unsupported");
+    expect(MODEL_FAILURE_CODES).toContain("unsupported_input");
+    for (const code of ["agent_fixed_field", "secret_not_in_manifest", "manifest_inconsistent", "manifest_changed"])
+      expect(ERROR_CODES).toContain(code);
+    expect(ERROR_CODES).not.toContain("agent_upgrade_unavailable");
+    for (const code of ["environment_immutable", "environment_unsuitable", "environment_busy"])
+      expect(ERROR_CODES).not.toContain(code);
+    // Protocol 11 removed sandbox resources: no `sandboxes` Host feature.
+    expect(HOST_PROTOCOL.features).not.toContain("sandboxes");
+    // The compatibility window for protocol 4 to 10 clients is closed.
+    for (const removed of ["runtime-tenants", "admin-status", "subject-tokens", "browser-access", "derived-principals"])
+      expect(HOST_PROTOCOL.features).not.toContain(removed);
+    // Protocol 15 changed what a session pins and which tool names are reserved: 14 clients are
+    // refused too.
+    for (const version of [4, 8, 10, 11, 12, 13, 14])
+      expect(checkCompatibility({ version, required: [] }, HOST_PROTOCOL)).toMatchObject({
+        ok: false,
+        reason: "version",
+      });
+  });
+
+  it("makes artifact ids that match their pattern", () => {
+    const id = newArtifactId();
+    expect(isArtifactId(id)).toBe(true);
+    expect(isArtifactId("af_short")).toBe(false);
+  });
+
+  it("accepts a client inside the host range with required features", () => {
+    expect(
+      checkCompatibility(
+        { version: PROTOCOL_VERSION, required: [...PROTOCOL_FEATURES] },
+        HOST_PROTOCOL,
+      ),
+    ).toEqual({ ok: true });
+  });
+
+  it("rejects an out-of-range protocol version", () => {
+    expect(
+      checkCompatibility({ version: 1, required: [] }, HOST_PROTOCOL),
+    ).toEqual({
+      ok: false,
+      reason: "version",
+      client: 1,
+      host: HOST_PROTOCOL,
+    });
+  });
+
+  it("rejects missing required features", () => {
+    expect(
+      checkCompatibility(
+        { version: PROTOCOL_VERSION, required: ["agents", "missing-feature"] },
+        HOST_PROTOCOL,
+      ),
+    ).toEqual({
+      ok: false,
+      reason: "feature",
+      missing: ["missing-feature"],
+      host: HOST_PROTOCOL,
+    });
+  });
+
+});
+
+describe("keys by name (/v1/tenant/keys)", () => {
+  it("retires the operator-keys Host feature with the Admin API (protocol 8)", () => {
+    expect(OPTIONAL_HOST_FEATURES).not.toContain("operator-keys");
+    expect(HOST_PROTOCOL.features).not.toContain("operator-keys");
+    expect(PROTOCOL_FEATURES).not.toContain("operator-keys");
+  });
+
+  it("parses the key answers, and a put's key is 64 hex", () => {
+    const key = { id: "backend", role: "application", createdAt: "2026-10-04T00:00:00.000Z" };
+    expect(ListOperatorKeysResponseSchema.parse({ keys: [key] }).keys).toEqual([key]);
+    expect(
+      PutOperatorKeyResponseSchema.parse({ ...key, key: "a".repeat(64), rotated: false }).rotated,
+    ).toBe(false);
+    expect(() => PutOperatorKeyResponseSchema.parse({ ...key, key: "short", rotated: true })).toThrow();
+    expect(() => ListOperatorKeysResponseSchema.parse({ keys: [{ ...key, key: "a".repeat(64) }] })).toThrow();
+    expect(DeleteOperatorKeyResponseSchema.parse({ id: "backend", deleted: true })).toEqual({
+      id: "backend",
+      deleted: true,
+    });
+  });
+});

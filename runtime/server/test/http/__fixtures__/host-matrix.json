@@ -1,0 +1,2004 @@
+{
+  "GET /health": {
+    "none": {
+      "status": 200
+    },
+    "protocol-only": {
+      "status": 200
+    },
+    "wrong-admin": {
+      "status": 200
+    },
+    "admin": {
+      "status": 200
+    },
+    "application": {
+      "status": 200
+    },
+    "management": {
+      "status": 200
+    },
+    "admin-with-origin": {
+      "status": 403
+    }
+  },
+  "POST /health": {
+    "none": {
+      "status": 200
+    },
+    "protocol-only": {
+      "status": 200
+    },
+    "wrong-admin": {
+      "status": 200
+    },
+    "admin": {
+      "status": 200
+    },
+    "application": {
+      "status": 200
+    },
+    "management": {
+      "status": 200
+    },
+    "admin-with-origin": {
+      "status": 403
+    }
+  },
+  "GET /ready": {
+    "none": {
+      "status": 200
+    },
+    "protocol-only": {
+      "status": 200
+    },
+    "wrong-admin": {
+      "status": 200
+    },
+    "admin": {
+      "status": 200
+    },
+    "application": {
+      "status": 200
+    },
+    "management": {
+      "status": 200
+    },
+    "admin-with-origin": {
+      "status": 403
+    }
+  },
+  "GET /v1/admin/tenants": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "POST /v1/admin/tenants": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/tenants/<tenant>": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/tenants/tn_0000000000000000000000dead": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "DELETE /v1/admin/tenants/tn_0000000000000000000000dead": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/tenants/not-a-tenant": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "DELETE /v1/admin/tenants/<tenant>?activeWork=bogus": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/status": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/host": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/nothing": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/tenants/": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1//admin/tenants": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "HEAD /v1/admin/status": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json"
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\""
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\""
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\""
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json"
+    }
+  },
+  "PUT /v1/admin/status": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "GET /v1/admin/keys": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "PUT /v1/admin/keys/studio": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "PUT /v1/admin/keys/Not_A_Key": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "DELETE /v1/admin/keys/studio": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "DELETE /v1/admin/keys/missing-key": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  },
+  "POST /v1/admin/keys": {
+    "none": {
+      "status": 426,
+      "contentType": "application/json",
+      "code": "protocol_unsupported",
+      "protocol": {
+        "min": 16,
+        "max": 18,
+        "features": [
+          "studio-principal",
+          "artifacts",
+          "management-api",
+          "resource-server",
+          "model-inputs",
+          "flat-manifest",
+          "harness-boundary",
+          "agents",
+          "session-queue",
+          "usage-by-kind",
+          "tenant-fixture-model",
+          "transcript-events",
+          "subject-headers",
+          "ag-ui-endpoint",
+          "a2a-endpoint",
+          "a2a-profile-v2",
+          "sandbox-pods",
+          "trusted-issuers",
+          "session-reads",
+          "calls-export",
+          "credential-coverage",
+          "tool-calls",
+          "environment-setup",
+          "environment-disk-versions",
+          "tool-policy",
+          "traces",
+          "artifact-reads",
+          "gateway-credentials",
+          "agent-folders",
+          "session-model",
+          "model-host-identity",
+          "credential-provider",
+          "turns",
+          "agent-model",
+          "secret-routing",
+          "remove-tools",
+          "message-context",
+          "tenant-audit",
+          "agent-triggers",
+          "api-triggers",
+          "steer",
+          "queue-recovery",
+          "a2a-steer",
+          "computer-move",
+          "model-roles",
+          "plugin-subagents",
+          "plugin-files",
+          "person-started-skills"
+        ]
+      }
+    },
+    "protocol-only": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_required",
+      "message": "A bearer credential is required"
+    },
+    "wrong-admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "admin": {
+      "status": 401,
+      "contentType": "application/json",
+      "wwwAuthenticate": "Bearer error=\"invalid_token\", resource_metadata=\"<runtime>/.well-known/oauth-protected-resource\"",
+      "code": "credential_invalid",
+      "message": "The credential is not valid here"
+    },
+    "application": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "management": {
+      "status": 404,
+      "contentType": "application/json",
+      "code": "request_rejected",
+      "message": "Route not found"
+    },
+    "admin-with-origin": {
+      "status": 403,
+      "contentType": "application/json",
+      "code": "origin_rejected",
+      "message": "Application keys are not accepted from browsers"
+    }
+  }
+}

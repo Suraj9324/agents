@@ -1,0 +1,63 @@
+import type {
+  McpServerManifest,
+  PluginManifest,
+  SandboxManifest,
+  SkillManifest,
+} from "../types/manifest.js";
+import type { Delegate } from "./delegate.js";
+import type { SkillFileSource } from "../types/part.js";
+import type {
+  ToolApproval,
+  ToolDefinition,
+  ToolEffects,
+  ToolExecutionContext,
+  ToolInputSchema,
+  ToolOutcome,
+  ToolOutputSchema,
+  ToolOwner,
+  ToolRunResult,
+  ToolSchema,
+} from "../types/tool.js";
+
+export interface BoundToolDefinition<Info = unknown>
+  extends Omit<
+    ToolDefinition<ToolInputSchema, Info, ToolOutputSchema | undefined>,
+    "inputSchema" | "outputSchema" | "execute" | "run" | "input" | "output"
+  > {
+  readonly inputSchema: ToolSchema<unknown>;
+  readonly outputSchema?: ToolSchema<unknown>;
+  readonly execute: (
+    args: unknown,
+    context: ToolExecutionContext<Info>
+  ) => Promise<ToolRunResult>;
+  readonly approval?: ToolApproval<ToolInputSchema>;
+  readonly effects?: ToolEffects;
+  readonly owner: ToolOwner;
+  readonly source: ToolDefinition<any, any, any>;
+  /** Set when this tool is an agent used as a tool; the engine runs it. */
+  readonly delegate?: Delegate;
+}
+
+/**
+ * One part of an agent definition: what one builder call, skills folder or plugin added, or (in
+ * an agent rebuilt from its manifest) what one run adds, its session part. The engine offers each part's
+ * tools and instructions to the model in part order; the manifest holds the parts merged.
+ */
+export interface DefinitionPart {
+  readonly id: string;
+  readonly tools?: readonly ToolDefinition<any, any, any>[];
+  /** Execution-only tools. Advertised for this run and omitted from the manifest. */
+  readonly sessionTools?: readonly ToolDefinition<any, any, any>[];
+  readonly instructions?: readonly string[];
+  /** Text the model reads while the session tools are advertised. Not in the manifest. */
+  readonly sessionInstructions?: readonly string[];
+  readonly skills?: Readonly<Record<string, SkillManifest>>;
+  /** Each skill file's bytes, by `sha256:<hex>`. Not a manifest field. */
+  readonly skillFiles?: Readonly<Record<string, SkillFileSource>>;
+  /** The secret slots each skill's scripts read, by skill name. Not a manifest field. */
+  readonly skillSecrets?: Readonly<Record<string, readonly string[]>>;
+  readonly mcpServers?: Readonly<Record<string, McpServerManifest>>;
+  /** Agent Plugins mounted whole, with their `files`. */
+  readonly plugins?: readonly PluginManifest[];
+  readonly sandbox?: SandboxManifest;
+}

@@ -1,0 +1,108 @@
+# My Nylorun agent
+
+Before you start, install the prerequisites once. Nothing downloads them for
+you; `npx nylorun@beta doctor` checks them.
+
+- Node 24 or newer.
+- Docker with Compose v2: [Docker
+  Desktop](https://docs.docker.com/get-started/get-docker/),
+  [OrbStack](https://orbstack.dev) or [Colima](https://github.com/abiosoft/colima).
+  The local Runtime and Studio run in Docker Compose.
+
+On Windows, use [WSL2](https://learn.microsoft.com/windows/wsl/install): install
+Node inside your WSL distribution, enable Docker Desktop's WSL integration, and
+keep the project in the Linux filesystem (`~/…`, not `/mnt/c/…`), where file
+watching works.
+
+Agent definitions live in `agents/`. The **Runtime** runs your agents and
+holds their sessions in its **Tenant**, one per installation; this project
+attaches to its own local Tenant through a **Project link**. `src/main.ts`
+saves each agent in `agents/index.ts` to the Runtime as an agent manifest
+(`client.agentManifests.save`), with the runtime section in
+`runtime/scratch.runtime.json` (a virtual workspace with no network), makes the
+**Agent** its sessions run on (`client.agents.put`, named after the agent), and
+exits; from then on the Runtime runs them from what was saved. The Agent tracks
+its manifest: each save moves it to the new version in place, and each
+session's next turn runs it (`npx nylorun@beta agents pin assistant <n>` keeps
+it on one version). The project
+depends only on `@nylorun/agents`; `nylorun` runs with `npx`. It sets up and
+runs this project's local Tenant (Runtime and Studio), links the project to it,
+and manages the Tenant: its status, reset and model provider
+(`npx nylorun@beta <command>`).
+
+```sh
+npx nylorun@beta start  # this project's Tenant and the link; the first run pulls the images
+npm run dev
+```
+
+`nylorun start` in this directory sets up the project's Tenant on the first
+run (named after the directory, under `~/.nylorun/tenants/<name>/`) and just
+starts it after that. It prints the Runtime and Studio URLs; `npx nylorun
+studio` signs your browser in to Studio. The Tenant keeps running after you stop `npm run dev`, so sessions survive a source
+change; `npx nylorun stop` stops it (volumes are kept), `npx nylorun status`
+shows its health, and `npx nylorun local logs runtime -f` its logs.
+
+The first `nylorun start` writes `.nylorun/link.json` and
+`.nylorun/credentials.json`, and seeds the Tenant's model provider from
+`MODEL_PROVIDER`, `MODEL` and `MODEL_PROVIDER_API_KEY` in `.env` (see
+`.env.example`). The key is stored in the Tenant vault, never back in `.env`.
+Without them, set the provider in Studio's Model provider screen, or with
+`npx nylorun@beta tenant models set`. Model calls use the Tenant's provider and may
+incur its usual charges.
+
+`npm run dev` runs `src/main.ts` with `tsx watch`: it saves the agents to the
+Runtime, which it finds through the Project link, and saves a new version on
+every source edit. `npx nylorun studio` opens Studio on this project's Tenant,
+and signs in a browser that is not signed in yet; chat with the assistant
+there. The Runtime listens on
+`http://localhost:8787` and Studio on `http://localhost:4161`, or on free ports
+chosen on the first start.
+
+```sh
+npm run build
+npm start
+```
+
+`npm start` runs `node dist/src/main.js`, the same entry as development: it
+saves the agents once, a deploy step. Set `NYLORUN_RUNTIME_URL` and
+`NYLORUN_SERVER_KEY` before starting, or keep the Project link beside this
+directory. `agents/index.ts` exports the registry. Under `npm run dev` and
+`npm start` alike, each save moves the Agent to the new version: its sessions,
+open ones included, run your edit from their next turn, with its workspace as
+it was (a turn already running ends on its version).
+
+The assistant has no tools yet. A tool is an `http()` tool, a request the
+Runtime makes to a service of yours (see the comment in
+`agents/assistant/agent.ts`), a remote MCP server, or another agent used as a
+tool. A code tool (`tool({ run })`) is refused when it is saved: the Runtime
+runs agents from their manifests alone.
+
+An agent can also be a folder of Markdown and JSON, with no TypeScript: its
+instructions in `AGENT.md`, and `tools/`, `mcp.json`, `skills/`, `triggers/`
+and `runtime.json` beside it as it needs them, or a flow of agents
+(`flow.json`). `nylorun` writes, checks and saves one, and talks to its Agent:
+
+```sh
+npx nylorun@beta init agents/hello --example   # AGENT.md, a tool, an MCP server and a trigger, each explained
+npx nylorun@beta check agents/hello            # compile it offline: every problem by file, line and column
+npx nylorun@beta apply agents/hello --agent    # save it and make the Agent hello (--watch: again on each change)
+npx nylorun@beta chat hello                    # send each line, print each reply
+```
+
+The SDK reads the Project link itself; set `NYLORUN_RUNTIME_URL` and
+`NYLORUN_SERVER_KEY` only to run the app outside this project.
+
+Project link and credentials live in gitignored `.nylorun/` beside this project.
+The Tenant's Host root (`~/.nylorun/tenants/<name>/`, or `NYLORUN_HOME`) holds
+its files and the admin key; Tenant data lives in its Docker volumes.
+A fresh clone or second worktree does not reuse this link: `npx nylorun start`
+there gives it a Tenant of its own, and `npx nylorun start --tenant <name>`
+links it to this project's Tenant instead.
+Keep `.nylorun/` private. The application key is derived from the Tenant's
+admin key when the project is linked. Ordinary
+shutdown/restart preserves completed session history; `npx nylorun tenant reset
+--all` empties the Tenant, and `npx nylorun local reset` deletes all its data.
+
+This beta supports local text, HTTP tools, remote MCP servers and agents used
+as tools; the starter itself wires none of them. Advanced waits, media,
+deployment, reconciliation and broad recovery guarantees are deferred.

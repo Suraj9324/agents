@@ -1,0 +1,96 @@
+import { createServer } from "node:http";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  PROTOCOL_FEATURES,
+  PROTOCOL_VERSION,
+} from "@nylorun/core/compatibility";
+import { doctorSandbox } from "../../src/client/doctor.js";
+import { temporaryHome, testDeps } from "../stack/support.js";
+
+const servers: { close(): void }[] = [];
+const tenantHeaders: (string | string[] | undefined)[] = [];
+afterEach(() => servers.splice(0).forEach((server) => server.close()));
+
+async function runtime(report: unknown): Promise<string> {
+  const server = createServer((request, response) => {
+    const url = request.url ?? "/";
+    if (url === "/health") {
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify({
+          status: "ok",
+          protocol: {
+            min: PROTOCOL_VERSION,
+            max: PROTOCOL_VERSION,
+            features: [...PROTOCOL_FEATURES],
+          },
+        }),
+      );
+      return;
+    }
+    // The Management API, with the management key.
+    expect(url).toBe("/v1/tenant/sandbox");
+    expect(request.headers.authorization).toBe("Bearer key");
+    tenantHeaders.push(request.headers["nylorun-tenant"]);
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify(report));
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as { port: number };
+  return `http://127.0.0.1:${address.port}`;
+}
+
+const probes = [
+  {
+    name: "virtual",
+    isolation: "process",
+    available: true,
+    reason: "emulated shell in the Runtime process (not a VM)",
+  },
+];
+
+const report = {
+  preference: "auto",
+  backend: "virtual",
+  isolation: "process",
+  reason: "emulated shell in the Runtime process (not a VM)",
+  probes,
+  defaultImage: "python:3.13-slim",
+};
+
+it("doctor sandbox prints Tenant API report (snapshot)", async () => {
+  const url = await runtime(report);
+  const deps = testDeps(await temporaryHome(), {
+    fetch: (input, init) => fetch(input, init),
+  });
+  deps.env = { ...deps.env, NYLORUN_RUNTIME_URL: url, NYLORUN_MANAGEMENT_KEY: "key" };
+  await doctorSandbox(deps, { json: false });
+  const text = deps.lines.join("\n");
+  expect(text).toContain("virtual");
+  expect(text).toContain("selected");
+  expect(text).toContain("preference");
+  expect(text).toMatch(/platform/);
+  // The report request names no Tenant: the installation serves one.
+  expect(tenantHeaders).toEqual([undefined]);
+});
+
+it("doctor sandbox prints the limits in force: effective, or config from a Runtime before #588", async () => {
+  const limits = { network: ["github.com", "pypi.org"], idle: "15m", environments: 100 };
+  for (const sent of [
+    // `config` is what the Tenant set; `effective` is in force.
+    { ...report, config: { limits: { network: ["github.com", "pypi.org"] } }, effective: { limits } },
+    // An older Runtime sent the settings in force as `config`.
+    { ...report, config: { limits } },
+  ]) {
+    const url = await runtime(sent);
+    const deps = testDeps(await temporaryHome(), {
+      fetch: (input, init) => fetch(input, init),
+    });
+    deps.env = { ...deps.env, NYLORUN_RUNTIME_URL: url, NYLORUN_MANAGEMENT_KEY: "key" };
+    await doctorSandbox(deps, { json: false });
+    expect(deps.lines.find((text) => text.trim().startsWith("limits"))).toContain(
+      "idle 15m, 100 Agents, 2 allowed hosts",
+    );
+  }
+});

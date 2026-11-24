@@ -1,0 +1,125 @@
+package config_test
+
+import (
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/nylorun/agents/sandboxes/internal/config"
+)
+
+func TestLoad(t *testing.T) {
+	dir := t.TempDir()
+	ca := base64.StdEncoding.EncodeToString([]byte("-----BEGIN CERTIFICATE-----\n"))
+	cluster := `{"context":"docker-desktop","server":"https://127.0.0.1:6443","dial":"host.docker.internal:6443",
+		"tlsServerName":"127.0.0.1","caData":"` + ca + `","namespace":"nylorun-sbx-shop","controllerVersion":"v1.0.10",
+		"hostAddress":"192.168.65.254","bindAddress":"127.0.0.1","ports":{"harness":41001,"gates":41002,"egress":41003},
+		"networkPolicy":{"enforced":true,"probedAt":"2026-10-03T00:00:00Z"},"enabledAt":"2026-10-03T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, "cluster.json"), []byte(cluster), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"NYLORUN_SANDBOXES_DIR": dir, "NYLORUN_SANDBOXES_TOKEN": "short"}
+	if _, err := config.Load(func(k string) string { return env[k] }); err == nil {
+		t.Fatal("a short token is refused")
+	}
+	env["NYLORUN_SANDBOXES_TOKEN"] = "0123456789abcdef0123456789abcdef"
+	cfg, err := config.Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != ":4300" || cfg.TokenFile != filepath.Join(dir, "token") {
+		t.Fatalf("defaults: %+v", cfg)
+	}
+	rest, err := cfg.Rest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dial the Docker host, verify the kubeconfig's own server name.
+	if rest.Host != "https://host.docker.internal:6443" || rest.TLSClientConfig.ServerName != "127.0.0.1" ||
+		rest.BearerTokenFile != cfg.TokenFile || string(rest.TLSClientConfig.CAData) != "-----BEGIN CERTIFICATE-----\n" {
+		t.Fatalf("rest config: %+v", rest)
+	}
+	harness, gates, egress := cfg.Cluster.PodURLs()
+	if harness != "http://192.168.65.254:41001" || gates != "http://192.168.65.254:41002" || egress != "http://192.168.65.254:41003" {
+		t.Fatal("pod URLs", harness, gates, egress)
+	}
+	for _, bad := range []string{`{}`, `{"namespace":"n","dial":"nohost","caData":"x"}`, `{"namespace":"n","dial":"h:1","caData":"%%"}`} {
+		if _, err := config.ParseCluster([]byte(bad)); err == nil {
+			t.Errorf("%s is refused", bad)
+		}
+	}
+}
+
+func TestParseClusterSubstrate(t *testing.T) {
+	ca := base64.StdEncoding.EncodeToString([]byte("-----BEGIN CERTIFICATE-----\n"))
+	base := `"context":"kind-kind","server":"https://127.0.0.1:6443","dial":"host.docker.internal:6443","tlsServerName":"127.0.0.1","caData":"` + ca + `","namespace":"nylorun-sbx-shop"`
+	c, err := config.ParseCluster([]byte(`{` + base + `}`))
+	if err != nil || c.Backend != config.BackendAgentSandbox {
+		t.Fatalf("default backend: %v %v", c.Backend, err)
+	}
+	if _, err := config.ParseCluster([]byte(`{` + base + `,"backend":"substrate"}`)); err == nil {
+		t.Fatal("substrate without its settings parsed")
+	}
+	c, err = config.ParseCluster([]byte(`{` + base + `,"backend":"substrate","substrate":{"atespace":"nylorun-shop","systemNamespace":"ate-system","apiService":"api","serviceAccount":"nylorun-sandboxes","edge":{"host":"edge.shop.nylorun.internal","harnessPort":8793,"gatesPort":8794}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, g := c.EdgeURLs()
+	if h != "https://edge.shop.nylorun.internal:8793" || g != "https://edge.shop.nylorun.internal:8794" {
+		t.Fatalf("edge urls %s %s", h, g)
+	}
+	if _, err := config.ParseCluster([]byte(`{` + base + `,"backend":"other"}`)); err == nil {
+		t.Fatal("an unknown backend parsed")
+	}
+}
+
+func TestParseClusterInClusterComputer(t *testing.T) {
+	raw := `{"namespace":"nylorun","inCluster":true,"backend":"substrate","substrate":{"atespace":"nylorun","systemNamespace":"ate-system","apiService":"api","serviceAccount":"nylorun-sandboxes","computer":{}}}`
+	c, err := config.ParseCluster([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.InCluster || c.Substrate.ComputerPort() != config.DefaultComputerPort {
+		t.Fatalf("in cluster %v, computer port %d", c.InCluster, c.Substrate.ComputerPort())
+	}
+	if _, err := config.ParseCluster([]byte(`{"namespace":"nylorun","inCluster":true}`)); err == nil {
+		t.Fatal("inCluster with agent-sandbox parsed")
+	}
+	if _, err := config.ParseCluster([]byte(`{"namespace":"nylorun","backend":"substrate","substrate":{"atespace":"a","systemNamespace":"ate-system","apiService":"api","serviceAccount":"s","computer":{}}}`)); err == nil {
+		t.Fatal("outside the cluster without dial and caData parsed")
+	}
+}
+
+func TestParseClusterImageMirrors(t *testing.T) {
+	raw := `{"namespace":"nylorun","inCluster":true,"backend":"substrate","substrate":{"atespace":"nylorun","systemNamespace":"ate-system","apiService":"api","serviceAccount":"nylorun-sandboxes","computer":{}},"imageMirrors":{"ghcr.io/nylorun/bot-computer":"asia-south1-docker.pkg.dev/p/nylorun/bot-computer"}}`
+	c, err := config.ParseCluster([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Mirrors.Len() != 1 || c.Mirrors.To("ghcr.io/nylorun/bot-computer@sha256:"+strings.Repeat("a", 64)) != "asia-south1-docker.pkg.dev/p/nylorun/bot-computer@sha256:"+strings.Repeat("a", 64) {
+		t.Fatalf("mirrors %+v", c.Mirrors)
+	}
+	bad := strings.Replace(raw, `"asia-south1-docker.pkg.dev/p/nylorun/bot-computer"`, `"asia-south1-docker.pkg.dev/p/nylorun/bot-computer:1"`, 1)
+	if _, err := config.ParseCluster([]byte(bad)); err == nil || !strings.Contains(err.Error(), "imageMirrors") {
+		t.Fatalf("a mirror with a tag parsed: %v", err)
+	}
+}
+
+func TestParseFlagsComputerAgent(t *testing.T) {
+	var c config.Config
+	if err := c.ParseFlags(nil); err != nil || c.ComputerAgent != config.ComputerAgentEngine || c.ComputerImage != "" {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	image := "ghcr.io/nylorun/computer:1.0@sha256:" + strings.Repeat("a", 64)
+	if err := c.ParseFlags([]string{"--computer-agent=go", "--computer-image", image}); err != nil || c.ComputerAgent != config.ComputerAgentGo || c.ComputerImage != image {
+		t.Fatalf("go: %+v %v", c, err)
+	}
+	for _, bad := range [][]string{{"--computer-agent=go"}, {"--computer-agent=node"}, {"--computer-agent=engine", "extra"}, {"--nope"}} {
+		var c config.Config
+		if err := c.ParseFlags(bad); err == nil {
+			t.Errorf("%v parsed", bad)
+		}
+	}
+}

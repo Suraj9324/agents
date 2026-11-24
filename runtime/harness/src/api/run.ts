@@ -1,0 +1,421 @@
+/**
+ * One run: resume the engine from `turn.start` with the session's transcript (cached, or read
+ * once), run the segment over the API host, and report how it ended. Core settles it and
+ * answers with the record position the transcript is now at.
+ *
+ * A run core stopped for a shutdown or a lost lease is given back (`lease.release`); core
+ * settles nothing for it, as it never did for an advance it stopped.
+ */
+import { startedSkillsOf, withPersonStartedSkills } from "../tools/person-started.js";
+import {
+  fromBase64,
+  type CompactionFacts,
+  transcriptOf,
+  transcriptUpdates,
+  withTranscript,
+  type HarnessChannel,
+  type OutputMethod,
+  type TurnOutput,
+  type TurnStatus,
+} from "@nylorun/core/harness-api";
+import type { WorkflowManifest } from "@nylorun/core/contracts";
+import type { AgentManifest } from "@nylorun/core/define";
+import { runDurable, type DurableCheckpoint } from "../run/durable.js";
+import { runFlowDurable } from "../flow/engine.js";
+import type { FlowCheckpoint } from "../flow/checkpoint.js";
+import type { FlowOperatorLimits } from "../flow/limits.js";
+import { runAbortKind } from "./abort.js";
+import type { HarnessExecutors, HarnessRun } from "./executors.js";
+import { apiHost, type EngineConfig } from "./host.js";
+import { engineToolsFor } from "../tools/engine-tools.js";
+import { engineFeaturesOf } from "@nylorun/core/engine";
+import { memoryIndexBlock } from "../tools/memory.js";
+import { mcpToolSet } from "../tools/mcp.js";
+import { saveOutputs } from "../tools/outputs.js";
+import type { TranscriptCache } from "./transcript-cache.js";
+import type { FileContext } from "../loop/model/files.js";
+import type { LoopConfig } from "../loop/config.js";
+import type { CompactionConfig } from "../loop/compaction/config.js";
+
+export interface RunContext {
+  readonly channel: HarnessChannel;
+  readonly executors: HarnessExecutors;
+  readonly cache: TranscriptCache;
+  /** The harness's configuration of our engine's own tools. */
+  readonly engine: EngineConfig;
+}
+
+type EngineResult =
+  Awaited<ReturnType<typeof runDurable>> | Awaited<ReturnType<typeof runFlowDurable>>;
+
+const METHODS: Record<TurnStatus, OutputMethod> = {
+  completed: "turn.completed",
+  paused: "turn.paused",
+  yielded: "checkpoint",
+  waiting: "turn.waiting",
+  uncertain: "turn.waiting",
+  failed: "turn.failed",
+  cancelled: "turn.failed",
+};
+
+export async function runTurn(ctx: RunContext, run: HarnessRun): Promise<void> {
+  const { runId, signal } = run;
+  let { start } = run;
+  const sessionId = run.grant.sessionId;
+  const cursor = start.transcript.cursor;
+  let transcript: readonly unknown[] = [];
+  let output: TurnOutput;
+  let after: readonly unknown[] | undefined;
+  try {
+    if (start.engine === "agent" && ctx.executors.prepare) {
+      const prepared = await ctx.executors.prepare(run, (params) =>
+        ctx.channel.request("session.mcp", { runId, ...params }),
+      );
+      if (prepared?.mcp) {
+        start = { ...start, mcp: prepared.mcp };
+        // The executors and our engine's tools read the run's facts as they now are.
+        (run as { start: HarnessRun["start"] }).start = start;
+      }
+    }
+    let checkpoint = start.checkpoint as DurableCheckpoint;
+    // The state is ours alone: core never reads it. The turn's manifest is core's choice
+    // (the pin, or a variant a message named), and the state follows it.
+    if (
+      start.engine === "agent" &&
+      checkpoint.state &&
+      checkpoint.state.manifestHash !== checkpoint.manifestHash
+    )
+      checkpoint = {
+        ...checkpoint,
+        state: { ...checkpoint.state, manifestHash: checkpoint.manifestHash },
+      };
+    if (start.engine === "agent" && checkpoint.state) {
+      transcript = ctx.cache.get(sessionId, cursor) ?? (await read(ctx, run));
+      checkpoint = { ...checkpoint, state: withTranscript(checkpoint.state, transcript) };
+    }
+    // The session's MCP tools as our engine offers them (protocol 15): named, and laid out as our
+    // state pinned them while the facts stay the same.
+    // The Agent's memory: its tool and rules for every agent of the tree, writes for
+    // the root only, and its index pinned at the head of the conversation.
+    const memory = start.engine === "agent" ? start.memory : undefined;
+    const rootId = (start.manifest as AgentManifest).id;
+    // The agent's plan and connection requests (A2A profile v2): the version's
+    // `harness.loop.plan` and `harness.loop.connections`, for the root agent.
+    const loop =
+      start.engine === "agent"
+        ? (start.loop as { plan?: unknown; connections?: unknown; ask?: unknown } | undefined)
+        : undefined;
+    const plan = loop?.plan === true;
+    const connections = loop?.connections === true;
+    // `ask` (`nylorun-interactions`): the version's `harness.loop.ask`, for the root agent.
+    const ask = loop?.ask === true;
+    // The triggers the agent sets up itself: the version declares `harness.engine.triggers`,
+    // for the root agent only.
+    const triggers = start.engine === "agent" && start.agent?.triggers === true;
+    // Skills only a person starts: the root's turn offers those its input names, a subagent none.
+    const started = startedSkillsOf(checkpoint.input);
+    const engineTools = (agent: AgentManifest) =>
+      engineToolsFor(
+        withPersonStartedSkills(agent, agent.id === rootId ? started : undefined),
+        start.agent,
+        ctx.engine,
+        memory && {
+          access: memory.access,
+          ...(memory.instructions === undefined ? {} : { instructions: memory.instructions }),
+          root: agent.id === rootId,
+          // No index is pinned when the version sets `harness.memory.index: false`.
+          index: memory.index !== undefined,
+        },
+        plan && agent.id === rootId,
+        connections && agent.id === rootId,
+        triggers && agent.id === rootId,
+        ask && agent.id === rootId,
+      );
+    const mcp =
+      start.engine === "agent" && start.mcp
+        ? mcpToolSet(start.mcp, start.manifest as AgentManifest, {
+            config: ctx.engine.mcpTools,
+            ...(start.model ? { model: start.model } : {}),
+            ...(checkpoint.state?.mcpLayout ? { layout: checkpoint.state.mcpLayout } : {}),
+            taken: (agent) => engineTools(agent).tools.map((tool) => tool.name),
+          })
+        : undefined;
+    // What the agent's declarations leave our engine to say, not choose: claimed once,
+    // when the session's layout is decided.
+    for (const diagnostic of mcp?.diagnostics ?? [])
+      await ctx.channel
+        .request("event", {
+          runId,
+          sessionId,
+          turnId: run.grant.turnId,
+          type: "engine.diagnostic",
+          payload: diagnostic,
+        })
+        .catch(() => undefined);
+    const host = apiHost(ctx.channel, ctx.executors, run, ctx.engine, mcp);
+    const result: EngineResult =
+      start.engine === "flow"
+        ? await runFlowDurable({
+            manifest: start.manifest as WorkflowManifest,
+            checkpoint: start.checkpoint as FlowCheckpoint,
+            signal,
+            host,
+            limits: start.options.flowLimits as Partial<FlowOperatorLimits> | undefined,
+            valueChars: ctx.engine.flowValueChars,
+          })
+        : await runDurable({
+            manifest: start.manifest as AgentManifest,
+            checkpoint,
+            signal,
+            host,
+            ...(mcp ? { mcp } : {}),
+            // Our engine's own tools and text, from the turn's facts (protocol 15).
+            engineTools,
+            ...(memory?.index !== undefined
+              ? { pinned: [memoryIndexBlock({ index: memory.index, truncated: memory.truncated })] }
+              : {}),
+            // Another session wrote the memory since this one's last turn: its index again.
+            ...(memory?.refresh ? { refreshPinned: true } : {}),
+            ...(start.options.yieldAfter ? { yieldAfter: start.options.yieldAfter } : {}),
+            // Core answers the `inputs` effect: messages steered into the turn.
+            takeInputs: true,
+            ...(start.model ? { model: start.model } : {}),
+            files: filesOf(ctx, run, start, (start.manifest as AgentManifest).engine),
+            loop: await agentLoopOf(ctx, run, sessionId, start),
+          });
+    // Our engine's outputs folder: saved before the turn ends, while the run is held, for
+    // a root agent that declares nothing or declares `engine.outputs`.
+    if (
+      start.engine === "agent" &&
+      result.status === "completed" &&
+      start.agent?.sandbox !== undefined &&
+      engineFeaturesOf((start.manifest as AgentManifest).engine, { computer: true }).outputs &&
+      ctx.executors.files
+    )
+      await saveOutputs({
+        channel: ctx.channel,
+        run,
+        files: ctx.executors.files,
+        config: ctx.engine.outputs,
+        signal,
+      });
+    ({ output, after } = outputOf(runId, result, transcript, start.limits.recordEntryBytes));
+  } catch (error) {
+    output = {
+      runId,
+      thrown: {
+        ...(typeof (error as { code?: unknown })?.code === "string"
+          ? { code: (error as { code: string }).code }
+          : {}),
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+  const kind = runAbortKind(signal);
+  if (kind === "shutdown" || kind === "ownership.lost") {
+    await ctx.channel.request("lease.release", { runId, reason: kind }).catch(() => undefined);
+    return;
+  }
+  const status = output.status;
+  const settled = await ctx.channel
+    .request(status ? METHODS[status] : "turn.failed", output)
+    .catch(() => undefined);
+  // The cache follows the record: an edited transcript at the cursor core settled it at; a
+  // segment that waits leaves it as it started; a failure or cancel reverts it in the fold.
+  if (status === "waiting" || status === "uncertain") {
+    if (start.engine === "agent") ctx.cache.put(sessionId, cursor, transcript);
+  } else if (after && settled?.cursor !== undefined)
+    ctx.cache.put(
+      sessionId,
+      settled.cursor,
+      after,
+      estimate(ctx.cache, sessionId, transcript, output),
+    );
+  else ctx.cache.delete(sessionId);
+}
+
+/**
+ * How the run's engine reads the turn's files (protocol 15): it decides from the model
+ * descriptor and the Runtime limits, and reads text over the artifact seam.
+ */
+function filesOf(
+  ctx: RunContext,
+  run: HarnessRun,
+  start: HarnessRun["start"],
+  engine: AgentManifest["engine"],
+): FileContext {
+  return {
+    ...(start.model ? { model: start.model } : {}),
+    limits: start.limits,
+    // Reference lines offer `read_artifact` only to an agent that has it.
+    ...(engineFeaturesOf(engine, { computer: false }).artifactsRead
+      ? {}
+      : { artifactReads: false }),
+    async read(reference, offset, length, signal) {
+      const answer = await ctx.channel.request(
+        "artifact.read",
+        {
+          runId: run.runId,
+          artifactId: reference.artifactId,
+          version: reference.version,
+          offset,
+          length,
+        },
+        signal ?? run.signal,
+      );
+      return { artifact: answer.artifact, bytes: fromBase64(answer.base64), eof: answer.eof };
+    },
+  };
+}
+
+/** The edited transcript's size from the cached one's and the edits, without serializing it. */
+function estimate(
+  cache: TranscriptCache,
+  sessionId: string,
+  start: readonly unknown[],
+  output: TurnOutput,
+): number | undefined {
+  const base = cache.bytesOf(sessionId);
+  const updates = output.transcript ?? [];
+  if (base === undefined) return undefined;
+  if (updates.length === 0) return base;
+  const keep = updates[0]!.keep;
+  const kept = start.length === 0 ? 0 : Math.round((base * keep) / start.length);
+  return updates.reduce((sum, update) => sum + JSON.stringify(update.entries).length, kept);
+}
+
+async function read(ctx: RunContext, run: HarnessRun): Promise<unknown[]> {
+  try {
+    const { entries } = await ctx.channel.request("transcript.read", { runId: run.runId });
+    return entries;
+  } catch (error) {
+    if (run.signal.aborted) throw run.signal.reason;
+    throw error;
+  }
+}
+
+/** The engine's result as an output. An agent's state goes without its transcript. */
+function outputOf(
+  runId: string,
+  result: EngineResult,
+  start: readonly unknown[],
+  recordEntryBytes: number,
+): { output: TurnOutput; after?: readonly unknown[] } {
+  if (result.status === "waiting" || result.status === "uncertain")
+    return { output: { runId, status: result.status, effectIds: [...result.effectIds] } };
+  const outcome = ("result" in result ? result.result : {}) as {
+    state?: unknown;
+    output?: unknown;
+    pending?: unknown;
+    error?: unknown;
+  };
+  const fields = {
+    ...(outcome.output !== undefined ? { output: outcome.output } : {}),
+    ...(outcome.pending !== undefined ? { pending: outcome.pending } : {}),
+    ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+    ...("cancelEffectIds" in result && result.cancelEffectIds?.length
+      ? { cancelEffectIds: [...result.cancelEffectIds] }
+      : {}),
+  };
+  if (outcome.state === undefined) return { output: { runId, status: result.status, ...fields } };
+  const after = transcriptOf(outcome.state);
+  const compaction = compactionOf(start, after, result);
+  return {
+    output: {
+      runId,
+      status: result.status,
+      state: withTranscript(outcome.state, []),
+      transcript: transcriptUpdates(start, after, recordEntryBytes, compaction),
+      ...fields,
+    },
+    after,
+  };
+}
+
+/**
+ * What the segment says of a compaction it made: its transcript starts with a summary it did
+ * not start with, written by the root's summary calls. Our engine keeps one summary, first; a
+ * segment that compacted twice names every summary call, and the facts of the last.
+ */
+function compactionOf(
+  start: readonly unknown[],
+  after: readonly unknown[],
+  result: EngineResult,
+): CompactionFacts | undefined {
+  const ids = "summaryEffectIds" in result ? result.summaryEffectIds : undefined;
+  const entry = after[0] as
+    | { kind?: unknown; trigger?: unknown; tokensBefore?: unknown; tokensAfter?: unknown }
+    | undefined;
+  if (!ids?.length || entry?.kind !== "compaction") return undefined;
+  if (JSON.stringify(start[0]) === JSON.stringify(entry)) return undefined;
+  return {
+    trigger: entry.trigger === "overflow" ? "overflow" : "threshold",
+    tokensBefore: Math.max(0, Math.round(Number(entry.tokensBefore) || 0)),
+    tokensAfter: Math.max(0, Math.round(Number(entry.tokensAfter) || 0)),
+    summaryEffectIds: [...ids],
+  };
+}
+
+/** The compaction settings an Agent's version may set in `harness.loop.compaction`. */
+const AGENT_COMPACTION_KEYS = ["threshold", "keepTokens"] as const;
+
+/**
+ * The loop settings for this run: the Host's, with the compaction settings the Agent's version
+ * sets in `harness.loop.compaction` over them, and those of `roles[<role>]` over the Agent's for a
+ * session opened with that role. A setting that is not a positive integer is left out,
+ * and said once with an `engine.diagnostic`.
+ */
+export async function agentLoopOf(
+  ctx: {
+    readonly engine: { readonly loop: LoopConfig };
+    readonly channel: { request(kind: string, body: unknown): Promise<unknown> };
+  },
+  run: { readonly runId: string; readonly grant: { readonly turnId: string } },
+  sessionId: string,
+  start: { readonly loop?: unknown; readonly role?: unknown },
+): Promise<LoopConfig> {
+  const base = ctx.engine.loop;
+  const settings = (start.loop as { compaction?: unknown } | undefined)?.compaction;
+  if (settings === undefined) return base;
+  const ignored: string[] = [];
+  const pick = (
+    from: unknown,
+    where: string,
+  ): Partial<Pick<CompactionConfig, "threshold" | "keepTokens">> => {
+    if (from === undefined) return {};
+    if (!from || typeof from !== "object" || Array.isArray(from)) {
+      ignored.push(where);
+      return {};
+    }
+    const out: { threshold?: number; keepTokens?: number } = {};
+    for (const key of AGENT_COMPACTION_KEYS) {
+      const value = (from as Record<string, unknown>)[key];
+      if (value === undefined) continue;
+      if (typeof value === "number" && Number.isInteger(value) && value > 0) out[key] = value;
+      else ignored.push(`${where}.${key}`);
+    }
+    return out;
+  };
+  const role = typeof start.role === "string" ? start.role : undefined;
+  const roles = (settings as { roles?: unknown } | null)?.roles;
+  const own = pick(settings, "harness.loop.compaction");
+  const forRole =
+    role !== undefined && roles && typeof roles === "object" && !Array.isArray(roles)
+      ? pick((roles as Record<string, unknown>)[role], `harness.loop.compaction.roles.${role}`)
+      : {};
+  if (ignored.length > 0)
+    await ctx.channel
+      .request("event", {
+        runId: run.runId,
+        sessionId,
+        turnId: run.grant.turnId,
+        type: "engine.diagnostic",
+        payload: {
+          code: "compaction_setting_ignored",
+          message: `Left out, not a positive integer: ${ignored.join(", ")}. The Host's compaction settings apply there.`,
+        },
+      })
+      .catch(() => undefined);
+  const compaction = { ...base.compaction, ...own, ...forRole };
+  return Object.freeze({ ...base, compaction: Object.freeze(compaction) });
+}

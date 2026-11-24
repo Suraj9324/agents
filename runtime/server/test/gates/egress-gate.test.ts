@@ -1,0 +1,841 @@
+/**
+ * egress-gate (`gates/egress.ts`): a CONNECT proxy that opens a tunnel only with a live
+ * egress token, only to a host the sandbox's spec allows, on 443 or 80, never to an IP literal or
+ * a private address. Name resolution and dialling go through test hooks: every allowed name
+ * "resolves" to a local echo server, which the hook's address check lets through. Each
+ * connection is recorded once, on the test Tenant's record.
+ */
+import { createServer as createTcpServer, connect, type Server as TcpServer, type Socket } from "node:net";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  egressAllows,
+  isEgressBlocked,
+  proxyToken,
+  startEgressGate,
+  storeEgressRecord,
+  storeEgressSandboxes,
+  type EgressGate,
+  type EgressRecord,
+  type EgressSandboxes,
+  type StartEgressGateOptions,
+} from "../../src/gates/egress.js";
+import { mintEgressToken, verifyEgressToken, type EgressTokenKeyCache } from "../../src/sandbox/egress-token.js";
+import { tenantTokenIssuer } from "@nylorun/core/contracts";
+import { runFixture, type RunFixture } from "../support/run-tokens.js";
+import { startEgress } from "../../src/host/gates.js";
+import type { TenantVault, TenantVaults } from "../../src/gates/tenant-vaults.js";
+import type { Environment, SandboxPodState } from "../../src/store/types.js";
+import { recordedRows } from "../support/record.js";
+import { clientHelloFor } from "../support/tls-hello.js";
+import { testTenantPool } from "../support/store.js";
+import { startTestTelemetry } from "../support/telemetry.js";
+import { writeSandboxConfig } from "../../src/sandbox/tenant-config.js";
+
+let runs: RunFixture;
+let echo: TcpServer;
+let echoPort: number;
+const logs: { message: string; fields?: Record<string, unknown> }[] = [];
+const logger = {
+  info: (message: string, fields?: Record<string, unknown>) => logs.push({ message, ...(fields ? { fields } : {}) }),
+  warn: (message: string, fields?: Record<string, unknown>) => logs.push({ message, ...(fields ? { fields } : {}) }),
+  error: (message: string, fields?: Record<string, unknown>) => logs.push({ message, ...(fields ? { fields } : {}) }),
+};
+
+/** The sandboxes egress-gate reads: id → epoch and allowlist; absent means gone or lost. */
+const sandboxes = new Map<string, { epoch: number; allow: string[] }>();
+let reads = 0;
+const fake: EgressSandboxes = {
+  async live(id) {
+    reads += 1;
+    const sandbox = sandboxes.get(id);
+    return sandbox && { epoch: sandbox.epoch, allow: [...sandbox.allow] };
+  },
+};
+
+/** Names and what they "resolve" to. */
+const DNS: Record<string, string[]> = {
+  "allowed.test": ["127.0.0.1"],
+  "a.wild.test": ["127.0.0.1"],
+  "wild.test": ["127.0.0.1"],
+  "other.test": ["127.0.0.1"],
+  "private.test": ["10.0.0.5"],
+  "metadata.test": ["169.254.169.254"],
+  "mixed.test": ["192.168.1.10", "127.0.0.1"],
+  "loopback6.test": ["::1"],
+};
+
+const gates: EgressGate[] = [];
+async function gate(overrides: Partial<StartEgressGateOptions> = {}): Promise<EgressGate> {
+  const keys: EgressTokenKeyCache = new Map();
+  const started = await startEgressGate({
+    listen: { host: "127.0.0.1", port: 0 },
+    logger,
+    verify: (raw) => verifyEgressToken(runs.store, runs.tenantId, raw, keys),
+    sandboxes: fake,
+    cacheMs: 0,
+    async lookup(host) {
+      const addresses = DNS[host];
+      if (!addresses) throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND" });
+      return addresses.map((address) => ({ address, family: address.includes(":") ? 6 : 4 }));
+    },
+    // The echo server is on loopback: let 127.0.0.1 through, refuse everything else as usual.
+    blocked: (address) => address !== "127.0.0.1" && isEgressBlocked(address),
+    dial: (address) => connect({ host: address, port: echoPort }),
+    ...overrides,
+  });
+  gates.push(started);
+  return started;
+}
+
+const token = async (sandboxId = "sbx_1", epoch = 1) =>
+  (await mintEgressToken({ keys: runs.keys }, { tenantId: runs.tenantId, sandboxId, epoch, podUid: "pod-1" })).token;
+const basic = (raw: string) => `Basic ${Buffer.from(`nylo:${raw}`).toString("base64")}`;
+
+interface Answer {
+  status: number;
+  head: string;
+  socket: Socket;
+  /** The ClientHello bytes `tunnel` sent on an open 443 tunnel; 0 otherwise. */
+  helloBytes?: number;
+}
+
+/** Sends `request` to the gate and reads the answer's head. */
+function send(proxy: EgressGate, request: string): Promise<Answer> {
+  const port = Number(new URL(proxy.url).port);
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let buffer = "";
+    const onData = (chunk: Buffer) => {
+      buffer += chunk.toString("latin1");
+      const end = buffer.indexOf("\r\n\r\n");
+      if (end === -1) return;
+      socket.off("data", onData);
+      const head = buffer.slice(0, end);
+      const rest = buffer.slice(end + 4);
+      if (rest) socket.unshift(Buffer.from(rest, "latin1"));
+      resolve({ status: Number(/^HTTP\/1\.1 (\d{3})/.exec(head)?.[1]), head, socket });
+    };
+    socket.on("data", onData);
+    socket.once("error", reject);
+    socket.write(request);
+  });
+}
+
+const sockets: Socket[] = [];
+/**
+ * Opens a tunnel. On an open 443 tunnel it then sends a ClientHello naming the target, as a TLS
+ * client does, and reads the echo server's copy back, so the tunnel is past the gate's SNI check
+ *. `serverName` overrides the name sent; `null` sends none.
+ */
+async function tunnel(proxy: EgressGate, target: string, authorization?: string, serverName?: string | null): Promise<Answer> {
+  const answer = await send(
+    proxy,
+    `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${authorization ? `Proxy-Authorization: ${authorization}\r\n` : ""}\r\n`,
+  );
+  sockets.push(answer.socket);
+  const [host, port] = [target.slice(0, target.lastIndexOf(":")), target.slice(target.lastIndexOf(":") + 1)];
+  if (answer.status === 200 && port === "443") {
+    const hello = await clientHelloFor(serverName === null ? undefined : (serverName ?? host.replace(/\.$/, "")));
+    answer.socket.write(hello);
+    answer.helloBytes = hello.length;
+    if (serverName === undefined) await readBytes(answer.socket, hello.length);
+  }
+  return answer;
+}
+
+/** Reads exactly `count` bytes from `socket`. */
+function readBytes(socket: Socket, count: number): Promise<Buffer> {
+  return new Promise((resolve) => {
+    let got = Buffer.alloc(0);
+    const onData = (chunk: Buffer) => {
+      got = Buffer.concat([got, chunk]);
+      if (got.length >= count) {
+        socket.off("data", onData);
+        if (got.length > count) socket.unshift(got.subarray(count));
+        resolve(got.subarray(0, count));
+      }
+    };
+    socket.on("data", onData);
+  });
+}
+
+/** Writes `text` through an open tunnel and reads it back from the echo server. */
+function roundTrip(socket: Socket, text: string): Promise<string> {
+  return new Promise((resolve) => {
+    let got = "";
+    const onData = (chunk: Buffer) => {
+      got += chunk.toString();
+      if (got.length >= text.length) {
+        socket.off("data", onData);
+        resolve(got);
+      }
+    };
+    socket.on("data", onData);
+    socket.write(text);
+  });
+}
+
+const closed = (socket: Socket) =>
+  new Promise<void>((resolve) => {
+    if (socket.destroyed || socket.readableEnded) return resolve();
+    socket.once("close", () => resolve());
+    socket.resume();
+  });
+
+beforeAll(async () => {
+  runs = await runFixture();
+  echo = createTcpServer((socket) => socket.pipe(socket));
+  await new Promise<void>((resolve) => echo.listen(0, "127.0.0.1", resolve));
+  echoPort = (echo.address() as { port: number }).port;
+});
+
+afterEach(async () => {
+  for (const socket of sockets.splice(0)) socket.destroy();
+  await Promise.all(gates.splice(0).map((started) => started.close()));
+  sandboxes.clear();
+  logs.length = 0;
+});
+
+afterAll(async () => {
+  await new Promise((resolve) => echo.close(resolve));
+});
+
+describe("egress-gate", () => {
+  it("tunnels to an allowed host with Basic or Bearer credentials, exactly or by *.suffix", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test", "*.wild.test"] });
+    const proxy = await gate();
+    const raw = await token();
+    const viaBasic = await tunnel(proxy, "allowed.test:443", basic(raw));
+    expect(viaBasic.status).toBe(200);
+    expect(await roundTrip(viaBasic.socket, "ping")).toBe("ping");
+    const viaBearer = await tunnel(proxy, "a.wild.test:80", `Bearer ${raw}`);
+    expect(viaBearer.status).toBe(200);
+    expect(await roundTrip(viaBearer.socket, "pong")).toBe("pong");
+    // A bare `<token>@` in the proxy URL: the token is the user name.
+    const viaUser = await tunnel(proxy, "ALLOWED.test.:443", `Basic ${Buffer.from(`${raw}:`).toString("base64")}`);
+    expect(viaUser.status).toBe(200);
+    // `*.wild.test` does not match wild.test itself.
+    expect((await tunnel(proxy, "wild.test:443", basic(raw))).status).toBe(403);
+  });
+
+  it("counts each connection once by outcome and refusal reason, and an allowed one's bytes", async () => {
+    const test = startTestTelemetry();
+    try {
+      sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+      const proxy = await gate();
+      expect((await tunnel(proxy, "allowed.test:443")).status).toBe(407);
+      expect((await tunnel(proxy, "other.test:443", basic(await token()))).status).toBe(403);
+      const allowed = await tunnel(proxy, "allowed.test:80", basic(await token()));
+      expect(await roundTrip(allowed.socket, "ping")).toBe("ping");
+      allowed.socket.end();
+      await closed(allowed.socket);
+      await expect
+        .poll(async () => (await test.points("nylorun.egress.connections")).map((point) => [point.attributes, point.value]))
+        .toEqual([
+          [{ "nylorun.egress.outcome": "refused", "nylorun.egress.reason": "egress_token_missing" }, 1],
+          [{ "nylorun.egress.outcome": "refused", "nylorun.egress.reason": "host_not_allowed" }, 1],
+          [{ "nylorun.egress.outcome": "allowed" }, 1],
+        ]);
+      expect(await test.points("nylorun.egress.bytes")).toEqual([
+        { attributes: { "network.io.direction": "transmit" }, value: 4 },
+        { attributes: { "network.io.direction": "receive" }, value: 4 },
+      ]);
+    } finally {
+      await test.close();
+    }
+  });
+
+  it("refuses a host the spec does not allow, and every host when the spec allows none", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    sandboxes.set("sbx_2", { epoch: 1, allow: [] });
+    const proxy = await gate();
+    const refused = await tunnel(proxy, "other.test:443", basic(await token()));
+    expect(refused.status).toBe(403);
+    expect(refused.head).not.toMatch(/proxy-authenticate/i);
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_2")))).status).toBe(403);
+    expect(logs).toContainEqual({
+      message: "egress_refused",
+      fields: { status: 403, reason: "host_not_allowed", host: "other.test", port: 443, sandboxId: "sbx_1" },
+    });
+  });
+
+  it("closes a 443 tunnel whose ClientHello names another host, or none, or isn't TLS", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test", "*.wild.test"] });
+    const proxy = await gate({ helloMs: 2_000 });
+    const raw = await token();
+    const refusals = () => logs.filter((entry) => entry.message === "egress_refused").map((entry) => entry.fields?.reason);
+
+    // Fronting: CONNECT to an allowed host, then ask the front end for another one.
+    const fronted = await tunnel(proxy, "allowed.test:443", basic(raw), "evil.test");
+    expect(fronted.status).toBe(200);
+    await closed(fronted.socket);
+    // No server name at all.
+    const nameless = await tunnel(proxy, "allowed.test:443", basic(raw), null);
+    await closed(nameless.socket);
+    // Not TLS.
+    const plain = await send(proxy, `CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\nProxy-Authorization: ${basic(raw)}\r\n\r\n`);
+    sockets.push(plain.socket);
+    plain.socket.write("GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n");
+    await closed(plain.socket);
+    // Nothing sent before the wait ends.
+    const silent = await send(proxy, `CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\nProxy-Authorization: ${basic(raw)}\r\n\r\n`);
+    sockets.push(silent.socket);
+    await closed(silent.socket);
+    expect(refusals()).toEqual(["sni_mismatch", "sni_missing", "sni_invalid", "sni_timeout"]);
+    expect(logs.find((entry) => entry.fields?.reason === "sni_mismatch")?.fields).toMatchObject({ host: "allowed.test", serverName: "evil.test", port: 443 });
+
+    // The name it was allowed, any case, and a *.suffix host, pass.
+    const exact = await tunnel(proxy, "allowed.test:443", basic(raw));
+    expect(await roundTrip(exact.socket, "ping")).toBe("ping");
+    const wild = await tunnel(proxy, "a.wild.test:443", basic(raw));
+    expect(await roundTrip(wild.socket, "ping")).toBe("ping");
+    // Port 80 carries no TLS: no check.
+    const http = await tunnel(proxy, "allowed.test:80", basic(raw));
+    expect(await roundTrip(http.socket, "GET / HTTP/1.1\r\n\r\n")).toBe("GET / HTTP/1.1\r\n\r\n");
+  });
+
+  it("refuses ports other than 443 and 80", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    const proxy = await gate();
+    for (const port of [22, 5432, 8080, 444])
+      expect((await tunnel(proxy, `allowed.test:${port}`, basic(await token()))).status).toBe(403);
+  });
+
+  it("refuses IP literals and names that are not host names", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    const proxy = await gate();
+    const raw = await token();
+    for (const target of ["127.0.0.1:443", "1.1.1.1:443", "[::1]:443", "[2606:4700::1111]:443", "2130706433:443", "localhost:443", "*.wild.test:443", "allowed.test"])
+      expect((await tunnel(proxy, target, basic(raw))).status, target).toBe(403);
+  });
+
+  it("refuses a name that resolves to a private, link-local or loopback address", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["private.test", "metadata.test", "loopback6.test", "mixed.test", "gone.test"] });
+    const dialled: string[] = [];
+    const proxy = await gate({
+      dial: (address) => {
+        dialled.push(address);
+        return connect({ host: "127.0.0.1", port: echoPort });
+      },
+    });
+    const raw = await token();
+    for (const host of ["private.test", "metadata.test", "loopback6.test"])
+      expect((await tunnel(proxy, `${host}:443`, basic(raw))).status, host).toBe(403);
+    expect((await tunnel(proxy, "gone.test:443", basic(raw))).status).toBe(502);
+    // Only the checked address is dialled.
+    expect((await tunnel(proxy, "mixed.test:443", basic(raw))).status).toBe(200);
+    expect(dialled).toEqual(["127.0.0.1"]);
+  });
+
+  it("refuses a missing, malformed, expired or stale-epoch token, and a gone sandbox", async () => {
+    sandboxes.set("sbx_1", { epoch: 2, allow: ["allowed.test"] });
+    const proxy = await gate();
+    const missing = await tunnel(proxy, "allowed.test:443");
+    expect(missing.status).toBe(407);
+    expect(missing.head).toMatch(/proxy-authenticate: Basic realm="nylorun-egress"/i);
+    expect((await tunnel(proxy, "allowed.test:443", basic("not-a-token"))).status).toBe(407);
+    expect((await tunnel(proxy, "allowed.test:443", "Digest abc")).status).toBe(407);
+    const iat = Math.floor(Date.now() / 1000) - 600;
+    const expired = await runs.keys.sign({
+      typ: "nylorun-egress+jwt",
+      claims: { iss: tenantTokenIssuer(runs.tenantId), aud: "nylorun-egress", sbx: "sbx_1", epc: 2, pod: "p", iat, exp: iat + 60, jti: "j" },
+    });
+    expect((await tunnel(proxy, "allowed.test:443", basic(expired.token))).status).toBe(407);
+    // The sandbox's host epoch moved on (a relaunch): the old pod's token is stale.
+    const stale = await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 1)));
+    expect(stale.status).toBe(407);
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 3)))).status).toBe(407);
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 2)))).status).toBe(200);
+    // Lost or deleted.
+    sandboxes.delete("sbx_1");
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 2)))).status).toBe(407);
+    const reasons = logs.filter((entry) => entry.message === "egress_refused").map((entry) => entry.fields?.reason);
+    expect(reasons).toEqual([
+      "egress_token_missing",
+      "egress_token_malformed",
+      "egress_token_missing",
+      "egress_token_expired",
+      "epoch_stale",
+      "epoch_stale",
+      "sandbox_gone",
+    ]);
+    expect(JSON.stringify(logs)).not.toContain(expired.token);
+  });
+
+  it("refuses a run token or a host token presented as an egress token", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    const proxy = await gate();
+    const run = (await runs.run("egress-gate-run")).token;
+    const iat = Math.floor(Date.now() / 1000);
+    const host = await runs.keys.sign({
+      typ: "nylorun-host+jwt",
+      claims: { iss: tenantTokenIssuer(runs.tenantId), aud: "nylorun-harness", sbx: "sbx_1", epc: 1, pod: "p", iat, exp: iat + 60, jti: "h" },
+    });
+    for (const raw of [run, host.token]) {
+      expect((await tunnel(proxy, "allowed.test:443", basic(raw))).status).toBe(407);
+      expect((await tunnel(proxy, "allowed.test:443", `Bearer ${raw}`)).status).toBe(407);
+    }
+  });
+
+  it("answers plain HTTP, absolute-form or not, with 405", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    const proxy = await gate();
+    const raw = await token();
+    for (const request of [
+      `GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nProxy-Authorization: ${basic(raw)}\r\n\r\n`,
+      "GET /ready HTTP/1.1\r\nHost: gateway\r\n\r\n",
+      "POST http://allowed.test/x HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\n\r\n",
+    ]) {
+      const answer = await send(proxy, request);
+      sockets.push(answer.socket);
+      expect(answer.status).toBe(405);
+      expect(answer.head).toMatch(/allow: CONNECT/i);
+    }
+  });
+
+  it("caps open tunnels per sandbox, and frees a slot when one closes", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    sandboxes.set("sbx_2", { epoch: 1, allow: ["allowed.test"] });
+    const proxy = await gate({ maxPerSandbox: 2 });
+    const raw = await token();
+    const first = await tunnel(proxy, "allowed.test:443", basic(raw));
+    const second = await tunnel(proxy, "allowed.test:443", basic(raw));
+    expect([first.status, second.status]).toEqual([200, 200]);
+    expect((await tunnel(proxy, "allowed.test:443", basic(raw))).status).toBe(429);
+    // Another sandbox has its own slots.
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_2")))).status).toBe(200);
+    first.socket.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await tunnel(proxy, "allowed.test:443", basic(raw))).status).toBe(200);
+  });
+
+  it("closes a tunnel that stays idle", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    const proxy = await gate({ idleMs: 150 });
+    const open = await tunnel(proxy, "allowed.test:443", basic(await token()));
+    expect(open.status).toBe(200);
+    expect(await roundTrip(open.socket, "x")).toBe("x");
+    const started = Date.now();
+    await closed(open.socket);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("runs in the gateway over the Tenant's keys (`--service egress`)", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    const vaults: TenantVaults = {
+      // No session on the sandbox binds a shell secret: every host is a tunnel.
+      open: async () =>
+        ({ tenantId: runs.tenantId, store: runs.store, environmentSecretBound: async () => false }) as unknown as TenantVault,
+    };
+    const proxy = await startEgress({
+      egress: { listen: { host: "127.0.0.1", port: 0 } },
+      logger,
+      vaults,
+      gate: {
+        sandboxes: fake,
+        lookup: async () => [{ address: "127.0.0.1", family: 4 }],
+        blocked: () => false,
+        dial: (address) => connect({ host: address, port: echoPort }),
+      },
+    });
+    gates.push(proxy);
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token()))).status).toBe(200);
+    expect((await tunnel(proxy, "other.test:443", basic(await token()))).status).toBe(403);
+  });
+
+  it("reuses a sandbox's epoch and allowlist for the cache window, and reads again for a newer epoch", async () => {
+    sandboxes.set("sbx_1", { epoch: 1, allow: ["allowed.test"] });
+    const proxy = await gate({ cacheMs: 60_000 });
+    reads = 0;
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 1)))).status).toBe(200);
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 1)))).status).toBe(200);
+    expect(reads).toBe(1);
+    // A join bumped the epoch: the new token's epoch is newer than the cached one.
+    sandboxes.set("sbx_1", { epoch: 2, allow: ["allowed.test"] });
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 2)))).status).toBe(200);
+    expect(reads).toBe(2);
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token("sbx_1", 1)))).status).toBe(407);
+  });
+});
+
+/** A pod Agent `id` the gate's sandbox reads allow `allow` for, as its record holds it. */
+async function podAgent(id: string, allow: string[]): Promise<void> {
+  const now = new Date().toISOString();
+  const recipe = { harness: "nylorun", lifecycle: {}, network: { allowedHosts: allow } };
+  await runs.store.tx((t) =>
+    t.createEnvironment(
+      {
+        id,
+        kind: "pod",
+        labels: {},
+        recipe,
+        applied: recipe,
+        version: 1,
+        appliedVersion: 1,
+        lastUsedAt: now,
+        createdAt: now,
+        updatedAt: now,
+        manifestName: "bot",
+        manifestVersion: 1,
+        manifestRef: "tracking",
+        manifestHash: "sha256:test",
+        desiredState: "on",
+        pod: { k8sName: `${id}-g0`, volumeGen: 0, desired: "running", observed: "running", podUid: "pod-1", hostEpoch: 1, rev: 1 },
+      },
+      100,
+    ),
+  );
+  sandboxes.set(id, { epoch: 1, allow });
+}
+
+/** Session `id` on Agent `agentId`, its turn `turnId` holding it (or none). */
+async function sessionOn(id: string, agentId: string, turnId: string | null): Promise<void> {
+  await runs.store.tx((t) =>
+    t.put("sessions", id, {
+      id,
+      agentId,
+      ownerUserId: "user-1",
+      status: turnId ? "running" : "idle",
+      activeTurnId: turnId,
+      environmentId: agentId,
+    }),
+  );
+}
+
+/** The gate's record on the test Tenant, counting the reads and writes it finished (or failed). */
+let turnReads = 0;
+let writes = 0;
+function record(): EgressRecord {
+  const inner = storeEgressRecord(runs.store);
+  return {
+    async runningTurns(environmentId) {
+      try {
+        return await inner.runningTurns(environmentId);
+      } finally {
+        turnReads += 1;
+      }
+    },
+    async write(connection) {
+      try {
+        await inner.write(connection);
+      } finally {
+        writes += 1;
+      }
+    },
+  };
+}
+
+async function until(done: () => boolean, ms = 5_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error("timed out");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** Every session event of the test Tenant, as stored. */
+async function sessionRows(): Promise<{ sessionId: string; body: Record<string, any> }[]> {
+  const rows = await recordedRows(testTenantPool(runs.tenantId), runs.tenantId);
+  return [...rows.values()].flat().map((row) => ({ sessionId: row.sessionId, body: row.body as Record<string, any> }));
+}
+
+/** The `agent.egress` events on Agent `id`'s stream. */
+const egressOf = async (id: string) =>
+  (await runs.store.tx((t) => t.agentEvents(id, { types: ["agent.egress"] }))) as Record<string, any>[];
+
+describe("egress-gate events", () => {
+  it("records one agent.egress per tunnel, naming the turns that ran when it opened", async () => {
+    await podAgent("egress-held", ["allowed.test"]);
+    await sessionOn("egress-held-s", "egress-held", "turn-1");
+    await sessionOn("egress-held-t", "egress-held", "turn-9");
+    await sessionOn("egress-held-u", "egress-held", null);
+    const proxy = await gate({ record: record() });
+    turnReads = 0;
+    writes = 0;
+    const open = await tunnel(proxy, "allowed.test:443", basic(await token("egress-held")));
+    expect(open.status).toBe(200);
+    expect(await roundTrip(open.socket, "ping")).toBe("ping");
+    expect(await roundTrip(open.socket, "hello")).toBe("hello");
+    // The gate never waits for its read of the running turns; the test does, before a turn moves.
+    await until(() => turnReads === 1);
+    // A turn ends (another starts) before the tunnel closes: the event keeps the turns read at open.
+    await runs.update("egress-held-s", { activeTurnId: "turn-2" });
+    open.socket.destroy();
+    await until(() => writes === 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(writes).toBe(1);
+    expect(turnReads).toBe(1);
+    const events = await egressOf("egress-held");
+    expect(events).toHaveLength(1);
+    const [event] = events;
+    expect(event).toMatchObject({
+      type: "agent.egress",
+      agentId: "egress-held",
+      payload: {
+        agentId: "egress-held",
+        host: "allowed.test",
+        port: 443,
+        outcome: "allowed",
+        mode: "tunnel",
+        credentialBound: false,
+        // "ping" and "hello", after the ClientHello the gate checked and the echo returned.
+        bytesUp: 9 + open.helloBytes!,
+        bytesDown: 9 + open.helloBytes!,
+        runningTurns: [
+          { sessionId: "egress-held-s", turnId: "turn-1" },
+          { sessionId: "egress-held-t", turnId: "turn-9" },
+        ],
+      },
+    });
+    expect(event!.payload).not.toHaveProperty("reason");
+    expect(event!.payload).not.toHaveProperty("requests");
+    expect(event!.payload.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Date.parse(event!.payload.startedAt)).toBeLessThanOrEqual(Date.parse(event!.time));
+    // No session log holds it.
+    expect((await sessionRows()).filter((row) => row.body.type === "egress.connection")).toEqual([]);
+  });
+
+  it("records a refusal at once with its reason and status, and a bad token not at all", async () => {
+    await podAgent("egress-refused", ["allowed.test", "private.test"]);
+    await sessionOn("egress-refused-s", "egress-refused", "turn-1");
+    const proxy = await gate({ record: record() });
+    writes = 0;
+    const raw = await token("egress-refused");
+    expect((await tunnel(proxy, "other.test:443", basic(raw))).status).toBe(403);
+    expect((await tunnel(proxy, "allowed.test:22", basic(raw))).status).toBe(403);
+    expect((await tunnel(proxy, "private.test:443", basic(raw))).status).toBe(403);
+    // Before the Agent is known: a log line only.
+    expect((await tunnel(proxy, "allowed.test:443", basic("not-a-token"))).status).toBe(407);
+    await until(() => writes === 3);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(writes).toBe(3);
+    const events = await egressOf("egress-refused");
+    expect(events.map((event) => [event.payload.host, event.payload.port, event.payload.reason, event.payload.status])).toEqual(
+      expect.arrayContaining([
+        ["other.test", 443, "host_not_allowed", 403],
+        ["allowed.test", 22, "port_refused", 403],
+        ["private.test", 443, "address_refused", 403],
+      ]),
+    );
+    expect(events).toHaveLength(3);
+    for (const event of events) {
+      expect(event.payload).toMatchObject({
+        outcome: "refused",
+        mode: "tunnel",
+        bytesUp: 0,
+        bytesDown: 0,
+        runningTurns: [{ sessionId: "egress-refused-s", turnId: "turn-1" }],
+      });
+    }
+  });
+
+  it("records traffic while no turn runs with no running turns", async () => {
+    await podAgent("egress-idle", ["allowed.test"]);
+    await sessionOn("egress-idle-s", "egress-idle", null);
+    const proxy = await gate({ record: record() });
+    writes = 0;
+    const open = await tunnel(proxy, "allowed.test:80", basic(await token("egress-idle")));
+    expect(await roundTrip(open.socket, "x")).toBe("x");
+    open.socket.destroy();
+    await until(() => writes === 1);
+    const events = await egressOf("egress-idle");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "agent.egress",
+      agentId: "egress-idle",
+      payload: { agentId: "egress-idle", host: "allowed.test", port: 80, outcome: "allowed", bytesUp: 1, bytesDown: 1, runningTurns: [] },
+    });
+  });
+
+  it("names at most 16 running turns", async () => {
+    await podAgent("egress-many", ["allowed.test"]);
+    for (let i = 0; i < 20; i += 1) await sessionOn(`egress-many-${String(i).padStart(2, "0")}`, "egress-many", `turn-${i}`);
+    const turns = await storeEgressRecord(runs.store).runningTurns("egress-many");
+    expect(turns).toHaveLength(16);
+    expect(turns[0]).toEqual({ sessionId: "egress-many-00", turnId: "turn-0" });
+  });
+
+  it("never records a header value, a path or a body", async () => {
+    await podAgent("egress-scan", ["allowed.test"]);
+    await sessionOn("egress-scan-s", "egress-scan", "turn-1");
+    const proxy = await gate({ record: record() });
+    writes = 0;
+    const raw = await token("egress-scan");
+    const open = await tunnel(proxy, "allowed.test:443", basic(raw));
+    const request = "GET /secret/path HTTP/1.1\r\nAuthorization: Bearer header-value-1\r\n\r\nbody-bytes";
+    expect(await roundTrip(open.socket, request)).toBe(request);
+    open.socket.destroy();
+    expect((await tunnel(proxy, "other.test:443", basic(raw))).status).toBe(403);
+    await until(() => writes === 2);
+    const rows = JSON.stringify([
+      ...(await sessionRows()).map((row) => row.body),
+      ...(await runs.store.tx((t) => t.agentEvents("egress-scan"))),
+    ]);
+    expect(rows).toContain("agent.egress");
+    for (const secret of [raw, basic(raw), "header-value-1", "/secret/path", "body-bytes", "Authorization", "nylo:"])
+      expect(rows).not.toContain(secret);
+  });
+
+  it("logs a failed write and keeps the tunnel", async () => {
+    await podAgent("egress-failing", ["allowed.test"]);
+    const proxy = await gate({
+      record: {
+        runningTurns: async () => [],
+        write: async () => {
+          throw new Error("the record is down");
+        },
+      },
+    });
+    const open = await tunnel(proxy, "allowed.test:443", basic(await token("egress-failing")));
+    expect(await roundTrip(open.socket, "still")).toBe("still");
+    open.socket.destroy();
+    await until(() => logs.some((entry) => entry.message === "egress_record_failed"));
+    expect(logs.find((entry) => entry.message === "egress_record_failed")!.fields).toMatchObject({
+      sandboxId: "egress-failing",
+      host: "allowed.test",
+    });
+  });
+});
+
+describe("egress-gate helpers", () => {
+  it("reads a pod Agent's host epoch, pod and applied allowlist; nothing once deleted or lost", async () => {
+    const now = new Date().toISOString();
+    const pod = (patch: Partial<SandboxPodState> = {}): SandboxPodState => ({
+      k8sName: "sbx-x-g0",
+      volumeGen: 0,
+      desired: "running",
+      observed: "running",
+      podUid: "pod-7",
+      hostEpoch: 4,
+      rev: 1,
+      ...patch,
+    });
+    const recipe = (allowedHosts?: string[]) => ({
+      harness: "nylorun",
+      lifecycle: {},
+      ...(allowedHosts ? { network: { allowedHosts } } : {}),
+    });
+    const row = (
+      id: string,
+      kind: "virtual" | "pod",
+      allow?: string[],
+      state?: SandboxPodState,
+      asked: string[] | undefined = allow,
+    ): Environment => ({
+      id,
+      kind,
+      labels: {},
+      recipe: recipe(asked),
+      applied: recipe(allow),
+      version: 1,
+      appliedVersion: 1,
+      lastUsedAt: now,
+      createdAt: now,
+      updatedAt: now,
+      manifestName: "bot",
+      manifestVersion: 1,
+      manifestRef: "tracking",
+      manifestHash: "sha256:test",
+      desiredState: "on",
+      ...(state ? { pod: state } : {}),
+    });
+    await runs.store.tx(async (t) => {
+      await t.createEnvironment(row("egress-pod", "pod", ["*.example.com"], pod()), 100);
+      await t.createEnvironment(row("egress-pod-none", "pod", undefined, pod({ podUid: undefined, hostEpoch: 0 })), 100);
+      // A recipe change not yet applied to the pod: the gate reads what the pod runs.
+      await t.createEnvironment(row("egress-pod-pending", "pod", ["a.example.com"], pod(), ["b.example.com"]), 100);
+      await t.createEnvironment(row("egress-pod-deleted", "pod", ["a.example.com"], pod({ desired: "deleted" })), 100);
+      await t.createEnvironment(row("egress-pod-lost", "pod", ["a.example.com"], pod({ observed: "lost" })), 100);
+      await t.createEnvironment(row("egress-virtual", "virtual", ["example.com"]), 100);
+    });
+    const store = storeEgressSandboxes(runs.store);
+    expect(await store.live("egress-pod")).toEqual({ epoch: 4, podUid: "pod-7", name: "sbx-x-g0", allow: ["*.example.com"] });
+    expect(await store.live("egress-pod-none")).toEqual({ epoch: 0, name: "sbx-x-g0", allow: [] });
+    expect(await store.live("egress-pod-pending")).toEqual({ epoch: 4, podUid: "pod-7", name: "sbx-x-g0", allow: ["a.example.com"] });
+    for (const id of ["egress-pod-deleted", "egress-pod-lost", "egress-virtual", "egress-unknown"])
+      expect(await store.live(id), id).toBeUndefined();
+  });
+
+  it("reads an owned pod Agent's owner, and the Tenant's egress ceiling once it sets one", async () => {
+    const now = new Date().toISOString();
+    await runs.store.tx(async (t) => {
+      await t.createEnvironment(
+        {
+          id: "egress-owned",
+          kind: "pod",
+          labels: {},
+          recipe: { harness: "nylorun", lifecycle: {}, network: { allowedHosts: ["a.example.com"] } },
+          applied: { harness: "nylorun", lifecycle: {}, network: { allowedHosts: ["a.example.com"] } },
+          version: 1,
+          appliedVersion: 1,
+          ownerUserId: "u:org:ada",
+          lastUsedAt: now,
+          createdAt: now,
+          updatedAt: now,
+          manifestName: "bot",
+          manifestVersion: 1,
+          manifestRef: "tracking",
+          manifestHash: "sha256:test",
+          desiredState: "on",
+          pod: { k8sName: "sbx-o-g0", volumeGen: 0, desired: "running", observed: "running", podUid: "pod-8", hostEpoch: 2, rev: 1 },
+        },
+        100,
+      );
+    });
+    const store = storeEgressSandboxes(runs.store);
+    // No ceiling of the Tenant's own: none is read into the answer.
+    expect(await store.live("egress-owned")).toEqual({ epoch: 2, podUid: "pod-8", name: "sbx-o-g0", allow: ["a.example.com"], owner: "u:org:ada" });
+    await runs.store.tx((t) => writeSandboxConfig(t, { limits: { network: ["*.example.com", "api.vercel.com"] } }));
+    expect(await store.live("egress-owned")).toEqual({
+      epoch: 2,
+      podUid: "pod-8",
+      name: "sbx-o-g0",
+      allow: ["a.example.com"],
+      owner: "u:org:ada",
+      ceiling: ["*.example.com", "api.vercel.com"],
+    });
+    // An Agent with no owner is never asked about, so its ceiling is not read.
+    expect(await store.live("egress-pod")).toEqual({ epoch: 4, podUid: "pod-7", name: "sbx-x-g0", allow: ["*.example.com"] });
+    await runs.store.tx((t) => writeSandboxConfig(t, {}));
+  });
+
+  it("refuses a token of another pod at the sandbox's epoch", async () => {
+    const proxy = await gate({
+      sandboxes: { live: async () => ({ epoch: 1, podUid: "pod-other", allow: ["allowed.test"] }) },
+    });
+    expect((await tunnel(proxy, "allowed.test:443", basic(await token()))).status).toBe(407);
+    expect(logs.some((entry) => entry.fields?.reason === "pod_stale")).toBe(true);
+  });
+
+  it("blocks private, loopback, link-local, metadata, reserved and IPv4-embedding addresses", () => {
+    for (const address of [
+      "10.1.2.3", "172.16.0.1", "192.168.65.254", "127.0.0.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
+      "224.0.0.1", "255.255.255.255", "198.18.0.1", "::1", "::", "fe80::1", "fd00:ec2::254",
+      "::ffff:127.0.0.1", "::ffff:169.254.169.254", "64:ff9b::a00:1", "2002:a00:1::", "not-an-address",
+    ])
+      expect(isEgressBlocked(address), address).toBe(true);
+    for (const address of ["93.184.215.14", "1.1.1.1", "2606:4700::1111", "::ffff:1.1.1.1"])
+      expect(isEgressBlocked(address), address).toBe(false);
+  });
+
+  it("matches exact names and *.suffix patterns only", () => {
+    const allow = ["api.github.com", "*.example.com"];
+    expect(egressAllows("api.github.com", allow)).toBe(true);
+    expect(egressAllows("a.b.example.com", allow)).toBe(true);
+    expect(egressAllows("example.com", allow)).toBe(false);
+    expect(egressAllows("evilexample.com", allow)).toBe(false);
+    expect(egressAllows("github.com", allow)).toBe(false);
+    expect(egressAllows("api.github.com.evil.test", allow)).toBe(false);
+  });
+
+  it("reads the token from Basic (password, or a bare user) and Bearer", () => {
+    const b64 = (text: string) => Buffer.from(text).toString("base64");
+    expect(proxyToken(`Basic ${b64("x:tok")}`)).toBe("tok");
+    expect(proxyToken(`basic ${b64("tok:")}`)).toBe("tok");
+    expect(proxyToken(`Basic ${b64("tok")}`)).toBe("tok");
+    expect(proxyToken("Bearer tok")).toBe("tok");
+    expect(proxyToken(`Basic ${b64(":")}`)).toBeUndefined();
+    expect(proxyToken("Digest tok")).toBeUndefined();
+    expect(proxyToken(undefined)).toBeUndefined();
+  });
+});

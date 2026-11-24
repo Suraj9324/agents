@@ -1,0 +1,660 @@
+import { describe, expect, it } from "vitest";
+import { z } from "zod";
+import {
+  Agent,
+  type ModelAdapter,
+  type ModelCall,
+  type TranscriptEntry,
+} from "@nylorun/core/define";
+import {
+  compact,
+  compactionLimit,
+  contextBudget,
+  estimateTokens,
+  findCut,
+} from "../src/loop/compaction/index.js";
+import { agentLoopOf } from "../src/api/run.js";
+import { compactionConfigOf } from "../src/loop/compaction/config.js";
+import { loopConfigOf } from "../src/loop/config.js";
+import {
+  createDurableCheckpoint,
+  runDurable,
+  type DurableHost,
+  type EffectResolution,
+  type HostEffect,
+} from "../src/run/index.js";
+
+const text = (length: number, fill = "x") => fill.repeat(length);
+
+function toolStep(turnId: string, n: number, size = 400): TranscriptEntry[] {
+  return [
+    {
+      kind: "candidate",
+      turnId,
+      stepId: `${turnId}-s${n}`,
+      candidate: {
+        output: [
+          { type: "text", text: text(size, "a") },
+          { type: "tool-call", id: `${turnId}-c${n}`, name: "job", args: {} },
+        ],
+      },
+    },
+    {
+      kind: "tool-results",
+      turnId,
+      stepId: `${turnId}-s${n}`,
+      results: [
+        { kind: "completed", callId: `${turnId}-c${n}`, toolName: "job", output: text(size, "r") },
+      ],
+    },
+  ];
+}
+
+const input = (turnId: string, value: string): TranscriptEntry => ({
+  kind: "input",
+  turnId,
+  event: { kind: "user-message", text: value },
+});
+
+/** A model that summarizes any compaction call and records every call it saw. */
+function summarizer(calls: { call: ModelCall; invocationId: string }[]): ModelAdapter {
+  return async (call, context) => {
+    calls.push({ call, invocationId: context.invocationId });
+    return { output: [{ type: "text", text: `summary #${calls.length}` }] };
+  };
+}
+
+describe("compaction cut", () => {
+  it("never starts the kept tail with tool results", () => {
+    const transcript = [input("t1", "go"), ...toolStep("t1", 1), ...toolStep("t1", 2)];
+    for (let keep = 1; keep < 1_000; keep += 37) {
+      const cut = findCut(transcript, keep);
+      expect(transcript[cut]?.kind).not.toBe("tool-results");
+    }
+  });
+
+  it("keeps the previous summary out of the tail", () => {
+    const transcript: TranscriptEntry[] = [
+      {
+        kind: "compaction",
+        turnId: "t0",
+        stepId: "s0",
+        summary: "old",
+        trigger: "threshold",
+        tokensBefore: 10,
+        tokensAfter: 5,
+      },
+      input("t1", "go"),
+    ];
+    expect(findCut(transcript, 1_000_000)).toBe(1);
+  });
+});
+
+describe("compact", () => {
+  it("summarizes older entries, keeps the current request, and drops what it summarized", async () => {
+    const calls: { call: ModelCall; invocationId: string }[] = [];
+    const transcript = [
+      input("t1", "first task"),
+      ...toolStep("t1", 1),
+      input("t2", "the current request"),
+      ...toolStep("t2", 1),
+      ...toolStep("t2", 2),
+      ...toolStep("t2", 3),
+    ];
+    const next = await compact({
+      transcript,
+      executionId: "session",
+      turnId: "t2",
+      stepId: "t2-s4",
+      trigger: "threshold",
+      budget: { contextWindow: 1_000, reserve: 100 },
+      invoke: summarizer(calls),
+      signal: new AbortController().signal,
+    });
+    expect(next).toBeDefined();
+    expect(next![0]).toMatchObject({ kind: "compaction", summary: "summary #1" });
+    // The current turn's request survives verbatim even though the cut fell after it.
+    expect(next![1]).toEqual(input("t2", "the current request"));
+    expect(next!.some((entry) => entry.kind === "input" && entry.turnId === "t1")).toBe(false);
+    expect(next!.length).toBeLessThan(transcript.length);
+    expect(calls[0]!.invocationId).toBe("compaction-t2-s4");
+    expect(JSON.stringify(calls[0]!.call.prompt)).toContain("first task");
+  });
+
+  it("merges the previous summary into the next one", async () => {
+    const calls: { call: ModelCall; invocationId: string }[] = [];
+    const transcript: TranscriptEntry[] = [
+      {
+        kind: "compaction",
+        turnId: "t1",
+        stepId: "s",
+        summary: "EARLIER SUMMARY",
+        trigger: "threshold",
+        tokensBefore: 1,
+        tokensAfter: 1,
+      },
+      input("t2", "go"),
+      ...toolStep("t2", 1),
+      ...toolStep("t2", 2),
+      ...toolStep("t2", 3),
+    ];
+    await compact({
+      transcript,
+      executionId: "session",
+      turnId: "t3",
+      stepId: "t3-s1",
+      trigger: "overflow",
+      budget: { contextWindow: 1_000, reserve: 100 },
+      invoke: summarizer(calls),
+      signal: new AbortController().signal,
+    });
+    const prompt = JSON.stringify(calls[0]!.call.prompt);
+    expect(prompt).toContain("<previous-summary>");
+    expect(prompt).toContain("EARLIER SUMMARY");
+    expect(calls[0]!.invocationId).toBe("compaction-t3-s1-overflow");
+  });
+
+  it("summarizes history larger than the window in chunks, merging as it goes", async () => {
+    const calls: { call: ModelCall; invocationId: string }[] = [];
+    const contexts: unknown[] = [];
+    const transcript = [
+      input("t1", "FIRST FACT: the port is 5433"),
+      ...Array.from({ length: 12 }, (_, n) => toolStep("t1", n, 1_500)).flat(),
+      input("t1", "keep going"),
+    ];
+    const invoke: ModelAdapter = async (call, context) => {
+      calls.push({ call, invocationId: context.invocationId });
+      contexts.push(context.compaction);
+      return { output: [{ type: "text", text: `running summary ${calls.length}` }] };
+    };
+    const next = await compact({
+      transcript,
+      executionId: "session",
+      turnId: "t2",
+      stepId: "s9",
+      trigger: "threshold",
+      budget: { contextWindow: 4_000, reserve: 1_000 },
+      invoke,
+      signal: new AbortController().signal,
+    });
+    expect(calls.length).toBeGreaterThan(1);
+    // Every summarizer input fits the window.
+    for (const { call } of calls)
+      expect(Math.ceil(JSON.stringify(call.prompt).length / 4)).toBeLessThan(4_000);
+    // The first chunk holds the oldest fact; each later call merges the running summary.
+    expect(JSON.stringify(calls[0]!.call.prompt)).toContain("FIRST FACT");
+    for (const [index, { call }] of calls.entries())
+      if (index > 0) expect(JSON.stringify(call.prompt)).toContain(`running summary ${index}`);
+    expect(calls.map((c) => c.invocationId)).toEqual(
+      calls.map((_, index) => (index === 0 ? "compaction-s9" : `compaction-s9-${index}`)),
+    );
+    // Every call is a summary call of the one compaction; its facts go with the transcript edit.
+    expect(
+      contexts.every((c) => (c as { trigger?: string }).trigger === contexts[0]!.trigger),
+    ).toBe(true);
+    expect(next![0]).toMatchObject({
+      kind: "compaction",
+      summary: `running summary ${calls.length}`,
+    });
+  });
+
+  it("returns undefined when there is nothing older to summarize", async () => {
+    const next = await compact({
+      transcript: [input("t1", "go")],
+      executionId: "session",
+      turnId: "t1",
+      stepId: "s1",
+      trigger: "threshold",
+      budget: { contextWindow: 100_000, reserve: 1_000 },
+      invoke: summarizer([]),
+      signal: new AbortController().signal,
+    });
+    expect(next).toBeUndefined();
+  });
+
+  it("reads the budget and estimate from the latest candidate", () => {
+    const transcript: TranscriptEntry[] = [
+      input("t1", "go"),
+      {
+        kind: "candidate",
+        turnId: "t1",
+        stepId: "s1",
+        candidate: {
+          output: [{ type: "text", text: "ok" }],
+          usage: { totalTokens: 900 },
+          evidence: { extras: { contextWindow: 16_384, maxOutputTokens: 2_048 } },
+        },
+      },
+      input("t1", text(400)),
+    ];
+    expect(contextBudget(transcript)).toEqual({ contextWindow: 16_384, reserve: 2_048 });
+    expect(estimateTokens(transcript)).toBe(900 + Math.ceil((400 + "[User]: ".length) / 4));
+  });
+});
+
+describe("compaction and files (protocol 12)", () => {
+  const upload = (
+    turnId: string,
+    artifactId: string,
+    mediaType: string,
+    size: number,
+  ): TranscriptEntry => ({
+    kind: "input",
+    turnId,
+    event: {
+      kind: "user-message",
+      content: [
+        { type: "text", text: "see" },
+        {
+          type: "media",
+          mediaType,
+          reference: { artifactId, version: 1, name: `${artifactId}.bin`, size },
+        },
+      ],
+    },
+  });
+  const answered = (turnId: string, totalTokens: number): TranscriptEntry => ({
+    kind: "candidate",
+    turnId,
+    stepId: `${turnId}-s`,
+    candidate: { output: [{ type: "text", text: "ok" }], usage: { totalTokens } },
+  });
+
+  it("carries the summarized part's files as reference lines", async () => {
+    const calls: { call: ModelCall; invocationId: string }[] = [];
+    const transcript = [
+      upload("t1", "af_a", "image/png", 10),
+      ...toolStep("t1", 1),
+      input("t2", "the current request"),
+      ...toolStep("t2", 1),
+      ...toolStep("t2", 2),
+      ...toolStep("t2", 3),
+    ];
+    const next = await compact({
+      transcript: [
+        {
+          kind: "compaction",
+          turnId: "t0",
+          stepId: "s",
+          summary: "EARLIER",
+          trigger: "threshold",
+          tokensBefore: 1,
+          tokensAfter: 1,
+          files: ['[Uploaded artifact "old" · af_old v1 · read_artifact to view]'],
+        },
+        ...transcript,
+      ],
+      executionId: "session",
+      turnId: "t2",
+      stepId: "t2-s4",
+      trigger: "threshold",
+      budget: { contextWindow: 1_000, reserve: 100 },
+      invoke: summarizer(calls),
+      signal: new AbortController().signal,
+    });
+    const line = '[Uploaded artifact "af_a.bin" · af_a v1 · read_artifact to view]';
+    expect(next![0]).toMatchObject({
+      kind: "compaction",
+      files: ['[Uploaded artifact "old" · af_old v1 · read_artifact to view]', line],
+    });
+    // The summarizer reads the file as its line, never as media.
+    expect(JSON.stringify(calls[0]!.call.prompt)).toContain("af_a v1");
+    expect(JSON.stringify(calls[0]!.call.prompt)).not.toContain('"media"');
+  });
+
+  it("offers read_artifact in no line for an agent without it", async () => {
+    const calls: { call: ModelCall; invocationId: string }[] = [];
+    const next = await compact({
+      transcript: [
+        upload("t1", "af_a", "image/png", 10),
+        ...toolStep("t1", 1),
+        input("t2", "the current request"),
+        ...toolStep("t2", 1),
+        ...toolStep("t2", 2),
+        ...toolStep("t2", 3),
+      ],
+      executionId: "session",
+      turnId: "t2",
+      stepId: "t2-s4",
+      trigger: "threshold",
+      budget: { contextWindow: 1_000, reserve: 100 },
+      files: { limits: { modelFileBytes: 1_000_000 }, artifactReads: false },
+      invoke: summarizer(calls),
+      signal: new AbortController().signal,
+    });
+    expect(next![0]).toMatchObject({ files: ['[Uploaded artifact "af_a.bin" · af_a v1]'] });
+    expect(JSON.stringify(calls[0]!.call.prompt)).not.toContain("read_artifact");
+  });
+
+  it("counts this turn's files by size, and takes an earlier turn's off the reported usage", () => {
+    // An image counts 1,600 tokens, text a quarter of its bytes, another file an eighth (at most 100k).
+    const image = upload("t1", "af_i", "image/png", 1_000_000);
+    const pdf = upload("t1", "af_p", "application/pdf", 80_000);
+    expect(estimateTokens([image, pdf], "t1")).toBe(estimateTokens([image, pdf]) + 1_600 + 10_000);
+    // The reported call of turn t1 carried both files; in turn t2 they are lines.
+    const transcript = [image, pdf, answered("t1", 20_000), input("t2", "next")];
+    expect(estimateTokens(transcript, "t2")).toBe(
+      20_000 - 1_600 - 10_000 + Math.ceil("[User]: next".length / 4),
+    );
+    // In turn t1 the reported usage already counts them.
+    expect(estimateTokens(transcript.slice(0, 3), "t1")).toBe(20_000);
+  });
+
+  it("counts this turn's files as the model gets them (protocol 15)", () => {
+    const image = upload("t1", "af_i", "image/png", 1_000);
+    const csv = upload("t1", "af_c", "text/csv", 4_000);
+    const pdf = upload("t1", "af_p", "application/pdf", 80_000);
+    const base = estimateTokens([image, csv, pdf]);
+    const limits = { modelFileBytes: 1_000_000 };
+    const reads = (inputs: ("text" | "image" | "pdf")[]) => ({
+      model: { provider: "p", id: "m", inputs, contextWindow: 100_000, maxOutputTokens: 4_000 },
+      limits,
+    });
+    // A model that reads everything: an image 1,600, text a quarter, a PDF an eighth.
+    expect(estimateTokens([image, csv, pdf], "t1", reads(["text", "image", "pdf"]))).toBe(
+      base + 1_600 + 1_000 + 10_000,
+    );
+    // A text-only model gets notes for the image and the PDF: their lines are text already.
+    expect(estimateTokens([image, csv, pdf], "t1", reads(["text"]))).toBe(base + 1_000);
+    // A file past modelFileBytes is a note too.
+    expect(
+      estimateTokens([csv], "t1", { ...reads(["text"]), limits: { modelFileBytes: 100 } }),
+    ).toBe(estimateTokens([csv]));
+  });
+
+  it("estimates and budgets with the harness's compaction settings", () => {
+    const image = upload("t1", "af_i", "image/png", 1_000);
+    const pdf = upload("t1", "af_p", "application/pdf", 80_000);
+    const config = compactionConfigOf({ imageTokens: 10, fileBytesPerToken: 80, charsPerToken: 2 });
+    const base = estimateTokens([image, pdf], undefined, undefined, config);
+    expect(estimateTokens([image, pdf], "t1", undefined, config)).toBe(base + 10 + 1_000);
+    const model = { contextWindow: 200_000, maxOutputTokens: 64_000 };
+    expect(contextBudget([input("t1", "go")], model)).toEqual({
+      contextWindow: 200_000,
+      reserve: 16_384,
+    });
+    expect(
+      contextBudget([input("t1", "go")], model, compactionConfigOf({ maxReserveTokens: 1_000 })),
+    ).toEqual({ contextWindow: 200_000, reserve: 1_000 });
+    expect(
+      contextBudget(
+        [input("t1", "go")],
+        { contextWindow: 1_000, maxOutputTokens: 64_000 },
+        compactionConfigOf({ maxReserveShare: 0.1 }),
+      ),
+    ).toEqual({ contextWindow: 1_000, reserve: 100 });
+  });
+
+  it("budgets by the model descriptor before any answer reports a window", () => {
+    expect(contextBudget([input("t1", "go")])).toBeUndefined();
+    expect(
+      contextBudget([input("t1", "go")], { contextWindow: 32_768, maxOutputTokens: 64_000 }),
+    ).toEqual({ contextWindow: 32_768, reserve: 8_192 });
+    expect(
+      contextBudget([input("t1", "go")], { contextWindow: 200_000, maxOutputTokens: 4_000 }),
+    ).toEqual({ contextWindow: 200_000, reserve: 4_000 });
+  });
+});
+
+describe("compaction in the turn loop", () => {
+  const agent = () =>
+    Agent({ id: "long", name: "Long" })
+      .tools({ name: "job", inputSchema: z.object({}), execute: async () => "unused" })
+      .build();
+
+  /**
+   * A journaled host whose model makes `steps` tool calls, then answers. Its window is
+   * `window` tokens: a larger prompt fails with context_overflow unless `report` is set,
+   * in which case it also reports the window so the engine compacts before sending.
+   */
+  function host(options: { window: number; steps: number; report: boolean }) {
+    const journal = new Map<string, EffectResolution>();
+    const requests = new Map<string, HostEffect>();
+    const kinds: string[] = [];
+    /** The output limit of each summary call. */
+    const summaryLimits: (number | undefined)[] = [];
+    let modelSteps = 0;
+    const size = (call: ModelCall) => Math.ceil(JSON.stringify(call.prompt).length / 4);
+    const resolveEffect: DurableHost["resolveEffect"] = async (effect) => {
+      const recorded = journal.get(effect.effectId);
+      if (recorded) {
+        expect(effect).toEqual(requests.get(effect.effectId));
+        return recorded;
+      }
+      requests.set(effect.effectId, effect);
+      let value: unknown;
+      if (effect.kind === "tool") value = { kind: "completed", output: text(1_200, "r") };
+      else {
+        const call = effect.input as ModelCall;
+        const compaction = String(effect.context.invocationId).startsWith("compaction-");
+        kinds.push(compaction ? "compaction" : "model");
+        if (compaction) summaryLimits.push(call.model?.controls?.maxOutputTokens);
+        const tokens = size(call);
+        if (!compaction && tokens > options.window)
+          value = {
+            kind: "failed",
+            code: "context_overflow",
+            message: `prompt is too long: ${tokens} tokens > ${options.window} maximum`,
+            retryable: false,
+          };
+        else if (compaction) value = { output: [{ type: "text", text: "summary of the work" }] };
+        else {
+          const index = modelSteps++;
+          value = {
+            output:
+              index < options.steps
+                ? [
+                    { type: "text", text: text(600, "a") },
+                    { type: "tool-call", id: `c${index}`, name: "job", args: {} },
+                  ]
+                : [{ type: "text", text: "done" }],
+            usage: { totalTokens: tokens + 200 },
+            ...(options.report
+              ? {
+                  evidence: {
+                    extras: { contextWindow: options.window, maxOutputTokens: 512 },
+                  },
+                }
+              : {}),
+          };
+        }
+      }
+      const resolution: EffectResolution = { status: "completed", outcome: { value } };
+      journal.set(effect.effectId, resolution);
+      return resolution;
+    };
+    return { host: { resolveEffect } satisfies DurableHost, kinds, summaryLimits };
+  }
+
+  it("runs with the loop's compaction settings (createHarness({ compaction }))", async () => {
+    const manifest = agent().manifest;
+    const checkpoint = createDurableCheckpoint({
+      manifest,
+      sessionId: "session",
+      turnId: "turn",
+      input: "go",
+    });
+    // Defaults: a summary may take 0.8 of the 512-token reserve.
+    const defaults = host({ window: 4_000, steps: 20, report: true });
+    await runDurable({ manifest, checkpoint, host: defaults.host });
+    expect(defaults.summaryLimits[0]).toBe(Math.max(256, Math.floor(512 * 0.8)));
+    // Set: a reserve of at most 100 tokens, and a summary of at least 300.
+    const set = host({ window: 4_000, steps: 20, report: true });
+    const loop = loopConfigOf({ compaction: { maxReserveTokens: 100, minSummaryTokens: 300 } });
+    const result = await runDurable({ manifest, checkpoint, host: set.host, loop });
+    expect(result.status).toBe("completed");
+    expect(set.summaryLimits.length).toBeGreaterThan(0);
+    expect(set.summaryLimits.every((limit) => limit === 300)).toBe(true);
+  });
+
+  it("compacts before a call that would not fit, and the turn completes", async () => {
+    const manifest = agent().manifest;
+    const checkpoint = createDurableCheckpoint({
+      manifest,
+      sessionId: "session",
+      turnId: "turn",
+      input: "go",
+    });
+    const { host: journaled, kinds } = host({ window: 4_000, steps: 20, report: true });
+    const result = await runDurable({ manifest, checkpoint, host: journaled });
+    expect(result.status).toBe("completed");
+    expect(kinds).toContain("compaction");
+    // Every model call fitted: proactive compaction ran before each would-be overflow.
+    expect(kinds.filter((kind) => kind === "model")).toHaveLength(21);
+    const state = (result as { result: { state: { transcript: TranscriptEntry[] } } }).result.state;
+    expect(state.transcript[0]?.kind).toBe("compaction");
+    expect(estimateTokens(state.transcript)).toBeLessThan(4_000);
+
+    // Replaying the same segment from the journal reaches the same state.
+    const replay = await runDurable({ manifest, checkpoint, host: journaled });
+    expect(replay).toEqual(result);
+  });
+
+  it("drops the pinned text at a compaction, so the next segment pins it afresh", async () => {
+    const manifest = agent().manifest;
+    const checkpoint = createDurableCheckpoint({
+      manifest,
+      sessionId: "session",
+      turnId: "turn",
+      input: "go",
+    });
+    const { host: journaled, kinds } = host({ window: 4_000, steps: 20, report: true });
+    const result = await runDurable({
+      manifest,
+      checkpoint,
+      host: journaled,
+      pinned: ["<memory-index>old</memory-index>"],
+    });
+    expect(result.status).toBe("completed");
+    expect(kinds).toContain("compaction");
+    expect(
+      (result as { result: { state: { pinned?: string[] } } }).result.state.pinned,
+    ).toBeUndefined();
+  });
+
+  it("compacts at the Agent's threshold, far below the window", async () => {
+    const manifest = agent().manifest;
+    const checkpoint = createDurableCheckpoint({
+      manifest,
+      sessionId: "session",
+      turnId: "turn",
+      input: "go",
+    });
+    // A 100k window: without a threshold, 20 steps never come near it.
+    const unset = host({ window: 100_000, steps: 20, report: true });
+    await runDurable({ manifest, checkpoint, host: unset.host });
+    expect(unset.kinds).not.toContain("compaction");
+    const set = host({ window: 100_000, steps: 20, report: true });
+    const loop = loopConfigOf({ compaction: { threshold: 3_000, keepTokens: 1_000 } });
+    const result = await runDurable({ manifest, checkpoint, host: set.host, loop });
+    expect(result.status).toBe("completed");
+    expect(set.kinds).toContain("compaction");
+    const state = (result as { result: { state: { transcript: TranscriptEntry[] } } }).result.state;
+    expect(state.transcript[0]?.kind).toBe("compaction");
+    expect(estimateTokens(state.transcript)).toBeLessThan(3_000);
+  });
+
+  it("compacts once and retries when the provider reports an overflow", async () => {
+    const manifest = agent().manifest;
+    const checkpoint = createDurableCheckpoint({
+      manifest,
+      sessionId: "session",
+      turnId: "turn",
+      input: "go",
+    });
+    const { host: journaled, kinds } = host({ window: 3_000, steps: 12, report: false });
+    const result = await runDurable({ manifest, checkpoint, host: journaled });
+    expect(result.status).toBe("completed");
+    const overflowRetries = kinds.filter((kind) => kind === "compaction").length;
+    expect(overflowRetries).toBeGreaterThan(0);
+  });
+});
+
+describe("compaction settings an Agent sets", () => {
+  it("fires at the lower of the threshold and the window line", () => {
+    const budget = { contextWindow: 1_000_000, reserve: 16_384 };
+    expect(compactionLimit(budget)).toBe(983_616);
+    expect(compactionLimit(budget, compactionConfigOf({ threshold: 40_000 }))).toBe(40_000);
+    expect(
+      compactionLimit(
+        { contextWindow: 30_000, reserve: 4_000 },
+        compactionConfigOf({ threshold: 40_000 }),
+      ),
+    ).toBe(26_000);
+    // Without a window (no model descriptor yet), the threshold alone.
+    expect(compactionLimit(undefined, compactionConfigOf({ threshold: 40_000 }))).toBe(40_000);
+    expect(compactionLimit(undefined)).toBeUndefined();
+  });
+
+  function context() {
+    const requests: { kind: string; body: unknown }[] = [];
+    return {
+      requests,
+      ctx: {
+        engine: {
+          loop: loopConfigOf({ compaction: { keepTokens: 20_000, maxReserveTokens: 9_000 } }),
+        },
+        channel: {
+          async request(kind: string, body: unknown) {
+            requests.push({ kind, body });
+            return {};
+          },
+        },
+      },
+    };
+  }
+  const run = { runId: "run", grant: { turnId: "turn" } };
+  const loop = {
+    compaction: {
+      threshold: 40_000,
+      keepTokens: 15_000,
+      roles: { builder: { threshold: 120_000 } },
+    },
+  };
+
+  it("lays the Agent's values over the Host's, and a role's over the Agent's", async () => {
+    const { ctx, requests } = context();
+    const unset = await agentLoopOf(ctx, run, "session", {});
+    expect(unset).toBe(ctx.engine.loop);
+    const own = await agentLoopOf(ctx, run, "session", { loop });
+    expect(own.compaction).toMatchObject({
+      threshold: 40_000,
+      keepTokens: 15_000,
+      maxReserveTokens: 9_000,
+    });
+    const builder = await agentLoopOf(ctx, run, "session", { loop, role: "builder" });
+    expect(builder.compaction).toMatchObject({
+      threshold: 120_000,
+      keepTokens: 15_000,
+      maxReserveTokens: 9_000,
+    });
+    const other = await agentLoopOf(ctx, run, "session", { loop, role: "reviewer" });
+    expect(other.compaction).toMatchObject({ threshold: 40_000 });
+    expect(requests).toEqual([]);
+  });
+
+  it("ignores a value that is not a positive integer, with a diagnostic", async () => {
+    const { ctx, requests } = context();
+    const result = await agentLoopOf(ctx, run, "session", {
+      loop: {
+        compaction: { threshold: -1, keepTokens: 15_000, roles: { builder: { threshold: "big" } } },
+      },
+      role: "builder",
+    });
+    expect(result.compaction.threshold).toBeUndefined();
+    expect(result.compaction.keepTokens).toBe(15_000);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      kind: "event",
+      body: {
+        runId: "run",
+        type: "engine.diagnostic",
+        payload: { code: "compaction_setting_ignored" },
+      },
+    });
+    expect(JSON.stringify(requests[0]!.body)).toContain("harness.loop.compaction.threshold");
+    expect(JSON.stringify(requests[0]!.body)).toContain(
+      "harness.loop.compaction.roles.builder.threshold",
+    );
+  });
+});

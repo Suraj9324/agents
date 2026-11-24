@@ -1,0 +1,87 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { z } from "zod";
+import {
+  Agent,
+  AgentBuilder,
+  McpError,
+  tool,
+} from "../src/index.js";
+import {
+  AgentBuilder as CoreAgentBuilder,
+  McpError as CoreMcpError,
+} from "@nylorun/core/define";
+
+/** Flow agents: the agents package's Agent adds .skills() and .plugin(). */
+
+function write(directory: string, path: string, contents: string): void {
+  const file = join(directory, path);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, contents);
+}
+
+function skillsFolder(): string {
+  const directory = mkdtempSync(join(tmpdir(), "nylorun-authoring-skills-"));
+  write(
+    directory,
+    "changelog/SKILL.md",
+    "---\nname: changelog\ndescription: Write a changelog entry.\n---\nSteps.\n"
+  );
+  return directory;
+}
+
+function pluginFolder(): string {
+  const directory = mkdtempSync(join(tmpdir(), "nylorun-authoring-plugin-"));
+  write(
+    directory,
+    "plugin.json",
+    JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+      name: "github",
+      version: "1.0.0",
+      description: "GitHub helpers.",
+    })
+  );
+  write(
+    directory,
+    "skills/open-pr/SKILL.md",
+    "---\nname: open-pr\ndescription: Open a pull request.\n---\nSteps.\n"
+  );
+  return directory;
+}
+
+const look = tool({
+  name: "look",
+  input: z.object({ q: z.string() }),
+  async run() {
+    return "";
+  },
+});
+
+describe("Agent from @nylorun/agents", () => {
+  it(".skills() and .plugin() add one part each", () => {
+    const folder = skillsFolder();
+    const pkg = pluginFolder();
+    const fresh = Agent({ id: "a" }).instructions("x").skills(folder).plugin(pkg);
+    const built = fresh.build();
+    expect(built.getBinding().parts.map((part) => part.id)).toEqual([
+      "agent",
+      `skills:${folder.split("/").at(-1)}`,
+      "plugin:github",
+    ]);
+    expect(built.manifest).not.toHaveProperty("capabilities");
+  });
+
+  it("keeps its methods through chaining", () => {
+    const agent = Agent({ id: "a" }).tools(look).output(z.object({ ok: z.boolean() })).skills(skillsFolder());
+    expect(agent).toBeInstanceOf(AgentBuilder);
+    expect(agent).toBeInstanceOf(CoreAgentBuilder);
+    expect(agent.build().manifest.outputSchema).toBeDefined();
+  });
+
+  it("re-exports the same error classes as core", () => {
+    expect(McpError).toBe(CoreMcpError);
+  });
+});

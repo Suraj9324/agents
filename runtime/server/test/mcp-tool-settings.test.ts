@@ -1,0 +1,473 @@
+/**
+ * Per-tool MCP settings and deferred tools, end to end over the Runtime API. Per-tool settings on an MCP server: an
+ * allowlist through `"*": {enabled: false}`, approval per tool, a diagnostic for a key that names
+ * no tool, and turn variants that may only tighten them: the turn's facts say which tools are
+ * enabled, and the record refuses a call of one that is not (`tool.disabled`) or that the session
+ * never discovered (`tool.unknown`). Deferred tools, through our engine (protocol 15): an agent
+ * whose MCP tools pass a tenth of the model's context window gets `tool_search` and `tool_call`
+ * in their place, and `tool_call` runs a tool as a direct call would (arguments checked,
+ * approval asked, the tool named by its identity). Manifests before 8 are refused.
+ * With `NYLORUN_TEST_MODEL_GATE=http` the gates service makes every call; otherwise the Tenant
+ * does, in process.
+ */
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { Agent, createClient, type AgentsClient } from "@nylorun/agents";
+import { type AgentManifest, type ModelCall } from "@nylorun/core/define";
+import type { ModelProvider } from "../src/core/provider.js";
+import { hostModelCatalog } from "../src/model/catalog.js";
+import { hostModelDescriptor } from "../src/model/descriptor.js";
+import { mcpFactsOf, type McpSnapshot } from "../src/mcp/snapshot.js";
+import { deploy, writeManifest } from "./support/agents.js";
+import { startTestTenant } from "./support/tenant.js";
+import { setToolPolicy } from "./support/tool-policy.js";
+
+const APP = "tool-settings-app-key-aaaaaaaaaaaaa";
+/** About 280 characters of a tool's description that no query of these tests matches. */
+const FILLER =
+  "Returns the records of the account named in the request, a page at a time, sorted by date, with totals for the page and a cursor for the next page while more remain. Fails when the account is closed or unknown to the service.";
+
+interface ToolSpec {
+  readonly name: string;
+  readonly description: string;
+  readonly input?: z.ZodRawShape;
+}
+
+/** A remote MCP server with `tools`, keeping the names of the tools called. */
+async function mcpServer(name: string, tools: readonly ToolSpec[], instructions?: string) {
+  const called: string[] = [];
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    if (req.method !== "POST") return void res.writeHead(405).end();
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const mcp = new McpServer({ name, version: "0.0.0" }, instructions ? { instructions } : undefined);
+    for (const tool of tools)
+      mcp.registerTool(tool.name, { description: tool.description, inputSchema: tool.input ?? {} }, async () => {
+        called.push(tool.name);
+        return { content: [{ type: "text", text: `${tool.name} ok` }] };
+      });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await mcp.connect(transport);
+    res.on("close", () => {
+      void transport.close().catch(() => {});
+      void mcp.close().catch(() => {});
+    });
+    await transport.handleRequest(req, res, JSON.parse(Buffer.concat(chunks).toString()));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  servers.push(server);
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`, called };
+}
+
+/** Twenty tools of a large server, each about 330 characters of JSON. */
+const many = (prefix: string, extra: ToolSpec[] = []): ToolSpec[] => [
+  ...extra,
+  ...Array.from({ length: 20 - extra.length }, (_, i) => ({
+    name: `${prefix}_t${String(i).padStart(2, "0")}`,
+    description: `Tool ${i} of ${prefix}. ${FILLER}`,
+  })),
+];
+
+const servers: Server[] = [];
+
+/** A tool result the model saw: its status and its JSON. */
+interface Seen {
+  readonly status: string;
+  readonly payload: any;
+}
+type Call = { name: string; args: Record<string, unknown> };
+/** What the model does next, given the result it just saw (none on its first step). */
+let brain: (seen: Seen | undefined) => Call | undefined = () => undefined;
+/** The tool names of each model call, and its prompt as JSON. */
+let offered: string[][] = [];
+let prompts: string[] = [];
+let calls = 0;
+const model: ModelProvider = async (effect: { input: unknown }) => {
+  const input = effect.input as ModelCall;
+  offered.push(input.tools.map((tool) => tool.name));
+  prompts.push(JSON.stringify(input.prompt));
+  const last = input.prompt.at(-1);
+  const seen =
+    last?.kind === "tool-result"
+      ? {
+          status: last.status,
+          payload: JSON.parse((last.content.find((part) => part.type === "text") as { text: string }).text),
+        }
+      : undefined;
+  const next = brain(seen);
+  if (!next) return { output: [{ type: "text", text: "done" }] };
+  calls += 1;
+  return { output: [{ type: "tool-call", id: `call-${calls}`, name: next.name, args: next.args }] };
+};
+
+/** The model makes `script`'s calls in turn, keeping each result it sees, then answers. */
+function script(...steps: Call[]): Seen[] {
+  const seen: Seen[] = [];
+  let step = 0;
+  brain = (result) => {
+    if (result) seen.push(result);
+    return steps[step++];
+  };
+  return seen;
+}
+
+type Runtime = Awaited<ReturnType<typeof startTestTenant>>;
+let runtime: Runtime;
+let client: AgentsClient;
+let github: Awaited<ReturnType<typeof mcpServer>>;
+let ledger: Awaited<ReturnType<typeof mcpServer>>;
+let funds: Awaited<ReturnType<typeof mcpServer>>;
+
+/** Saves `manifest` as an agent manifest and makes Agent `manifest.id` from it. */
+async function put(manifest: AgentManifest) {
+  await deploy(runtime.url, runtime.headers(), manifest);
+}
+
+let sessions = 0;
+type Session = ReturnType<AgentsClient["session"]>;
+/** Opens a session on Agent `agent` and starts a turn; `offered` and `prompts` start empty. */
+async function open(agent: string): Promise<Session> {
+  sessions += 1;
+  offered = [];
+  prompts = [];
+  const session = await client.createSession({ id: `settings-${sessions}`, agent, ownerUserId: "u:ada" });
+  await session.input("go", { idempotencyKey: `m${sessions}` });
+  return session;
+}
+
+async function settled(session: Session) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const view = await session.inspect();
+    if (["idle", "completed", "failed", "uncertain", "cancelled"].includes(view.status)) return view;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("timeout waiting for the turn to settle");
+}
+
+async function paused(session: Session) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const waits = await session.pending();
+    if (Array.isArray(waits) && waits.length > 0) return waits[0] as { interaction: { id: string; prompt: string } };
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("timeout waiting for the approval");
+}
+
+async function events(session: Session, type: string) {
+  const history = await session.history();
+  return history.items.filter((item) => item.type === type).map((item) => item.payload as Record<string, any>);
+}
+
+const toolsOf = (names: readonly string[], server: string) => names.filter((name) => name.startsWith(`${server}__`));
+
+beforeAll(async () => {
+  github = await mcpServer("github", [
+    { name: "search_issues", description: "Search issues.", input: { q: z.string() } },
+    { name: "create_issue", description: "Open an issue.", input: { title: z.string() } },
+    { name: "delete_repo", description: "Delete a repository." },
+    { name: "get_me", description: "The signed-in user." },
+  ]);
+  ledger = await mcpServer(
+    "ledger",
+    many("ledger", [
+      { name: "reconcile", description: `Run the month's reconciliation of two ledgers. ${FILLER}` },
+      { name: "post", description: `Post an entry. ${FILLER}`, input: { amount: z.number(), memo: z.string() } },
+    ]),
+    "Ledger tools act on the books of the signed-in company; amounts are in cents.",
+  );
+  funds = await mcpServer("funds", many("funds", [{ name: "transfer", description: `Move money. ${FILLER}` }]));
+  const archive = await mcpServer("archive", many("archive"));
+  const small = await mcpServer(
+    "small",
+    ["alpha", "beta", "gamma", "delta", "epsilon"].map((name) => ({ name, description: `The ${name} tool.` })),
+  );
+
+  runtime = await startTestTenant({ applicationKey: APP, modelProvider: model });
+  client = createClient({ url: runtime.url, key: runtime.applicationKey, tenant: runtime.tenantId });
+  await put(
+    Agent({ id: "allow" })
+      .mcp({
+        github: {
+          type: "streamable-http",
+          url: github.url,
+          tools: {
+            "*": { enabled: false },
+            search_issues: { enabled: true },
+            create_issue: { enabled: true },
+            not_a_tool: { enabled: true },
+          },
+        },
+      })
+      .build().manifest,
+  );
+  await put(
+    Agent({ id: "big" })
+      .mcp({
+        ledger: { type: "streamable-http", url: ledger.url },
+        funds: { type: "streamable-http", url: funds.url },
+        // One tool stays in the list whatever the size (settings override).
+        archive: { type: "streamable-http", url: archive.url, tools: { archive_t00: { deferred: false } } },
+      })
+      .build().manifest,
+  );
+  await put(Agent({ id: "small" }).mcp({ small: { type: "streamable-http", url: small.url } }).build().manifest);
+  await put(
+    Agent({ id: "picked" })
+      .mcp({ small: { type: "streamable-http", url: small.url, tools: { epsilon: { deferred: true } } } })
+      .build().manifest,
+  );
+  // The calls a person approves.
+  await setToolPolicy(runtime, [
+    // By the tool's identity (protocol 15): the server and the server's own name for the tool.
+    { effect: "ask", server: "github", tool: "create_issue" },
+    { effect: "ask", server: "funds", tool: "transfer" },
+  ]);
+}, 60_000);
+
+afterAll(async () => {
+  await runtime?.close();
+  for (const server of servers) await new Promise((resolve) => server.close(resolve));
+});
+
+describe("per-tool settings", () => {
+  it("makes an allowlist with '*': {enabled: false}, and names a key no tool has", async () => {
+    script({ name: "github__search_issues", args: { q: "bug" } });
+    const session = await open("allow");
+    expect((await settled(session)).status).toBe("completed");
+    expect(toolsOf(offered[0]!, "github")).toEqual(["github__search_issues", "github__create_issue"]);
+    expect(github.called).toEqual(["search_issues"]);
+    const [discovered] = await events(session, "mcp.discovered");
+    expect(discovered!.servers).toEqual([
+      expect.objectContaining({
+        serverName: "github",
+        outcome: "connected",
+        tools: 2,
+        disabled: 2,
+        unknownTools: ["not_a_tool"],
+        message: expect.stringContaining("not_a_tool"),
+      }),
+    ]);
+  });
+
+  it("never calls a disabled tool the model names", async () => {
+    const before = github.called.length;
+    const seen = script({ name: "github__delete_repo", args: {} });
+    const session = await open("allow");
+    expect((await settled(session)).status).toBe("completed");
+    expect(seen[0]!.status).toBe("failed");
+    expect(github.called.length).toBe(before);
+  });
+
+  it("holds one tool for approval, as the Tenant's tool policy asks, not the others", async () => {
+    script({ name: "github__create_issue", args: { title: "x" } });
+    const session = await open("allow");
+    const wait = await paused(session);
+    // A person approves the tool by its identity, the server's own name for it.
+    expect(wait.interaction.prompt).toBe("Approve github / create_issue?");
+    expect(wait.interaction).toMatchObject({ server: "github", tool: "create_issue" });
+    expect(github.called).not.toContain("create_issue");
+    await session.approve(wait.interaction.id, true, { idempotencyKey: "approve-create" });
+    expect((await settled(session)).status).toBe("completed");
+    expect(github.called).toContain("create_issue");
+  });
+
+  it("lets a turn variant disable a tool, never ask for an approval, and never widen", async () => {
+    script();
+    const session = await open("allow");
+    await settled(session);
+    // A variant never sets `runtime`: the turn runs with the pin's.
+    const { runtime: _runtime, ...pinned } = (await session.manifest()).manifest as unknown as AgentManifest;
+    const github = pinned.mcpServers!.github!;
+    const variant: AgentManifest = {
+      ...pinned,
+      mcpServers: {
+        ...pinned.mcpServers,
+        github: {
+          ...github,
+          tools: { ...github.tools, search_issues: { enabled: true }, create_issue: { enabled: false } },
+        },
+      },
+    };
+    offered = [];
+    script({ name: "github__search_issues", args: { q: "flaky" } });
+    await session.command({ type: "message", requestId: "variant-1", idempotencyKey: "variant-1", content: "again", manifest: variant });
+    expect((await settled(session)).status).toBe("completed");
+    expect(toolsOf(offered[0]!, "github")).toEqual(["github__search_issues"]);
+
+    // A variant cannot ask for an approval: tool approvals are the Tenant's tool policy.
+    const asking: AgentManifest = {
+      ...variant,
+      mcpServers: {
+        ...variant.mcpServers,
+        github: {
+          ...variant.mcpServers!.github!,
+          tools: { ...variant.mcpServers!.github!.tools, search_issues: { enabled: true, approval: "always" } },
+        },
+      },
+    };
+    await expect(
+      session.command({ type: "message", requestId: "variant-3", idempotencyKey: "variant-3", content: "ask", manifest: asking })
+    ).rejects.toThrow(/not a variant/);
+
+    // Widening is refused: enabling a tool the pin's allowlist leaves out.
+    const widened: AgentManifest = {
+      ...pinned,
+      mcpServers: {
+        ...pinned.mcpServers,
+        github: { ...github, tools: { ...github.tools, delete_repo: { enabled: true } } },
+      },
+    };
+    await expect(
+      session.command({ type: "message", requestId: "variant-2", idempotencyKey: "variant-2", content: "wider", manifest: widened })
+    ).rejects.toThrow(/not a variant/);
+  });
+});
+
+describe("deferred tools", () => {
+  it("defers 60 tools across 3 servers, keeps one a setting lists, and gives the model tool_search and tool_call", async () => {
+    script();
+    const session = await open("big");
+    expect((await settled(session)).status).toBe("completed");
+    const names = offered[0]!;
+    expect(names).toEqual(expect.arrayContaining(["tool_search", "tool_call", "archive__archive_t00"]));
+    expect(names.filter((name) => /^(ledger|funds|archive)__/.test(name))).toEqual(["archive__archive_t00"]);
+    // The note names each server, its deferred tools and its own instructions.
+    expect(prompts[0]).toContain("ledger: 20 tools");
+    expect(prompts[0]).toContain("amounts are in cents");
+    expect(prompts[0]).toContain("archive: 19 tools");
+    const [discovered] = await events(session, "mcp.discovered");
+    // The discovery counts each server's tools; deferring them is our engine's.
+    expect(discovered!.servers.map((server: any) => [server.serverName, server.tools, server.deferred])).toEqual([
+      ["ledger", 20, undefined],
+      ["funds", 20, undefined],
+      ["archive", 20, undefined],
+    ]);
+  });
+
+  it("defers none of 5 tools", async () => {
+    script();
+    const session = await open("small");
+    expect((await settled(session)).status).toBe("completed");
+    expect(toolsOf(offered[0]!, "small")).toHaveLength(5);
+    expect(offered[0]).not.toContain("tool_search");
+    expect((await events(session, "mcp.discovered"))[0]!.servers[0]).not.toHaveProperty("deferred");
+  });
+
+  it("defers the one tool a setting defers, even among 5", async () => {
+    script();
+    const session = await open("picked");
+    await settled(session);
+    expect(toolsOf(offered[0]!, "small")).toEqual(["small__alpha", "small__beta", "small__gamma", "small__delta"]);
+    expect(offered[0]).toEqual(expect.arrayContaining(["tool_search", "tool_call"]));
+  });
+
+  it("finds a tool by a word in its description, runs it with tool_call, and lists the same tools at every step", async () => {
+    const seen = script(
+      { name: "tool_search", args: { query: "reconciliation" } },
+      { name: "tool_call", args: { name: "ledger__reconcile", arguments: {} } },
+    );
+    const session = await open("big");
+    expect((await settled(session)).status).toBe("completed");
+    expect(seen[0]!.payload.tools[0]).toEqual({
+      name: "ledger__reconcile",
+      description: expect.stringContaining("reconciliation"),
+      inputSchema: expect.objectContaining({ type: "object" }),
+    });
+    expect(seen[1]).toEqual({ status: "completed", payload: "reconcile ok" });
+    expect(ledger.called).toContain("reconcile");
+    // The effect and tool.completed name the tool, not tool_call.
+    const completed = await events(session, "tool.completed");
+    expect(completed.map((item) => item.toolName)).toEqual(["tool_search", "ledger__reconcile"]);
+    expect(offered).toHaveLength(3);
+    for (const names of offered) expect(names).toEqual(offered[0]);
+  });
+
+  it("answers tool_call with arguments that do not match the tool's inputSchema with a failed result", async () => {
+    const before = ledger.called.length;
+    const seen = script({ name: "tool_call", args: { name: "ledger__post", arguments: { amount: "ten" } } });
+    const session = await open("big");
+    expect((await settled(session)).status).toBe("completed");
+    expect(seen[0]!.status).toBe("failed");
+    expect(JSON.stringify(seen[0]!.payload)).toMatch(/tool\.invalid-arguments|amount/);
+    expect(ledger.called.length).toBe(before);
+  });
+
+  it("asks for approval of a tool that needs it through tool_call, then runs it", async () => {
+    script({ name: "tool_call", args: { name: "funds__transfer", arguments: {} } });
+    const session = await open("big");
+    const wait = await paused(session);
+    expect(wait.interaction.prompt).toBe("Approve funds / transfer?");
+    expect(funds.called).toEqual([]);
+    await session.approve(wait.interaction.id, true, { idempotencyKey: "approve-transfer" });
+    expect((await settled(session)).status).toBe("completed");
+    expect(funds.called).toEqual(["transfer"]);
+    expect((await events(session, "tool.completed")).map((item) => item.toolName)).toEqual(["funds__transfer"]);
+  });
+});
+
+it("refuses a manifest of an earlier version: it is rebuilt (agent manifest 8)", async () => {
+  const json = {
+    manifestSchemaVersion: 6,
+    id: "legacy",
+    name: "legacy",
+    mcpServers: { small: { name: "small", type: "streamable-http", url: github.url } },
+  };
+  const response = await writeManifest(runtime.url, runtime.headers(), json as never);
+  expect(response.status).toBe(400);
+  expect((await fetch(`${runtime.url}/v1/agent-manifests/legacy`, { headers: runtime.headers() })).status).toBe(404);
+});
+
+describe("the turn's MCP facts", () => {
+  const manifest = Agent({ id: "a" })
+    .mcp({
+      s: {
+        type: "streamable-http",
+        url: "https://s.example.invalid/mcp",
+        tools: { "*": { deferred: true }, t1: { enabled: false } },
+      },
+    })
+    .build().manifest;
+  const snapshot: McpSnapshot = {
+    snapshotSchemaVersion: 2,
+    manifestHash: "h",
+    servers: [
+      { name: "s", instructions: "Hi.", tools: [0, 1].map((i) => ({ name: `t${i}`, inputSchema: { type: "object" } })) },
+      // A server the turn's manifest no longer declares.
+      { name: "gone", tools: [] },
+    ],
+  };
+
+  it("says which tools the turn leaves enabled, and the manifest's deferral, of the servers it declares", () => {
+    expect(mcpFactsOf(snapshot, manifest)).toEqual({
+      servers: [
+        {
+          name: "s",
+          instructions: "Hi.",
+          tools: [
+            { name: "t0", inputSchema: { type: "object" }, enabled: true, deferred: true },
+            { name: "t1", inputSchema: { type: "object" }, enabled: false, deferred: true },
+          ],
+        },
+      ],
+    });
+  });
+});
+
+describe("the model descriptor", () => {
+  it("knows a catalog model's window, and a custom endpoint's from its settings", () => {
+    const provider = hostModelCatalog().providers.find((item) => item.models.length > 0)!;
+    const window = hostModelDescriptor({ provider: provider.id, model: provider.models[0]!.id })?.contextWindow;
+    expect(window).toBeGreaterThan(1_024);
+    expect(hostModelDescriptor({ provider: "groq", model: "no-such-model" })).toBeUndefined();
+    expect(
+      hostModelDescriptor({ provider: "custom", model: "m", baseUrl: "http://x", settings: { contextWindow: 9_000 } })
+        ?.contextWindow,
+    ).toBe(9_000);
+  });
+});

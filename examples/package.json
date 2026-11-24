@@ -1,0 +1,38 @@
+{
+  "name": "nylorun-harness-examples",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "configure": "nylorun tenant models set",
+    "dev": "tsx watch --env-file-if-exists=.env src/main.ts",
+    "build": "node -e \"import('node:fs/promises').then(async ({rm,cp}) => { await rm('dist', { recursive: true, force: true }); await cp('agents', 'dist/agents', { recursive: true, filter: (source) => !source.endsWith('.ts') }); await cp('runtime', 'dist/runtime', { recursive: true }); })\" && tsc -p tsconfig.build.json",
+    "start": "node dist/src/main.js",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "ag-ui": "tsx --env-file-if-exists=.env src/ag-ui/server.ts",
+    "codex:preflight": "node scripts/codex-preflight.mjs",
+    "triage": "tsx --env-file-if-exists=.env src/triage.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.6",
+    "@nylorun/agents": "file:../sdks/agents",
+    "@nylorun/harness": "file:../runtime/harness",
+    "@nylorun/runtime": "file:../runtime/server",
+    "zod-from-json-schema": "^0.5.6",
+    "@nylorun/core": "file:../core"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "nylorun": "file:../cli/nylorun",
+    "@nylorun/admin": "file:../sdks/admin",
+    "vitest": "^4.1.12",
+    "@ag-ui/client": "1.0.3",
+    "postgres": "^3.4.9"
+  }
+}

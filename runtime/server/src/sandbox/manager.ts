@@ -1,0 +1,832 @@
+/**
+ * Sandbox Manager: owns sandbox lifecycle for the Runtime. One workspace per sandbox resource
+ * (`sandbox: { id }`, keyed by the sandbox id), or per owning session for a sandbox chosen
+ * inline or by the Tenant default (keyed by the session id); created on the first sandbox tool
+ * call, stopped after its idle timeout, reattached on the next call. Each session's calls on a
+ * workspace run in the order it sends them, and different sessions' calls run at the same time
+ *: the sessions of one Environment run their turns at once. Opening, stopping and removing
+ * a workspace run alone: a stop or removal waits for the calls running, and calls that come after
+ * it wait for it.
+ *
+ * The manager keeps no timers and reaches no store: it keeps its compute records through a
+ * `SandboxRecords` port (the Tenant's `sandboxes` table in core's process, a file in a harness's)
+ * and writes its events through `emit`. Its owner drives it: `stopIdle` stops sandboxes idle
+ * past their timeout and marks records of compute this process no longer holds as stopped
+ * (after a restart); `reconcile` removes workspaces whose owner is gone. `sweep` does both, the
+ * reconcile once per process, as the Tenant sweep does in core's process.
+ *
+ * A folder the harness asks for (`mountFolder`: our engine's skill folders, `/skills/<name>@<hash>/`,
+ * protocol 15) is written read-only, once per open handle: the harness decides which folders
+ * and when, and gives their bytes; the manager only writes them (`skills.ts`).
+ */
+import { posix } from "node:path";
+import type { EventPayload } from "@nylorun/core/contracts";
+import { SANDBOX_WORKSPACE, type SandboxManifest, type SandboxToolName } from "@nylorun/core/define";
+import {
+  sandboxWorkspaceKey,
+  sessionWorkspaceKey,
+  workspacePrefix,
+  type SandboxRecord,
+  type SandboxRecords,
+  type SandboxState,
+} from "./records.js";
+import {
+  DEFAULT_SANDBOX_CPUS,
+  DEFAULT_SANDBOX_IMAGE,
+  describeNetwork,
+  idleMsOf,
+  memoryMiBOf,
+  resolveNetwork,
+} from "./policy.js";
+import {
+  parseSandboxPreference,
+  reportSelection,
+  selectSandboxBackend,
+  type SandboxSelection,
+  type SandboxSelectionReport,
+} from "./select.js";
+import { mountFolderFiles, type FolderFiles } from "./skills.js";
+import { DEFAULT_SANDBOX_TOOL_LIMITS, type SandboxToolLimits } from "@nylorun/harness";
+import { runDiskOp, type DiskAnswer, type DiskOp } from "./disk-fs.js";
+import {
+  helperCommandTimeoutMs,
+  quote,
+  resolveSandboxPath,
+  runSandboxTool,
+  type SandboxToolOutcome,
+  type SandboxToolReport,
+} from "./tools.js";
+import {
+  SandboxFileTooLargeError,
+  SandboxUnsupportedError,
+  type SandboxBackend,
+  type SandboxFileBytes,
+  type SandboxHandle,
+  type SandboxListing,
+  type SandboxSpec,
+} from "./types.js";
+import { hostTuning } from "../tuning.js";
+
+export type { SandboxRecord, SandboxRecords, SandboxState } from "./records.js";
+
+export interface SandboxSessionRef {
+  /** The session whose log records the workspace's events: the owning session. */
+  readonly id: string;
+  readonly activeTurnId: string | null;
+  /**
+   * The sandbox resource the owning session is attached to. Its workspace is keyed by this id,
+   * so every session attached to it shares the files; absent, the workspace is the session's.
+   */
+  readonly environmentId?: string;
+  /**
+   * For a pod Environment: the host epoch it is at, so the call reaches a host that joined at
+   * that epoch or later, never one a restore or a lost volume retired.
+   */
+  readonly hostEpoch?: number;
+  /** Variables every command of the call gets: secret names set to the sentinel, plain values. */
+  readonly environment?: Readonly<Record<string, string>>;
+  /**
+   * Who the call's events are claimed for, passed back to `emit`: in a harness, the run that
+   * made the call (its run id).
+   */
+  readonly claim?: string;
+}
+
+/** What `emit` gets with an event besides its payload. */
+export interface SandboxEventMeta {
+  /** With `sandbox.state`: the workspace's record as it is now. */
+  readonly record?: SandboxRecord;
+  /** The `claim` of the call that caused the event; absent for an idle stop. */
+  readonly claim?: string;
+}
+
+interface Live {
+  readonly sessionId: string;
+  readonly environmentId?: string;
+  readonly backend: SandboxBackend;
+  handle?: SandboxHandle;
+  /** The open in progress, shared by the calls that find no handle at once. */
+  opening?: Promise<SandboxHandle>;
+  idleMs: number;
+  /** The calls running now, of every session. */
+  readonly running: Set<Promise<unknown>>;
+  /** When the last call ended (ms since the epoch). */
+  lastUsedAt: number;
+  /** Each session's queue: its calls run in order. */
+  readonly lanes: Map<string, Promise<unknown>>;
+  /** Stops and removals, one at a time; a call waits until none is pending. */
+  gate: Promise<unknown>;
+  /** The folders mounted, or being mounted, on the open handle (`mountFolder`). */
+  readonly mounts: Map<string, Promise<void>>;
+}
+
+export interface SandboxSweepOptions {
+  /** The sweep's clock, in ms since the epoch. Defaults to `Date.now()`. */
+  readonly now?: number;
+  /** Whether a session still exists; sandboxes of deleted sessions are removed. */
+  readonly sessionExists: (sessionId: string) => boolean | Promise<boolean>;
+  /** Whether a sandbox resource still exists. Default: every one does. */
+  readonly sandboxExists?: (environmentId: string) => boolean | Promise<boolean>;
+}
+
+export interface SandboxManagerOptions {
+  /** Distinguishes this Runtime's sandboxes from other Runtimes on the same machine: the Tenant id. */
+  readonly scope: string;
+  /** Where the workspaces' compute records are kept. */
+  readonly records: SandboxRecords;
+  readonly backends: readonly SandboxBackend[];
+  /** `auto` or `virtual`. Undefined means an invalid NYLORUN_SANDBOX value. */
+  readonly preference: string | undefined;
+  /** Delete sandboxes on close (the Runtime's store does not outlive the process). */
+  readonly ephemeral: boolean;
+  /** Writes a session event (in core, in its own transaction; in a harness, as a claim). */
+  readonly emit: <T extends SandboxEventType>(
+    sessionId: string,
+    turnId: string | null,
+    type: T,
+    payload: EventPayload<T>,
+    meta: SandboxEventMeta
+  ) => void | Promise<void>;
+}
+
+/** The session events a sandbox writes. */
+export type SandboxEventType = "environment.state" | "environment.exec";
+
+const READ_TOOLS = new Set<SandboxToolName>(["read", "grep", "glob"]);
+
+export class SandboxManager {
+  private selection?: Promise<SandboxSelection>;
+  private readonly live = new Map<string, Live>();
+  private readonly prefix: string;
+  private closing = false;
+  private reconciled = false;
+
+  constructor(private readonly options: SandboxManagerOptions) {
+    this.prefix = workspacePrefix(options.scope);
+  }
+
+  /**
+   * One sweep pass of core's process: `stopIdle`, then, on the first pass of this process,
+   * `reconcile` (skipped for ephemeral Runtimes, which delete theirs on close).
+   */
+  async sweep(options: SandboxSweepOptions): Promise<void> {
+    if (this.closing) return;
+    await this.stopIdle(options.now);
+    if (this.reconciled || this.options.ephemeral) return;
+    this.reconciled = true;
+    if (!(await this.hasRecords())) return;
+    await this.reconcile(
+      async (sessionId) =>
+        [...this.live.values()].some((live) => live.sessionId === sessionId) ||
+        (await options.sessionExists(sessionId)),
+      options.sandboxExists ?? (() => true)
+    );
+  }
+
+  /**
+   * Stops sandboxes idle for at least their idle timeout (their files remain; the next call
+   * reattaches), and marks records whose compute this process does not hold as stopped
+   * (compute is gone after a restart).
+   */
+  async stopIdle(at?: number): Promise<void> {
+    if (this.closing) return;
+    const now = at ?? Date.now();
+    const idle = (live: Live) =>
+      !!live.handle && live.running.size === 0 && now - live.lastUsedAt >= live.idleMs;
+    const stops: Promise<unknown>[] = [];
+    for (const [key, live] of this.live) {
+      if (!idle(live)) continue;
+      // After the calls running; checked again when its turn comes.
+      stops.push(this.alone(live, () => (idle(live) ? this.stop(key, live) : undefined)).catch(() => undefined));
+    }
+    await Promise.all(stops);
+    for (const record of await this.options.records.list()) {
+      if (record.state === "stopped") continue;
+      const live = this.live.get(record.key);
+      if (live && (live.handle || live.running.size > 0)) continue;
+      await this.options.records.put({ ...record, state: "stopped" });
+    }
+  }
+
+  /** Every workspace record this manager keeps. */
+  workspaces(): Promise<SandboxRecord[]> {
+    return this.options.records.list();
+  }
+
+  /** Backends are probed once, on first use, and the choice holds for the life of the Runtime. */
+  get ready(): Promise<SandboxSelection> {
+    if (!this.selection) {
+      const preference = parseSandboxPreference(this.options.preference);
+      this.selection = preference
+        ? selectSandboxBackend(this.options.backends, preference)
+        : Promise.resolve({
+            preference: "auto",
+            reason: `NYLORUN_SANDBOX='${this.options.preference}' is not valid; use auto or virtual`,
+            probes: [],
+          });
+    }
+    return this.selection;
+  }
+
+  /** Whether any sandbox was ever recorded, so startup can skip probing for agents without one. */
+  async hasRecords(): Promise<boolean> {
+    return (await this.options.records.count()) > 0;
+  }
+
+  keyOf(sessionId: string): string {
+    return sessionWorkspaceKey(this.options.scope, sessionId);
+  }
+
+  /** The workspace key of sandbox resource `environmentId` (`sandboxWorkspaceKey`). */
+  sandboxKeyOf(environmentId: string): string {
+    return sandboxWorkspaceKey(this.options.scope, environmentId);
+  }
+
+  private keyFor(session: SandboxSessionRef): string {
+    return session.environmentId === undefined
+      ? this.keyOf(session.id)
+      : this.sandboxKeyOf(session.environmentId);
+  }
+
+  async report(): Promise<SandboxSelectionReport & { readonly defaultImage: string }> {
+    return { ...reportSelection(await this.ready), defaultImage: DEFAULT_SANDBOX_IMAGE };
+  }
+
+  /**
+   * Runs sandbox operation `toolName` in the session's sandbox, held to `limits`: the harness's
+   * sandbox tool limits (`DEFAULT_SANDBOX_TOOL_LIMITS` when it names none).
+   */
+  async run(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined,
+    toolName: SandboxToolName,
+    input: unknown,
+    signal: AbortSignal,
+    limits: SandboxToolLimits = DEFAULT_SANDBOX_TOOL_LIMITS
+  ): Promise<SandboxToolOutcome> {
+    const prepared = await this.prepare(session, sandbox);
+    if ("kind" in prepared) return prepared;
+    const { live: entry, spec } = prepared;
+    return this.inLane(entry, session.id, () =>
+      this.execute(entry, session, spec, toolName, input, signal, limits)
+    );
+  }
+
+  /**
+   * Runs `call` in session `sessionId`'s queue on `live`: after its earlier calls, and after any
+   * stop or removal pending, beside other sessions' calls.
+   */
+  private inLane<T>(live: Live, sessionId: string, call: () => Promise<T>): Promise<T> {
+    const task = (live.lanes.get(sessionId) ?? Promise.resolve()).then(async () => {
+      // A stop queued while this waited goes first.
+      for (let gate = live.gate; ; gate = live.gate) {
+        await gate;
+        if (gate === live.gate) break;
+      }
+      const running = call();
+      live.running.add(running);
+      try {
+        return await running;
+      } finally {
+        live.running.delete(running);
+        live.lastUsedAt = Date.now();
+      }
+    });
+    const queued = task.catch(() => undefined);
+    live.lanes.set(sessionId, queued);
+    void queued.then(() => {
+      if (live.lanes.get(sessionId) === queued) live.lanes.delete(sessionId);
+    });
+    return task;
+  }
+
+  /** Runs `step` on `live` alone: after the calls running, before the calls that come after it. */
+  private alone<T>(live: Live, step: () => Promise<T> | T): Promise<T> {
+    const task = live.gate.then(async () => {
+      while (live.running.size > 0) await Promise.allSettled([...live.running]);
+      return step();
+    });
+    live.gate = task.catch(() => undefined);
+    return task;
+  }
+
+  /** The workspace's handle, opened once for the calls that need it at the same time. */
+  private async handleOf(live: Live, session: SandboxSessionRef, spec: SandboxSpec): Promise<SandboxHandle> {
+    if (live.handle) return live.handle;
+    const opening = (live.opening ??= this.open(live, session, spec).finally(() => {
+      if (live.opening === opening) live.opening = undefined;
+    }));
+    const handle = await opening;
+    live.handle ??= handle;
+    return handle;
+  }
+
+  /**
+   * The bytes of one file in the session's sandbox, for our engine's `save_artifact` and its
+   * outputs folder (`files.read`), in the same queue as its tool calls: `missing` when there is no such file, a failed outcome when the sandbox
+   * cannot open or the file is larger than `maxBytes`. Relative paths resolve in the workspace.
+   */
+  async readBytes(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined,
+    path: string,
+    maxBytes: number,
+    signal: AbortSignal
+  ): Promise<
+    | { kind: "read"; path: string; bytes: Uint8Array }
+    | { kind: "missing"; path: string }
+    | Extract<SandboxToolOutcome, { kind: "failed" }>
+  > {
+    return this.withHandle(session, sandbox, signal, async (handle, live) => {
+      const resolved = resolveSandboxPath(path, handle.workspace ?? SANDBOX_WORKSPACE);
+      if (!handle.readBytes)
+        return {
+          kind: "failed" as const,
+          code: "sandbox.unsupported",
+          message: `The ${live.backend.name} backend cannot read files as bytes`,
+        };
+      try {
+        const bytes = await handle.readBytes(resolved, maxBytes);
+        return bytes === undefined
+          ? { kind: "missing" as const, path: resolved }
+          : { kind: "read" as const, path: resolved, bytes };
+      } catch (error) {
+        if (error instanceof SandboxFileTooLargeError)
+          return {
+            kind: "failed" as const,
+            code: "artifact.too_large",
+            message: `${resolved} is ${error.size} bytes; an artifact may hold at most ${maxBytes}`,
+          };
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Writes `body` to one file of the session's sandbox, as it comes, for our engine's
+   * `read_artifact` with `path` (protocol 15), in the same queue as its tool calls: its folders
+   * are made first, and a file there is replaced. Relative paths resolve in the workspace.
+   */
+  async writeBytes(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined,
+    path: string,
+    body: SandboxFileBytes,
+    signal: AbortSignal
+  ): Promise<{ kind: "written"; path: string; size: number } | Extract<SandboxToolOutcome, { kind: "failed" }>> {
+    return this.withHandle(session, sandbox, signal, async (handle) => {
+      const resolved = resolveSandboxPath(path, handle.workspace ?? SANDBOX_WORKSPACE);
+      const parent = posix.dirname(resolved);
+      const made = await handle.exec(
+        { command: `mkdir -p ${quote(parent)}`, cwd: "/", timeoutMs: helperCommandTimeoutMs() },
+        signal
+      );
+      if (made.exitCode !== 0)
+        return {
+          kind: "failed" as const,
+          code: "sandbox.write_failed",
+          message: made.stderr.trim() || `Could not create ${parent}`,
+        };
+      let size = 0;
+      const counted =
+        body instanceof Uint8Array
+          ? ((size = body.byteLength), body)
+          : (async function* () {
+              for await (const chunk of body) {
+                size += chunk.byteLength;
+                yield chunk;
+              }
+            })();
+      await handle.writeFile(resolved, counted);
+      return { kind: "written" as const, path: resolved, size };
+    });
+  }
+
+  /**
+   * The files under directory `dir` of the session's sandbox, for our engine's outputs folder
+   * (`files.list`, protocol 15), in the same queue as its tool calls. `missing` when the sandbox was never created (nothing is
+   * started to look) or `dir` is not a directory. Relative paths resolve in the workspace.
+   */
+  async listFiles(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined,
+    dir: string,
+    maxEntries: number,
+    signal: AbortSignal
+  ): Promise<
+    | { kind: "listed"; path: string; listing: SandboxListing }
+    | { kind: "missing"; path: string }
+    | Extract<SandboxToolOutcome, { kind: "failed" }>
+  > {
+    const key = this.keyFor(session);
+    if (!this.live.get(key)?.handle) {
+      const record = await this.options.records.get(key);
+      if (!record) return { kind: "missing", path: dir };
+    }
+    return this.withHandle(session, sandbox, signal, async (handle, live) => {
+      const resolved = resolveSandboxPath(dir, handle.workspace ?? SANDBOX_WORKSPACE);
+      if (!handle.listFiles)
+        return {
+          kind: "failed" as const,
+          code: "sandbox.unsupported",
+          message: `The ${live.backend.name} backend cannot list files`,
+        };
+      const listing = await handle.listFiles(resolved, maxEntries);
+      return listing === undefined
+        ? { kind: "missing" as const, path: resolved }
+        : { kind: "listed" as const, path: resolved, listing };
+    });
+  }
+
+  /**
+   * One operation on the disk of the session's sandbox (`sandbox/disk-fs.ts`), in the
+   * same queue as its tool calls, starting it first when it is stopped.
+   */
+  async disk(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined,
+    op: DiskOp,
+    signal: AbortSignal
+  ): Promise<DiskAnswer | Extract<SandboxToolOutcome, { kind: "failed" }>> {
+    return this.withHandle(session, sandbox, signal, async (handle, live) => {
+      // A disk that is not on this machine (a computer) runs the operation where it is.
+      if (handle.diskOp)
+        try {
+          return await handle.diskOp(op, signal);
+        } catch (error) {
+          if (!(error instanceof SandboxUnsupportedError)) throw error;
+          return { kind: "failed" as const, code: "sandbox.unsupported", message: error.message };
+        }
+      if (!handle.diskRoots)
+        return {
+          kind: "failed" as const,
+          code: "sandbox.unsupported",
+          message: `The ${live.backend.name} backend has no disk to version`,
+        };
+      return runDiskOp(handle.diskRoots, op);
+    });
+  }
+
+  /** Runs `use` on the session's sandbox in its queue, starting it first when it is stopped. */
+  private async withHandle<T>(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined,
+    signal: AbortSignal,
+    use: (handle: SandboxHandle, live: Live) => Promise<T>
+  ): Promise<T | Extract<SandboxToolOutcome, { kind: "failed" }>> {
+    const prepared = await this.prepare(session, sandbox);
+    if ("kind" in prepared) return prepared;
+    const { live, spec } = prepared;
+    return this.inLane(live, session.id, async () => {
+      if (signal.aborted) throw new Error("Turn cancelled");
+      if (this.closing) throw new Error("Runtime is shutting down");
+      let handle: SandboxHandle;
+      try {
+        handle = await this.handleOf(live, session, spec);
+      } catch (error) {
+        return {
+          kind: "failed" as const,
+          code: "sandbox.start_failed",
+          message: `The sandbox could not start: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      return await use(handle, live);
+    });
+  }
+
+  /** The session's live sandbox entry and spec, or why it cannot run here. */
+  private async prepare(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined
+  ): Promise<{ live: Live; spec: SandboxSpec } | Extract<SandboxToolOutcome, { kind: "failed" }>> {
+    const selection = await this.ready;
+    const backend = selection.backend;
+    if (!backend)
+      return {
+        kind: "failed",
+        code: "sandbox.unavailable",
+        message: `No sandbox is available: ${selection.reason}. Run \`npx nylorun doctor sandbox\` for options.`,
+      };
+    const key = this.keyFor(session);
+    const spec: SandboxSpec = {
+      key,
+      image: sandbox?.image ?? DEFAULT_SANDBOX_IMAGE,
+      cpus: sandbox?.resources?.cpus ?? DEFAULT_SANDBOX_CPUS,
+      memoryMiB: memoryMiBOf(sandbox),
+      network: resolveNetwork(sandbox),
+    };
+    const unmet = backend.unmet(spec);
+    if (unmet)
+      return {
+        kind: "failed",
+        code: "sandbox.unavailable",
+        message: `This agent's sandbox cannot run on the ${backend.name} backend: ${unmet}.`,
+      };
+    let live = this.live.get(key);
+    if (!live) {
+      live = {
+        sessionId: session.id,
+        ...(session.environmentId === undefined ? {} : { environmentId: session.environmentId }),
+        backend,
+        idleMs: idleMsOf(sandbox),
+        running: new Set(),
+        lastUsedAt: Date.now(),
+        lanes: new Map(),
+        gate: Promise.resolve(),
+        mounts: new Map(),
+      };
+      this.live.set(key, live);
+    }
+    return { live, spec };
+  }
+
+  private async execute(
+    live: Live,
+    session: SandboxSessionRef,
+    spec: SandboxSpec,
+    toolName: SandboxToolName,
+    input: unknown,
+    signal: AbortSignal,
+    limits: SandboxToolLimits
+  ): Promise<SandboxToolOutcome> {
+    if (signal.aborted) throw new Error("Turn cancelled");
+    if (this.closing) throw new Error("Runtime is shutting down");
+    return this.executeOpen(live, session, spec, toolName, input, signal, limits);
+  }
+
+  /**
+   * The workspace's handle, opened when there is none. A start that fails is recorded as stopped
+   * and answered as a failed outcome: nothing ran yet, so it is definite, not uncertain.
+   */
+  private async started(
+    live: Live,
+    session: SandboxSessionRef,
+    spec: SandboxSpec
+  ): Promise<SandboxHandle | Extract<SandboxToolOutcome, { kind: "failed" }>> {
+    try {
+      return await this.handleOf(live, session, spec);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const record = await this.record(spec.key, live, session.id, spec.image, "stopped");
+      await this.options.emit(
+        session.id,
+        session.activeTurnId,
+        "environment.state",
+        { state: "stopped", backend: live.backend.name, error: message },
+        { record, ...claimOf(session) }
+      );
+      return {
+        kind: "failed",
+        code: "sandbox.start_failed",
+        message: `The sandbox could not start on ${live.backend.name} (image ${spec.image ?? "the backend's default"}): ${message}`,
+      };
+    }
+  }
+
+  private async executeOpen(
+    live: Live,
+    session: SandboxSessionRef,
+    spec: SandboxSpec,
+    toolName: SandboxToolName,
+    input: unknown,
+    signal: AbortSignal,
+    limits: SandboxToolLimits
+  ): Promise<SandboxToolOutcome> {
+    const handle = await this.started(live, session, spec);
+    if ("kind" in handle) return handle;
+    const started = Date.now();
+    let report: SandboxToolReport = {};
+    try {
+      const outcome = await runSandboxTool(
+        handle,
+        toolName,
+        (input ?? {}) as Record<string, any>,
+        signal,
+        (value) => {
+          report = value;
+        },
+        limits,
+        session.environment
+      );
+      await this.options.emit(
+        session.id,
+        session.activeTurnId,
+        "environment.exec",
+        {
+          tool: toolName,
+          ...report,
+          ...(report.command ? { command: report.command.slice(0, hostTuning().harness.execCommandChars) } : {}),
+          outcome: outcome.kind,
+          ...(outcome.kind === "failed" ? { code: outcome.code } : {}),
+          durationMs: Date.now() - started,
+        },
+        claimOf(session)
+      );
+      return outcome;
+    } catch (error) {
+      // The backend itself failed; reopen on the next call, unless another call already did.
+      if (live.handle === handle) live.handle = undefined;
+      if (signal.aborted || !READ_TOOLS.has(toolName)) throw error;
+      return {
+        kind: "failed",
+        code: "sandbox.error",
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Writes `files` (path in `folder` to `sha256:<hex>`) to `folder` of the session's sandbox,
+   * read-only, each one's bytes from `read`, in the session's queue (protocol 15: the harness
+   * decides which folders, and when). A folder the open handle already holds is `present` without
+   * an exec; calls that need one folder at once share its mount. A failed outcome when the sandbox
+   * cannot start or the folder cannot be written; it is not marked mounted then, so the next call
+   * tries again. A reopened handle holds none.
+   */
+  async mountFolder(
+    session: SandboxSessionRef,
+    sandbox: SandboxManifest | undefined,
+    folder: string,
+    files: FolderFiles,
+    read: (sha256: string) => SandboxFileBytes | Promise<SandboxFileBytes>,
+    signal: AbortSignal
+  ): Promise<{ kind: "mounted" | "present" } | Extract<SandboxToolOutcome, { kind: "failed" }>> {
+    const prepared = await this.prepare(session, sandbox);
+    if ("kind" in prepared) return prepared;
+    const { live, spec } = prepared;
+    return this.inLane(live, session.id, async () => {
+      if (signal.aborted) throw new Error("Turn cancelled");
+      if (this.closing) throw new Error("Runtime is shutting down");
+      const handle = await this.started(live, session, spec);
+      if ("kind" in handle) return handle;
+      let mounting = live.mounts.get(folder);
+      const present = mounting !== undefined;
+      if (!mounting) {
+        const mount = mountFolderFiles(handle, folder, files, async (sha256) => read(sha256), signal);
+        live.mounts.set(folder, mount);
+        void mount.catch(() => {
+          if (live.mounts.get(folder) === mount) live.mounts.delete(folder);
+        });
+        mounting = mount;
+      }
+      try {
+        await mounting;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        return {
+          kind: "failed" as const,
+          code: "sandbox.skills_unavailable",
+          message: `The files of folder ${folder} could not be put in the sandbox: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      return { kind: present ? ("present" as const) : ("mounted" as const) };
+    });
+  }
+
+  private async open(live: Live, session: SandboxSessionRef, spec: SandboxSpec): Promise<SandboxHandle> {
+    const existing = await this.options.records.get(spec.key);
+    const payload = {
+      backend: live.backend.name,
+      isolation: live.backend.isolation,
+      image: spec.image,
+      network: describeNetwork(spec.network),
+    };
+    const creating = await this.record(spec.key, live, session.id, spec.image, "creating", existing);
+    await this.options.emit(
+      session.id,
+      session.activeTurnId,
+      "environment.state",
+      { state: "creating", ...payload, ...(existing ? { reattach: true } : {}) },
+      { record: creating, ...claimOf(session) }
+    );
+    const handle = await live.backend.open(spec);
+    // A handle opened afresh holds no folder this manager knows of.
+    live.mounts.clear();
+    const running = await this.record(spec.key, live, session.id, spec.image, "running", existing);
+    await this.options.emit(
+      session.id,
+      session.activeTurnId,
+      "environment.state",
+      {
+        state: "running",
+        ...payload,
+        ...(existing && handle.created
+          ? { lost: true, note: "The sandbox was gone and was created again; its earlier files are lost." }
+          : {}),
+      },
+      { record: running, ...claimOf(session) }
+    );
+    return handle;
+  }
+
+  private async stop(key: string, live: Live) {
+    const handle = live.handle;
+    if (!handle) return;
+    live.handle = undefined;
+    try {
+      await handle.stop();
+    } finally {
+      const record = await this.record(key, live, live.sessionId, undefined, "stopped");
+      await this.options.emit(
+        live.sessionId,
+        null,
+        "environment.state",
+        { state: "stopped", backend: live.backend.name },
+        { record }
+      );
+    }
+  }
+
+  private async record(
+    key: string,
+    live: Live,
+    sessionId: string,
+    image: string | undefined,
+    state: SandboxState,
+    known?: SandboxRecord
+  ): Promise<SandboxRecord> {
+    const now = new Date().toISOString();
+    const existing = known ?? (await this.options.records.get(key));
+    const record: SandboxRecord = {
+      key,
+      sessionId,
+      ...(live.environmentId === undefined ? {} : { environmentId: live.environmentId }),
+      backend: live.backend.name,
+      image: image ?? existing?.image ?? "",
+      state,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    await this.options.records.put(record);
+    return record;
+  }
+
+  /** The sandbox record for a session, if one was ever created. */
+  status(sessionId: string): Promise<SandboxRecord | undefined> {
+    return this.options.records.get(this.keyOf(sessionId));
+  }
+
+  /**
+   * Deletes sandbox resource `environmentId`'s workspace, its files and its compute record, after
+   * any command queued on it. Called once the resource is deleted.
+   */
+  async removeSandbox(environmentId: string): Promise<void> {
+    await this.remove(this.sandboxKeyOf(environmentId));
+  }
+
+  /** Deletes the workspace `key`, its files and its record, after any command queued on it. */
+  async remove(key: string): Promise<void> {
+    const live = this.live.get(key);
+    if (live) {
+      await this.alone(live, () => {
+        live.handle = undefined;
+      }).catch(() => undefined);
+      this.live.delete(key);
+    }
+    const { backend } = await this.ready;
+    if (backend) await backend.remove(key);
+    await this.options.records.delete(key);
+  }
+
+  /**
+   * Delete workspaces this Runtime owns whose owner is gone: a session's when `sessionExists`
+   * says the session is gone, a sandbox resource's when `sandboxExists` says the resource is.
+   */
+  async reconcile(
+    sessionExists: (sessionId: string) => boolean | Promise<boolean>,
+    sandboxExists: (environmentId: string) => boolean | Promise<boolean>
+  ): Promise<void> {
+    const { backend } = await this.ready;
+    if (!backend) return;
+    for (const key of await backend.list(this.prefix)) {
+      const record = await this.options.records.get(key);
+      if (record) {
+        const kept =
+          record.environmentId === undefined
+            ? await sessionExists(record.sessionId)
+            : await sandboxExists(record.environmentId);
+        if (kept) continue;
+      }
+      await this.remove(key);
+    }
+  }
+
+  async close(): Promise<void> {
+    this.closing = true;
+    if (!this.selection) return;
+    const tasks = [...this.live.entries()].map(async ([key, live]) => {
+      await Promise.allSettled([...live.lanes.values(), live.gate]);
+      await Promise.allSettled([...live.running]);
+      if (this.options.ephemeral) {
+        live.handle = undefined;
+        await live.backend.remove(key);
+      } else await this.stop(key, live);
+    });
+    await Promise.allSettled(tasks);
+    this.live.clear();
+  }
+}
+
+function claimOf(session: SandboxSessionRef): { claim?: string } {
+  return session.claim === undefined ? {} : { claim: session.claim };
+}

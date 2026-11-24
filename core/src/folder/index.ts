@@ -1,0 +1,27 @@
+/**
+ * `@nylorun/core/folder`: agent folders. An agent written as a folder of
+ * Markdown and JSON, compiled by `compileAgentFolder` into the agent manifest v8 the Runtime
+ * runs. The Runtime compiles every folder it is sent with this code, and the CLI checks one
+ * offline with the same code. `folderOfManifest` writes the folder of a saved manifest,
+ * `agentFolderJsonSchemas` gives the JSON Schema of each kind of file in a folder, for editors, and
+ * `applyFolderFixes` makes the fix-its its diagnostics carry.
+ */
+export {
+  AGENT_FOLDER_COMPILER,
+  AGENT_FOLDER_LIMITS,
+  compileAgentFolder,
+  folderTextPaths,
+  type AgentFolderDiagnostic,
+  type AgentFolderEntry,
+  type AgentFolderFix,
+  type AgentFolderLimits,
+  type CompileAgentFolderInput,
+  type CompiledAgentFolder,
+} from "./compile.js";
+export { folderOfManifest, type FolderOfManifest, type FolderOfManifestOptions } from "./decompile.js";
+export { AGENT_FOLDER_SCHEMA_KINDS, agentFolderJsonSchemas, type AgentFolderSchemaKind } from "./schemas.js";
+export { applyFolderFixes, type AppliedFolderFixes } from "./fix.js";
+export { AGENT_FOLDER_V3, isFolderV3 } from "./v3.js";
+export { folderV3Edit, type FolderV3Edit } from "./migrate-v3.js";
+export { AGENT_FOLDER_V4, isFolderV4 } from "./subagent-files.js";
+export { folderV4Plan, type FolderV4Input, type FolderV4Plan } from "./migrate-v4.js";

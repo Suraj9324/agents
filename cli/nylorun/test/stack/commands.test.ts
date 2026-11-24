@@ -1,0 +1,890 @@
+import { doctorStack } from "../../src/doctor.js";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import {
+  ensureStack,
+  isStackCommand,
+  runStackCommand,
+  runStudioCommand,
+  stackProject,
+  HELP_HINT,
+  STUDIO_SIGN_IN_HINT,
+  tenantStudioPath,
+  withNext,
+} from "../../src/stack/commands.js";
+import { parseComposePs } from "../../src/stack/docker.js";
+import { stackPaths } from "../../src/stack/paths.js";
+import { STUDIO_ANALYTICS_ID, TELEMETRY_NOTICE, telemetryCommand } from "../../src/telemetry.js";
+import {
+  fakeDocker,
+  fakeFetch,
+  json,
+  operateStatusResult,
+  readyResponse,
+  TEST_TENANT_ID,
+  temporaryHome,
+  testDeps,
+} from "./support.js";
+
+/** host.json is written during `start`, so the fakes read it lazily. */
+const hostId = (home: string) =>
+  (JSON.parse(readFileSync(stackPaths(home).config, "utf8")) as { hostId: string }).hostId;
+
+const TENANT_ID = TEST_TENANT_ID;
+
+/** A fetch that answers like a healthy Tenant on the persisted ports. */
+async function healthyFetch(home: string, loginBody: unknown = { token: "tok en" }) {
+  return fakeFetch((url) => {
+    if (url.endsWith("/health"))
+      return json({ status: "ok", version: "0.10.0-beta", hostId: hostId(home) });
+    if (url.endsWith("/ready")) return readyResponse();
+    if (url.endsWith("/_studio/login-tokens")) return json(loginBody, 201);
+    return undefined;
+  });
+}
+
+/** What `start` prints for the Tenant under `home`. */
+const startLines = (_home: string, studio = true) => [
+  `Tenant    home-root  (${TENANT_ID})`,
+  "Runtime   http://localhost:8787",
+  ...(studio ? ["Studio    http://localhost:4161"] : []),
+];
+
+const NEXT = `next=%2Ftenants%2F${TENANT_ID}`;
+
+const compose = (home: string, project = "nylorun-home-root") => [
+  "compose",
+  "--project-name",
+  project,
+  "--file",
+  join(stackPaths(home).docker, "compose.yaml"),
+  "--env-file",
+  join(stackPaths(home).docker, ".env"),
+];
+
+describe("command names", () => {
+  it("knows the Tenant commands and the Compose spellings up and down", () => {
+    for (const name of ["start", "stop", "status", "logs", "reset", "studio", "up", "down", "ls", "delete"])
+      expect(isStackCommand(name)).toBe(true);
+    expect(isStackCommand("legacy")).toBe(false);
+    expect(isStackCommand("dev")).toBe(false);
+    expect(isStackCommand("tenant")).toBe(false);
+    expect(isStackCommand(undefined)).toBe(false);
+  });
+
+  it("names the Compose project after the Tenant, unless NYLORUN_COMPOSE_PROJECT overrides it", () => {
+    expect(stackProject({}, "shop")).toBe("nylorun-shop");
+    expect(stackProject({ NYLORUN_COMPOSE_PROJECT: "nylorun-f-test" }, "shop")).toBe("nylorun-f-test");
+    expect(() => stackProject({ NYLORUN_COMPOSE_PROJECT: "Bad Name" }, "shop")).toThrow(/NYLORUN_COMPOSE_PROJECT/);
+  });
+});
+
+describe("start", () => {
+  it("writes the Compose files, brings up the core services, then Studio, and prints both URLs", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    expect(await runStackCommand("start", [], deps)).toBe(0);
+    expect(docker.streamed).toEqual([
+      [...compose(home), "up", "--detach", "--wait", "--wait-timeout", "300", "--remove-orphans", "postgres", "restate", "s2-lite", "rustfs", "gateway", "runtime", "harness"],
+      [...compose(home), "up", "--detach", "--wait", "--wait-timeout", "120", "studio"],
+    ]);
+    expect(deps.lines).toEqual(startLines(home));
+    expect(existsSync(stackPaths(home).compose)).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, "tenant.json"), "utf8"))).toEqual({ format: 1, name: "home-root" });
+  });
+
+  it("--restate-ui publishes Restate's UI for that start; the next start closes it", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, { docker: fakeDocker(), fetch: await healthyFetch(home) });
+    expect(await runStackCommand("start", ["--restate-ui", "--no-studio"], deps)).toBe(0);
+    expect(deps.lines).toContain("Restate   http://localhost:9070  (UI and admin, unauthenticated; for debugging)");
+    const published = readFileSync(stackPaths(home).compose, "utf8");
+    expect(published).toContain('"127.0.0.1:${NYLORUN_RESTATE_PORT:?run nylorun start}:9070"');
+    expect(readFileSync(stackPaths(home).env, "utf8")).toMatch(/^NYLORUN_RESTATE_UI=1$/m);
+    deps.lines.length = 0;
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    expect(deps.lines.join("\n")).not.toContain("Restate");
+    expect(readFileSync(stackPaths(home).compose, "utf8")).not.toContain("NYLORUN_RESTATE_PORT");
+    expect(readFileSync(stackPaths(home).env, "utf8")).toMatch(/^NYLORUN_RESTATE_UI=0$/m);
+    // NYLORUN_RESTATE_UI=1 in the environment of start does what the flag does.
+    const env = testDeps(home, {
+      docker: fakeDocker(),
+      fetch: await healthyFetch(home),
+      env: { ...deps.env, NYLORUN_RESTATE_UI: "1" },
+    });
+    expect(await runStackCommand("start", ["--no-studio"], env)).toBe(0);
+    expect(readFileSync(stackPaths(home).compose, "utf8")).toContain("NYLORUN_RESTATE_PORT");
+  });
+
+  it("NYLORUN_HARNESS=in-process in .env rolls back: no harness service, kept across starts", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    const env = readFileSync(stackPaths(home).env, "utf8");
+    expect(env).toMatch(/^NYLORUN_HARNESS=remote$/m);
+    const token = /^NYLORUN_HARNESS_TOKEN=([0-9a-f]{64})$/m.exec(env)?.[1];
+    expect(token).toBeDefined();
+    writeFileSync(stackPaths(home).env, env.replace(/^NYLORUN_HARNESS=remote$/m, "NYLORUN_HARNESS=in-process"));
+    docker.streamed.length = 0;
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    expect(docker.streamed[0]).not.toContain("harness");
+    expect(docker.streamed[0]).toContain("--remove-orphans");
+    expect(readFileSync(stackPaths(home).compose, "utf8")).not.toContain("container_name: nylorun-home-root-harness");
+    const kept = readFileSync(stackPaths(home).env, "utf8");
+    expect(kept).toMatch(/^NYLORUN_HARNESS=in-process$/m);
+    expect(kept).toContain(`NYLORUN_HARNESS_TOKEN=${token}`);
+  });
+
+  it("opens no browser, even in a terminal: it prints the URLs, how to sign in and --help", async () => {
+    const home = await temporaryHome();
+    const fetch = await healthyFetch(home);
+    const deps = testDeps(home, { fetch, interactive: true });
+    expect(await runStackCommand("up", [], deps)).toBe(0);
+    expect(deps.lines).toEqual(startLines(home));
+    expect(deps.opened).toEqual([]);
+    expect(deps.errors).toContain(STUDIO_SIGN_IN_HINT);
+    expect(deps.errors.at(-1)).toBe(HELP_HINT);
+    expect(fetch.requests.some((r) => r.url.endsWith("/_studio/login-tokens"))).toBe(false);
+  });
+
+  it("accepts and ignores --no-open", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, { fetch: await healthyFetch(home), interactive: true });
+    expect(await runStackCommand("up", ["--no-open"], deps)).toBe(0);
+    expect(deps.lines).toEqual(startLines(home));
+    expect(deps.opened).toEqual([]);
+  });
+
+  it("up is start: it writes the Compose files on the first run and reuses them after", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    expect(await runStackCommand("up", [], deps)).toBe(0);
+    const compose = readFileSync(stackPaths(home).compose, "utf8");
+    const env = readFileSync(stackPaths(home).env, "utf8");
+    expect(deps.errors.some((line) => line.startsWith("Created Tenant home-root "))).toBe(true);
+    deps.errors.length = 0;
+    expect(await runStackCommand("up", ["--no-studio"], deps)).toBe(0);
+    expect(deps.errors.some((line) => line.startsWith("Created Tenant"))).toBe(false);
+    expect(readFileSync(stackPaths(home).compose, "utf8")).toBe(compose);
+    expect(readFileSync(stackPaths(home).env, "utf8")).toBe(env);
+  });
+
+  it("waits on /ready for the Tenant to open, then reads its id with nylorun-operate status", async () => {
+    const home = await temporaryHome();
+    let polls = 0;
+    const fetch = fakeFetch((url) => {
+      if (url.endsWith("/health"))
+        return json({ status: "ok", version: "0.10.0-beta", hostId: hostId(home) });
+      if (url.endsWith("/ready")) return readyResponse((polls += 1) >= 3);
+      return undefined;
+    });
+    const docker = fakeDocker();
+    const deps = testDeps(home, { fetch, docker });
+    expect(await runStackCommand("up", ["--no-studio"], deps)).toBe(0);
+    expect(polls).toBe(3);
+    expect(deps.lines).toEqual(startLines(home, false));
+    const ready = fetch.requests.find((r) => r.url.endsWith("/ready"))!;
+    expect(ready.url).toBe("http://localhost:8787/ready");
+    expect(new Headers(ready.init?.headers).has("authorization")).toBe(false);
+    // One nylorun-operate status, once the Tenant is open.
+    expect(docker.calls.filter((args) => args.includes("nylorun-operate"))).toEqual([
+      [...compose(home), "exec", "-T", "runtime", "nylorun-operate", "status", "--json"],
+    ]);
+    expect(fetch.requests.filter((request) => request.init?.method === "POST")).toEqual([]);
+    expect(fetch.requests.some((request) => request.url.includes("/v1/admin"))).toBe(false);
+  });
+
+  it("reports why the Tenant is unavailable, from nylorun-operate status (exit 7)", async () => {
+    const home = await temporaryHome();
+    const docker = (streamCode = 0) =>
+      fakeDocker({
+        streamCode: () => streamCode,
+        respond: (args) =>
+          args.includes("nylorun-operate")
+            ? operateStatusResult({
+                id: TENANT_ID,
+                name: "home-root",
+                state: "unavailable",
+                cause: "kek-missing",
+                message: "The vault key is missing. Restore tenant/vault-kek.",
+              })
+            : undefined,
+      });
+    const fetch = fakeFetch((url) => {
+      if (url.endsWith("/health")) return json({ status: "ok", hostId: hostId(home) });
+      if (url.endsWith("/ready")) return readyResponse(false);
+      return undefined;
+    });
+    // It does not wait out the timeout: nylorun-operate names a cause only when the Tenant cannot open.
+    const started = runStackCommand(
+      "up",
+      ["--no-studio"],
+      testDeps(home, { fetch, docker: docker(), healthTimeoutMs: 60_000 }),
+    );
+    await expect(started).rejects.toMatchObject({ exitCode: 7 });
+    await expect(started).rejects.toThrow(
+      /Tenant home-root is unavailable \(kek-missing\): The vault key is missing\. Restore tenant\/vault-kek\./,
+    );
+    // The Runtime fails readiness, so Compose fails first: the cause is reported all the same.
+    const composeFails = testDeps(home, { fetch, docker: docker(1) });
+    await expect(runStackCommand("up", [], composeFails)).rejects.toThrow(/unavailable \(kek-missing\)/);
+  });
+
+  it("says the Tenant did not open when nylorun-operate names no cause", async () => {
+    const home = await temporaryHome();
+    const fetch = fakeFetch((url) => {
+      if (url.endsWith("/health")) return json({ status: "ok", hostId: hostId(home) });
+      if (url.endsWith("/ready")) return readyResponse(false);
+      return undefined;
+    });
+    const docker = fakeDocker({
+      respond: (args) =>
+        args.includes("nylorun-operate")
+          ? operateStatusResult({
+              id: TENANT_ID,
+              name: "home-root",
+              state: "unavailable",
+              message: "The Runtime is running but has not opened the Tenant: its log names the cause",
+            })
+          : undefined,
+    });
+    await expect(
+      runStackCommand("up", ["--no-studio"], testDeps(home, { fetch, docker })),
+    ).rejects.toThrow(
+      'Tenant home-root did not open (http://localhost:8787/ready: not open): The Runtime is running but has not opened the Tenant: its log names the cause. See "nylorun status"',
+    );
+  });
+
+  it("uses the project override", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, {
+      docker,
+      fetch: await healthyFetch(home),
+      env: { NYLORUN_HOME: home, NYLORUN_COMPOSE_PROJECT: "nylorun-f-test" },
+    });
+    await runStackCommand("start", [], deps);
+    expect(docker.streamed[0]!.slice(0, 3)).toEqual(["compose", "--project-name", "nylorun-f-test"]);
+  });
+
+  it("--no-studio starts only the core services", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    expect(docker.streamed).toHaveLength(1);
+    expect(deps.lines).toEqual(startLines(home, false));
+  });
+
+  it("warns and still succeeds when Studio does not start", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker({ streamCode: (args) => (args.includes("studio") ? 1 : 0) });
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    expect(await runStackCommand("start", [], deps)).toBe(0);
+    expect(deps.errors.some((line) => line.startsWith("Warning: Studio did not start"))).toBe(true);
+    expect(deps.lines).toEqual(startLines(home, false));
+  });
+
+  it("fails when Compose fails or the Runtime is someone else's", async () => {
+    const home = await temporaryHome();
+    const failing = testDeps(home, { docker: fakeDocker({ streamCode: () => 1 }) });
+    await expect(runStackCommand("start", [], failing)).rejects.toMatchObject({ exitCode: 7 });
+
+    const foreign = testDeps(home, {
+      fetch: fakeFetch((url) => (url.endsWith("/health") ? json({ status: "ok", hostId: "host_other" }) : undefined)),
+    });
+    await expect(runStackCommand("start", [], foreign)).rejects.toThrow(/reports Host host_other/);
+
+    const silent = testDeps(home);
+    await expect(runStackCommand("start", [], silent)).rejects.toThrow(/did not answer/);
+  });
+
+  it("refuses to start next to a running launcher-managed Runtime", async () => {
+    const home = await temporaryHome();
+    await mkdir(home, { recursive: true });
+    await writeFile(stackPaths(home).state, JSON.stringify({ pid: 4242 }));
+    const deps = testDeps(home, { pidAlive: (pid) => pid === 4242 });
+    await expect(runStackCommand("start", [], deps)).rejects.toThrow(/nylorun-runtime --home .* down/);
+  });
+
+  it("rejects unknown options", async () => {
+    const deps = testDeps(await temporaryHome());
+    await expect(runStackCommand("start", ["--port", "1"], deps)).rejects.toMatchObject({ exitCode: 2 });
+  });
+});
+
+describe("start never runs a Runtime older than the Tenant's database", () => {
+  const recorded = (home: string) =>
+    (JSON.parse(readFileSync(stackPaths(home).config, "utf8")) as { runtimeVersion?: string })
+      .runtimeVersion;
+
+  /** A healthy Tenant whose Runtime reports `version`. */
+  const runningFetch = (home: string, version: string) =>
+    fakeFetch((url) => {
+      if (url.endsWith("/health")) return json({ status: "ok", version, hostId: hostId(home) });
+      if (url.endsWith("/ready")) return readyResponse();
+      return undefined;
+    });
+
+  /** Start the Tenant once with an earlier nylorun pinning `version`. */
+  async function startedBy(version: string) {
+    const home = await temporaryHome();
+    const first = testDeps(home, { fetch: runningFetch(home, version), runtimeVersion: version });
+    expect(await runStackCommand("start", ["--no-studio"], first)).toBe(0);
+    return home;
+  }
+
+  it("Studio reports page views unless telemetry is off, and says so once", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, { fetch: await healthyFetch(home) });
+    const env = () => readFileSync(stackPaths(home).env, "utf8");
+    expect(await runStackCommand("start", ["--no-open"], deps)).toBe(0);
+    expect(env()).toContain(`NYLORUN_STUDIO_ANALYTICS_ID=${STUDIO_ANALYTICS_ID}\n`);
+    expect(deps.errors).toContain(TELEMETRY_NOTICE);
+    deps.errors.length = 0;
+    expect(await runStackCommand("start", ["--no-open"], deps)).toBe(0);
+    expect(deps.errors).not.toContain(TELEMETRY_NOTICE);
+
+    for (const off of [{ NYLORUN_TELEMETRY_DISABLED: "1" }, { DO_NOT_TRACK: "1" }, { CI: "true" }]) {
+      const quiet = testDeps(home, { fetch: await healthyFetch(home), env: { NYLORUN_HOME: home, ...off } });
+      expect(await runStackCommand("start", ["--no-open"], quiet)).toBe(0);
+      expect(env()).toContain("NYLORUN_STUDIO_ANALYTICS_ID=\n");
+    }
+    await telemetryCommand(["disable"], { nylorunRoot: deps.nylorunRoot!, env: {}, out: () => {} });
+    expect(await runStackCommand("start", ["--no-open"], deps)).toBe(0);
+    expect(env()).toContain("NYLORUN_STUDIO_ANALYTICS_ID=\n");
+  });
+
+  it("a Tenant started in CI shows no telemetry notice", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, { fetch: await healthyFetch(home), env: { NYLORUN_HOME: home, CI: "1" } });
+    expect(await runStackCommand("start", ["--no-open"], deps)).toBe(0);
+    expect(deps.errors).not.toContain(TELEMETRY_NOTICE);
+  });
+
+  it("--studio-embed-origin adds an origin that may frame Studio, and status reports it", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, { fetch: await healthyFetch(home) });
+    expect(
+      await runStackCommand(
+        "start",
+        ["--no-studio", "--studio-embed-origin", "http://localhost:1420"],
+        deps,
+      ),
+    ).toBe(0);
+    const env = readFileSync(stackPaths(home).env, "utf8");
+    // No origin frames Studio by default: the one added is the only one.
+    expect(env).toContain("NYLORUN_STUDIO_FRAME_ANCESTORS=http://localhost:1420\n");
+    await expect(
+      runStackCommand("start", ["--no-studio", "--studio-embed-origin", "*"], deps),
+    ).rejects.toThrow(/not an exact origin/);
+    await expect(
+      runStackCommand("start", ["--no-studio", "--studio-embed-origin"], deps),
+    ).rejects.toThrow(/requires a value/);
+  });
+
+  it("records the pinned Runtime on the first run", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, { fetch: await healthyFetch(home) });
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    expect(recorded(home)).toBe("0.10.0-beta");
+    expect(deps.errors.some((line) => /downgrad/i.test(line))).toBe(false);
+  });
+
+  it("starts the same version again", async () => {
+    const home = await startedBy("0.10.0-beta");
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: runningFetch(home, "0.10.0-beta") });
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    expect(docker.streamed).toHaveLength(1);
+    expect(recorded(home)).toBe("0.10.0-beta");
+  });
+
+  it("upgrades a Tenant that ran, or is running, an older Runtime", async () => {
+    const home = await startedBy("0.9.0-beta");
+    expect(recorded(home)).toBe("0.9.0-beta");
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: runningFetch(home, "0.9.0-beta") });
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    expect(docker.streamed).toHaveLength(1);
+    expect(recorded(home)).toBe("0.10.0-beta");
+    expect(readFileSync(stackPaths(home).env, "utf8")).toContain("ghcr.io/nylorun/runtime:0.10.0-beta");
+  });
+
+  it("refuses a Runtime older than host.json records, before touching the Tenant", async () => {
+    const home = await startedBy("0.10.0");
+    const env = readFileSync(stackPaths(home).env, "utf8");
+    // 0.10.0-beta is a prerelease of 0.10.0, so it is older.
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: fakeFetch(() => undefined) });
+    const refused = runStackCommand("up", [], deps);
+    await expect(refused).rejects.toMatchObject({ exitCode: 5 });
+    await expect(refused).rejects.toThrow(
+      /Refusing to start Runtime 0\.10\.0-beta on Tenant home-root: Runtime 0\.10\.0 last ran it .*npx nylorun@latest start.*--allow-downgrade/,
+    );
+    expect(docker.streamed).toEqual([]);
+    expect(recorded(home)).toBe("0.10.0");
+    expect(readFileSync(stackPaths(home).env, "utf8")).toBe(env);
+
+    // `nylorun studio` starts the Tenant through the same path.
+    await expect(runStudioCommand(["--no-open"], deps)).rejects.toMatchObject({ exitCode: 5 });
+    expect(docker.streamed).toEqual([]);
+  });
+
+  it("downgrades with --allow-downgrade, warns, and records the older Runtime", async () => {
+    const home = await startedBy("0.11.0-beta");
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: runningFetch(home, "0.11.0-beta") });
+    expect(await runStackCommand("start", ["--no-studio", "--allow-downgrade"], deps)).toBe(0);
+    expect(docker.streamed).toHaveLength(1);
+    expect(deps.errors).toContain(
+      "Warning: starting Runtime 0.10.0-beta on Tenant home-root, which Runtime 0.11.0-beta last ran. " +
+        "If that Runtime migrated the database, the Tenant stays unavailable (schema-too-new).",
+    );
+    expect(recorded(home)).toBe("0.10.0-beta");
+    expect(readFileSync(stackPaths(home).env, "utf8")).toContain("ghcr.io/nylorun/runtime:0.10.0-beta");
+  });
+
+  it("does not guard, or record a version for, an image named by NYLORUN_RUNTIME_IMAGE", async () => {
+    const home = await startedBy("0.11.0-beta");
+    const deps = testDeps(home, {
+      env: { NYLORUN_HOME: home, NYLORUN_RUNTIME_IMAGE: "nylorun-runtime:dev" },
+      fetch: runningFetch(home, "0.11.0-beta"),
+    });
+    expect(await runStackCommand("start", ["--no-studio"], deps)).toBe(0);
+    expect(recorded(home)).toBe("0.11.0-beta");
+  });
+});
+
+describe("Docker preflight", () => {
+  it("explains a missing docker command", async () => {
+    const deps = testDeps(await temporaryHome(), {
+      docker: fakeDocker({
+        respond: (args) => (args[0] === "version" ? { code: 127, stdout: "", stderr: "", missing: true } : undefined),
+      }),
+    });
+    await expect(runStackCommand("start", [], deps)).rejects.toThrow(/docker command was not found/);
+  });
+
+  it("explains a stopped engine and a missing Compose v2", async () => {
+    const stopped = testDeps(await temporaryHome(), {
+      docker: fakeDocker({
+        respond: (args) =>
+          args[0] === "version" ? { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon\n" } : undefined,
+      }),
+    });
+    await expect(runStackCommand("start", [], stopped)).rejects.toThrow(/engine is not reachable \(Cannot connect/);
+
+    const oldCompose = testDeps(await temporaryHome(), {
+      docker: fakeDocker({
+        respond: (args) =>
+          args[1] === "version" ? { code: 0, stdout: "1.29.2\n", stderr: "" } : undefined,
+      }),
+    });
+    await expect(runStackCommand("start", [], oldCompose)).rejects.toThrow(/Compose v2 is required.*found 1.29.2/);
+  });
+});
+
+describe("stop, logs, status", () => {
+  async function started() {
+    const home = await temporaryHome();
+    const docker = fakeDocker({
+      respond: (args) =>
+        args.includes("ps")
+          ? {
+              code: 0,
+              stdout: [
+                { Service: "postgres", State: "running", Health: "healthy" },
+                { Service: "gateway", State: "running", Health: "healthy" },
+                { Service: "runtime", State: "running", Health: "healthy" },
+                { Service: "harness", State: "running", Health: "healthy" },
+                { Service: "studio", State: "running", Health: "healthy" },
+              ]
+                .map((row) => JSON.stringify(row))
+                .join("\n"),
+              stderr: "",
+            }
+          : undefined,
+    });
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    await runStackCommand("start", ["--no-studio"], deps);
+    deps.lines.length = 0;
+    docker.streamed.length = 0;
+    return { home, docker, deps };
+  }
+
+  it("require a Tenant", async () => {
+    const deps = testDeps(await temporaryHome());
+    await expect(runStackCommand("stop", [], deps)).rejects.toMatchObject({ exitCode: 3 });
+    await expect(runStackCommand("logs", [], deps)).rejects.toThrow(/nylorun start/);
+  });
+
+  it("stop runs compose stop", async () => {
+    const { home, docker, deps } = await started();
+    expect(await runStackCommand("stop", [], deps)).toBe(0);
+    expect(docker.streamed).toEqual([[...compose(home), "stop"]]);
+  });
+
+  it("down is stop: the containers stop and the volumes stay", async () => {
+    const { home, docker, deps } = await started();
+    expect(await runStackCommand("down", [], deps)).toBe(0);
+    expect(docker.streamed).toEqual([[...compose(home), "stop"]]);
+  });
+
+  it("logs passes the service, --follow and --tail", async () => {
+    const { home, docker, deps } = await started();
+    await runStackCommand("logs", ["runtime", "-f", "--tail", "20"], deps);
+    await runStackCommand("logs", [], deps);
+    expect(docker.streamed).toEqual([
+      [...compose(home), "logs", "--follow", "--tail", "20", "runtime"],
+      [...compose(home), "logs"],
+    ]);
+    await expect(runStackCommand("logs", ["db"], deps)).rejects.toThrow(/Unknown service db/);
+    await expect(runStackCommand("logs", ["--tail", "x"], deps)).rejects.toThrow(/Invalid --tail/);
+  });
+
+  it("status reports the Tenant, its id, health and services as JSON", async () => {
+    const { home, deps } = await started();
+    expect(await runStackCommand("status", ["--json"], deps)).toBe(0);
+    const status = JSON.parse(deps.lines.join("\n"));
+    expect(status).toMatchObject({
+      name: "home-root",
+      project: "nylorun-home-root",
+      home,
+      state: "running",
+      runtime: { url: "http://localhost:8787", healthy: true, version: "0.10.0-beta" },
+      tenant: { id: TENANT_ID, name: "home-root", state: "open" },
+      studio: { url: "http://localhost:4161", state: "running, healthy" },
+      // Restate's UI is published only with --restate-ui.
+      restate: { published: false },
+      harness: { mode: "remote", state: "running, healthy", healthy: true, connected: 1 },
+    });
+    expect(status.restate).not.toHaveProperty("url");
+    expect(status.runtime).toMatchObject({ ready: true });
+    expect(status.runtime).not.toHaveProperty("adminUrl");
+  });
+
+  it("status in words, and exit 3 when the Runtime does not answer", async () => {
+    const { deps } = await started();
+    await runStackCommand("status", [], deps);
+    expect(deps.lines.slice(0, 4)).toEqual([
+      "Tenant      home-root  running (Compose project nylorun-home-root)",
+      `Host root   ${deps.env.NYLORUN_HOME} (admin key in host-credentials.json, mode 0600)`,
+      `Tenant id   ${TENANT_ID} (home-root)  open`,
+      expect.stringMatching(/^Runtime     http:\/\/localhost:8787  healthy, ready, 0\.10\.0-beta, host_\w+$/),
+    ]);
+    const down = testDeps(deps.env.NYLORUN_HOME!, { docker: fakeDocker() });
+    expect(await runStackCommand("status", [], down)).toBe(3);
+    expect(down.lines[0]).toBe("Tenant      home-root  stopped (Compose project nylorun-home-root)");
+  });
+
+  it("status reports a Tenant that cannot open: not ready on /ready, the cause from nylorun-operate", async () => {
+    const { home, docker } = await started();
+    const run = docker.run.bind(docker);
+    const broken = testDeps(home, {
+      docker: Object.assign(docker, {
+        run: async (args: readonly string[]) =>
+          args.includes("nylorun-operate")
+            ? operateStatusResult({
+                id: TENANT_ID,
+                name: "home-root",
+                state: "unavailable",
+                cause: "kek-missing",
+                message: "The vault key is missing.",
+              })
+            : await run(args),
+      }),
+      fetch: fakeFetch((url) => {
+        if (url.endsWith("/health"))
+          return json({ status: "ok", version: "0.10.0-beta", hostId: hostId(home) });
+        if (url.endsWith("/ready")) return readyResponse(false, { mode: "remote", connected: 0 });
+        return undefined;
+      }),
+    });
+    await runStackCommand("status", [], broken);
+    expect(broken.lines).toContain(`Tenant id   ${TENANT_ID} (home-root)  unavailable: kek-missing: The vault key is missing.`);
+    expect(broken.lines.find((line) => line.startsWith("Runtime "))).toMatch(/healthy, not ready, /);
+    expect(broken.lines.some((line) => /Admin API|8788/.test(line))).toBe(false);
+    broken.lines.length = 0;
+    await runStackCommand("status", ["--json"], broken);
+    expect(JSON.parse(broken.lines.join("\n"))).toMatchObject({
+      runtime: { healthy: true, ready: false },
+      tenant: { state: "unavailable", cause: "kek-missing", message: "The vault key is missing." },
+      harness: { mode: "remote", connected: 0 },
+    });
+  });
+
+  it("status names the harness and says Restate's UI is closed", async () => {
+    const { deps } = await started();
+    await runStackCommand("status", [], deps);
+    expect(deps.lines).toContain(
+      'Harness     running, healthy, remote, 1 connected (agent turns, MCP servers and workspaces; "nylorun local logs harness")',
+    );
+    expect(deps.lines).toContain("Restate UI  not published (nylorun start --restate-ui)");
+  });
+
+  it("status of an absent Tenant exits 3 without touching Docker", async () => {
+    const docker = fakeDocker();
+    const deps = testDeps(await temporaryHome(), { docker });
+    expect(await runStackCommand("status", ["--json"], deps)).toBe(3);
+    expect(JSON.parse(deps.lines[0]!).state).toBe("absent");
+    expect(docker.calls).toEqual([]);
+  });
+});
+
+describe("reset", () => {
+  it("needs --yes when there is no terminal", async () => {
+    const deps = testDeps(await temporaryHome());
+    await expect(runStackCommand("reset", [], deps)).rejects.toMatchObject({ exitCode: 2 });
+  });
+
+  it("stops on a declined confirmation", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, confirm: async () => false });
+    expect(await runStackCommand("reset", [], deps)).toBe(1);
+    expect(docker.streamed).toEqual([]);
+  });
+
+  it("removes the volumes and the Tenant directory, keeping host files", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    await runStackCommand("start", ["--no-studio"], deps);
+    const paths = stackPaths(home);
+    await writeFile(join(paths.tenant, "vault-kek"), "kek");
+    // `start` wrote the vault key beside the Tenant directory; reset deletes it too.
+    expect(existsSync(paths.vaultKey)).toBe(true);
+    const env = await readFile(paths.env, "utf8");
+    docker.streamed.length = 0;
+    let asked = "";
+    const confirming = { ...deps, confirm: async (q: string) => ((asked = q), true) };
+    expect(await runStackCommand("reset", [], confirming)).toBe(0);
+    expect(asked).toMatch(/Delete Tenant home-root's volumes \(Compose project nylorun-home-root\)/);
+    expect(docker.streamed).toEqual([[...compose(home), "down", "--volumes", "--remove-orphans"]]);
+    expect(existsSync(join(paths.tenant, "vault-kek"))).toBe(false);
+    expect(existsSync(paths.vaultKey)).toBe(false);
+    expect(existsSync(paths.tenant)).toBe(true);
+    expect(await readFile(paths.env, "utf8")).toBe(env);
+    expect(existsSync(paths.credentials)).toBe(true);
+  });
+});
+
+describe("studio", () => {
+  it("mints a login on a running Tenant and opens it", async () => {
+    const home = await temporaryHome();
+    const psUp = {
+      code: 0,
+      stdout: JSON.stringify([
+        { Service: "gateway", State: "running", Health: "healthy" },
+        { Service: "runtime", State: "running", Health: "healthy" },
+        { Service: "harness", State: "running", Health: "healthy" },
+        { Service: "studio", State: "running", Health: "healthy" },
+      ]),
+      stderr: "",
+    };
+    const docker = fakeDocker({ respond: (args) => (args.includes("ps") ? psUp : undefined) });
+    const fetch = await healthyFetch(home);
+    const deps = testDeps(home, { docker, fetch });
+    await runStackCommand("start", [], deps);
+    docker.streamed.length = 0;
+    deps.lines.length = 0;
+    expect(await runStackCommand("studio", [], deps)).toBe(0);
+    expect(docker.streamed).toEqual([]);
+    expect(deps.lines).toEqual([`Studio    http://localhost:4161/tenants/${TENANT_ID}`]);
+    expect(deps.opened).toEqual([`http://localhost:4161/login?token=tok+en&${NEXT}`]);
+    const login = fetch.requests.find((r) => r.url.endsWith("/_studio/login-tokens"));
+    expect(login?.url).toBe("http://localhost:4161/_studio/login-tokens");
+    expect(login?.init?.method).toBe("POST");
+    expect((login?.init?.headers as Record<string, string>).authorization).toMatch(/^Bearer [0-9a-f]{64}$/);
+  });
+
+  it("uses a login URL Studio returns", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, { fetch: await healthyFetch(home, { loginUrl: "/login?token=abc" }) });
+    expect(await runStackCommand("studio", [], deps)).toBe(0);
+    expect(deps.opened).toEqual([`http://localhost:4161/login?token=abc&${NEXT}`]);
+  });
+
+  it("warns and fails when Studio is up but refuses a login token", async () => {
+    const home = await temporaryHome();
+    const deps = testDeps(home, {
+      fetch: fakeFetch((url) => {
+        if (url.endsWith("/health")) return json({ status: "ok", hostId: hostId(home) });
+        if (url.endsWith("/v1/admin/status")) return openTenant();
+        if (url.endsWith("/_studio/login-tokens")) return json({}, 401);
+        return undefined;
+      }),
+    });
+    expect(await runStackCommand("studio", [], { ...deps, loginTimeoutMs: 20 })).toBe(1);
+    expect(deps.errors.some((line) => /Studio at http:\/\/localhost:4161 is not reachable/.test(line))).toBe(true);
+    expect(deps.opened).toEqual([]);
+  });
+
+  it("starts a stopped Tenant first; --no-open only prints", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    expect(await runStackCommand("studio", ["--no-open"], deps)).toBe(0);
+    expect(docker.streamed.map((args) => args.at(-1))).toEqual(["harness", "studio"]);
+    expect(deps.lines).toEqual([
+      "Runtime   http://localhost:8787",
+      `Studio    http://localhost:4161/login?token=tok+en&${NEXT}`,
+    ]);
+    expect(deps.opened).toEqual([]);
+  });
+
+  it("lands on the page it is given", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    const next = tenantStudioPath("tn_01TESTSTUDIO00000000000001");
+    expect(await runStudioCommand([], deps, { next })).toBe(0);
+    const expected =
+      "http://localhost:4161/login?token=tok+en&next=%2Ftenants%2Ftn_01TESTSTUDIO00000000000001";
+    expect(deps.lines.at(-1)).toBe("Studio    http://localhost:4161/tenants/tn_01TESTSTUDIO00000000000001");
+    expect(deps.opened).toEqual([expected]);
+    const url = new URL(expected);
+    expect(url.searchParams.get("token")).toBe("tok en");
+    expect(url.searchParams.get("next")).toBe("/tenants/tn_01TESTSTUDIO00000000000001");
+  });
+
+  it("withNext keeps the login URL when there is no next", () => {
+    expect(withNext("http://localhost:1/login?token=a", undefined)).toBe(
+      "http://localhost:1/login?token=a",
+    );
+  });
+
+  it("fails when Studio cannot start", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker({ streamCode: (args) => (args.includes("studio") ? 1 : 0) });
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    await expect(runStackCommand("studio", ["--no-open"], deps)).rejects.toMatchObject({ exitCode: 7 });
+  });
+});
+
+describe("ensureStack", () => {
+  it("reuses a running Tenant without Compose up", async () => {
+    const home = await temporaryHome();
+    const psUp = {
+      code: 0,
+      stdout: JSON.stringify([
+        { Service: "gateway", State: "running", Health: "healthy" },
+        { Service: "runtime", State: "running", Health: "healthy" },
+        { Service: "harness", State: "running", Health: "healthy" },
+        { Service: "studio", State: "running", Health: "healthy" },
+      ]),
+      stderr: "",
+    };
+    const docker = fakeDocker({ respond: (args) => (args.includes("ps") ? psUp : undefined) });
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    await runStackCommand("start", [], deps);
+    docker.streamed.length = 0;
+    deps.lines.length = 0;
+    const stack = await ensureStack(deps, { studio: true });
+    expect(docker.streamed).toEqual([]);
+    expect(deps.lines).toEqual([]);
+    expect(stack).toMatchObject({
+      name: "home-root",
+      home,
+      runtimeUrl: "http://localhost:8787",
+      hostId: hostId(home),
+      studioPort: 4161,
+      studioUp: true,
+      started: false,
+    });
+    expect(stack).not.toHaveProperty("adminUrl");
+    // The admin key mints Studio logins.
+    expect(stack.adminKey).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("starts a stopped Tenant quietly; without Studio only the core services", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker();
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    const stack = await ensureStack(deps, { studio: false });
+    expect(docker.streamed.map((args) => args.at(-1))).toEqual(["harness"]);
+    expect(deps.lines).toEqual([]);
+    expect(stack).toMatchObject({ started: true, studioUp: false, runtimeUrl: "http://localhost:8787" });
+  });
+
+  it("checks Docker first", async () => {
+    const home = await temporaryHome();
+    const docker = fakeDocker({
+      respond: (args) =>
+        args[0] === "version" ? { code: 127, stdout: "", stderr: "", missing: true } : undefined,
+    });
+    await expect(ensureStack(testDeps(home, { docker }), { studio: true })).rejects.toThrow(
+      /Docker Desktop, OrbStack, Colima/,
+    );
+  });
+});
+
+describe("parseComposePs", () => {
+  it("reads both the array and the line-per-service formats", () => {
+    const row = { Service: "runtime", State: "running", Health: "healthy" };
+    const expected = [{ service: "runtime", state: "running", health: "healthy" }];
+    expect(parseComposePs(JSON.stringify([row]))).toEqual(expected);
+    expect(parseComposePs(`${JSON.stringify(row)}\n`)).toEqual(expected);
+    expect(parseComposePs("")).toEqual([]);
+  });
+});
+
+describe("doctor with a running Tenant", () => {
+  it.each([
+    ["healthy", 0, /gateway\s+✓ running, healthy · combined packing/],
+    ["unhealthy", 1, /gateway\s+✗ running, unhealthy: model calls fail; see nylorun local logs gateway/],
+  ] as const)("reports a %s gateway (exit %i)", async (health, code, line) => {
+    const home = await temporaryHome();
+    const docker = fakeDocker({
+      respond: (args) =>
+        args.includes("ps")
+          ? {
+              code: 0,
+              stdout: JSON.stringify([
+                { Service: "gateway", State: "running", Health: health },
+                { Service: "runtime", State: "running", Health: "healthy" },
+                { Service: "harness", State: "running", Health: "healthy" },
+                { Service: "studio", State: "running", Health: "healthy" },
+              ]),
+              stderr: "",
+            }
+          : undefined,
+    });
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    await runStackCommand("start", ["--no-studio"], deps);
+    const lines: string[] = [];
+    expect(await doctorStack({ json: false, deps, log: (text) => lines.push(text) })).toBe(code);
+    expect(lines.join("\n")).toMatch(line);
+  });
+
+  it("fails on a Tenant that is not open, with nylorun-operate's reason (exit 1)", async () => {
+    const home = await temporaryHome();
+    let open = true;
+    const docker = fakeDocker({
+      respond: (args) =>
+        args.includes("ps")
+          ? {
+              code: 0,
+              stdout: JSON.stringify(
+                ["gateway", "runtime", "harness", "studio"].map((Service) => ({ Service, State: "running", Health: "healthy" })),
+              ),
+              stderr: "",
+            }
+          : args.includes("nylorun-operate") && !open
+            ? operateStatusResult({ id: TENANT_ID, name: "home-root", state: "unavailable", message: "Its log names the cause" })
+            : undefined,
+    });
+    const deps = testDeps(home, { docker, fetch: await healthyFetch(home) });
+    await runStackCommand("start", ["--no-studio"], deps);
+    open = false;
+    const lines: string[] = [];
+    expect(await doctorStack({ json: false, deps, log: (text) => lines.push(text) })).toBe(1);
+    expect(lines.join("\n")).toMatch(/tenant id\s+✗ tn_\w+ unavailable: Its log names the cause/);
+  });
+});

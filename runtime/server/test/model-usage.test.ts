@@ -1,0 +1,232 @@
+/**
+ * The model usage ledger: whichever gate serves the call, every model call
+ * that answers is recorded once, and `GET /v1/tenant/usage` totals the rows by scope. A call
+ * that fails records nothing. Providers are faked by answering the custom endpoint's requests.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Agent, createClient, type AgentsClient } from "@nylorun/agents";
+import { deploy } from "./support/agents.js";
+import { startTestTenant } from "./support/tenant.js";
+
+const APP = "model-usage-app-token-aaaaaaaaaa";
+const PROVIDER = "https://models.usage.invalid/v1";
+const realFetch = globalThis.fetch;
+
+function answer(content: string) {
+  return new Response(
+    `data: ${JSON.stringify({
+      id: "r",
+      choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }],
+    })}\n\ndata: ${JSON.stringify({
+      id: "r",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 },
+    })}\n\ndata: [DONE]\n\n`,
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
+
+/**
+ * Vercel AI Gateway's answer when the provider behind it fails mid-stream: a first chunk, then
+ * an error chunk and no finish_reason.
+ */
+function cut() {
+  return new Response(
+    `data: ${JSON.stringify({ id: "r", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n` +
+      `data: ${JSON.stringify({ error: { message: "Upstream stream ended before terminal chunk" } })}\n\n`,
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
+
+/** Answers provider requests with `reply`; every other request goes to the Runtime. */
+function provider(reply: () => Response) {
+  let calls = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.startsWith(PROVIDER)) return realFetch(input, init);
+      calls++;
+      return reply();
+    }),
+  );
+  return { calls: () => calls };
+}
+
+const closers: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+  await Promise.all(closers.splice(0).map((close) => close()));
+});
+
+async function tenant() {
+  const runtime = await startTestTenant({
+    applicationKey: APP,
+    useHostModel: true,
+    modelCall: { retryBaseDelayMs: 1 },
+  });
+  closers.push(() => runtime.close());
+  const configured = await realFetch(`${runtime.url}/v1/tenant/model`, {
+    method: "PUT",
+    headers: { ...runtime.managementHeaders(), "content-type": "application/json" },
+    body: JSON.stringify({
+      requestId: "model-1",
+      idempotencyKey: "model-1",
+      provider: "custom",
+      model: "test-model",
+      baseUrl: PROVIDER,
+      auth: { type: "api_key", key: "provider-key" },
+    }),
+  });
+  expect(configured.status).toBe(200);
+  const client = createClient({ url: runtime.url, key: runtime.applicationKey, tenant: runtime.tenantId });
+  await deploy(runtime.url, runtime.headers(), Agent({ id: "bot", name: "Bot" }).instructions("Answer.").build());
+  const usage = async (query = "") => {
+    const response = await realFetch(`${runtime.url}/v1/tenant/usage${query}`, { headers: runtime.managementHeaders() });
+    return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+  };
+  return { client, usage };
+}
+
+async function settle(session: ReturnType<AgentsClient["session"]>) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const view = await session.inspect();
+    if (["completed", "failed", "cancelled", "uncertain"].includes(view.status)) return view;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("session did not settle");
+}
+
+describe.each([["in-process"], ["http"]] as const)("over the %s Model Gate", (transport) => {
+  beforeEach(() => {
+    vi.stubEnv("NYLORUN_TEST_MODEL_GATE", transport === "http" ? "http" : "");
+  });
+
+  it("records each answered call once and totals it by scope", async () => {
+    const counter = provider(() => answer("hi"));
+    const { client, usage } = await tenant();
+    expect((await usage()).body).toEqual({ scope: "tenant", period: "total", calls: 0, tokens: 0, costUsd: 0 });
+
+    const session = await client.createSession({ id: "s1", agent: "bot", ownerUserId: "ada" });
+    await session.input("hello", { idempotencyKey: "m1" });
+    expect((await settle(session)).status).toBe("completed");
+    await session.input("again", { idempotencyKey: "m2" });
+    expect((await settle(session)).status).toBe("completed");
+    expect(counter.calls()).toBe(2);
+
+    // A custom endpoint is priced at $0: only token limits can stop it.
+    expect((await usage()).body).toEqual({ scope: "tenant", period: "total", calls: 2, tokens: 30, costUsd: 0 });
+    const month = await usage("?scope=manifest&id=bot&period=month");
+    expect(month.body).toMatchObject({ scope: "manifest", id: "bot", period: "month", calls: 2, tokens: 30 });
+    expect(month.body.since).toMatch(/^\d{4}-\d{2}-01T00:00:00\.000Z$/);
+    expect((await usage("?scope=manifest&id=other")).body).toMatchObject({ calls: 0 });
+  });
+
+  it("puts the gate's timing and metered usage on the outcome, and the turn's totals on its end", async () => {
+    provider(() => answer("hi"));
+    const { client, usage } = await tenant();
+    const session = await client.createSession({ id: "s1", agent: "bot", ownerUserId: "ada" });
+    await session.input("hello", { idempotencyKey: "m1" });
+    expect((await settle(session)).status).toBe("completed");
+    const { items } = await session.history();
+    const [message] = items.filter((item) => item.type === "message.assistant");
+    const payload = message!.payload as Record<string, any>;
+    expect(payload).toMatchObject({
+      text: "hi",
+      effectId: expect.any(String),
+      durationMs: expect.any(Number),
+      firstTokenMs: expect.any(Number),
+      meteredUsage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+    });
+    expect(payload.meteredUsage).not.toHaveProperty("costUsd");
+    // One provider call answered it: no retry to report.
+    expect(payload.attempts).toBe(1);
+    expect(payload).not.toHaveProperty("retries");
+    const { startedAt, endedAt } = payload.gate as { startedAt: string; endedAt: string };
+    expect(Date.parse(endedAt)).toBeGreaterThanOrEqual(Date.parse(startedAt));
+    // The gate's call sits inside the journal's window.
+    expect(Date.parse(endedAt) - Date.parse(startedAt)).toBeLessThanOrEqual(payload.durationMs + 1);
+
+    // The turn's totals are what /v1/tenant/usage totals for it.
+    const [completed] = items.filter((item) => item.type === "turn.completed");
+    const turn = (await usage(`?scope=turn&id=${completed!.turnId}`)).body;
+    expect(completed!.payload).toMatchObject({
+      agentId: "bot",
+      durationMs: expect.any(Number),
+      totals: { steps: turn.calls, tokens: turn.tokens, costUsd: turn.costUsd },
+    });
+    expect(turn).toMatchObject({ calls: 1, tokens: 15 });
+  });
+
+  it("puts a call's retries on its message.assistant and its ledger row", async () => {
+    const counter = provider(() => (counter.calls() === 1 ? cut() : answer("after the cut")));
+    const { client, usage } = await tenant();
+    const session = await client.createSession({ id: "s1", agent: "bot", ownerUserId: "ada" });
+    await session.input("hello", { idempotencyKey: "m1" });
+    expect((await settle(session)).status).toBe("completed");
+    expect(counter.calls()).toBe(2);
+    const { items } = await session.history();
+    const message = items.find((item) => item.type === "message.assistant")!.payload as Record<string, unknown>;
+    expect(message).toMatchObject({
+      text: "after the cut",
+      attempts: 2,
+      retries: [{ attempt: 2, delayMs: 1, error: expect.stringContaining("Upstream stream ended before terminal chunk") }],
+    });
+    // The call is metered once, as one call, whatever it took.
+    expect((await usage()).body).toMatchObject({ calls: 1, tokens: 15 });
+  });
+
+  it("puts the retries on model.failed when every attempt is cut", async () => {
+    const counter = provider(() => cut());
+    const { client } = await tenant();
+    const session = await client.createSession({ id: "s1", agent: "bot", ownerUserId: "ada" });
+    await session.input("hello", { idempotencyKey: "m1" });
+    expect((await settle(session)).status).toBe("failed");
+    expect(counter.calls()).toBe(3);
+    const { items } = await session.history();
+    const failed = items.find((item) => item.type === "model.failed")!.payload as Record<string, any>;
+    expect(failed).toMatchObject({
+      code: "transient",
+      retryable: true,
+      attempts: 3,
+      retries: [
+        { attempt: 2, delayMs: 1, error: expect.stringContaining("Upstream stream ended") },
+        { attempt: 3, delayMs: 2, error: expect.stringContaining("Upstream stream ended") },
+      ],
+    });
+    expect(items.find((item) => item.type === "turn.failed")!.payload).toMatchObject({
+      error: { code: "model.transient" },
+    });
+  });
+
+  it("records nothing for a call that fails", async () => {
+    provider(() => new Response(JSON.stringify({ error: { message: "bad request" } }), { status: 400 }));
+    const { client, usage } = await tenant();
+    const session = await client.createSession({ id: "s1", agent: "bot", ownerUserId: "ada" });
+    await session.input("hello", { idempotencyKey: "m1" });
+    expect((await settle(session)).status).toBe("failed");
+    expect((await usage()).body).toMatchObject({ calls: 0 });
+    // Nothing was metered: the outcome's span is the journal's window alone.
+    const { items } = await session.history();
+    const failed = items.find((item) => item.type === "model.failed")!.payload as Record<string, unknown>;
+    expect(failed).toMatchObject({ effectId: expect.any(String), durationMs: expect.any(Number) });
+    expect(failed).not.toHaveProperty("gate");
+    expect(failed).not.toHaveProperty("meteredUsage");
+    // A refusal the request caused is never retried: one attempt, no retries.
+    expect(failed).toMatchObject({ attempts: 1 });
+    expect(failed).not.toHaveProperty("retries");
+    expect(items.find((item) => item.type === "turn.failed")!.payload).toMatchObject({
+      agentId: "bot",
+      totals: { steps: 0, tokens: 0, costUsd: 0 },
+    });
+  });
+});
+
+it("refuses a manifest or turn total without an id, and an unknown scope", async () => {
+  const { usage } = await tenant();
+  expect((await usage("?scope=manifest")).status).toBe(400);
+  expect((await usage("?scope=agent&id=bot")).status).toBe(400);
+  expect((await usage("?scope=session&id=s1")).status).toBe(400);
+  expect((await usage("?period=week")).status).toBe(400);
+});

@@ -1,0 +1,324 @@
+/**
+ * Our engine's skill tools (protocol 15), which run here, in the harness: `load_skill` for an
+ * agent with skills, and `read_skill_resource` when a skill has files besides `SKILL.md`. With
+ * them come the skill catalog the model reads (`skillCatalogText`) and, with a sandbox, the note
+ * on where each skill's files are (`skillFolderNote`).
+ *
+ * - `load_skill`: the skill's instructions (its `SKILL.md` after the frontmatter), the paths of
+ *   its other files, and, when the session has a sandbox, where they are in it
+ *   (`/skills/<name>@<hash>/`, read-only).
+ * - `read_skill_resource`: one text file of the skill. A binary file, or one larger than the
+ *   harness reads into the model's context (`readBytes`, at most what one record entry holds), is
+ *   refused: the model uses it in the sandbox, when there is one.
+ *
+ * A skill's bytes come over the Harness API's `definition.file` seam, a range of at most
+ * `turn.start.limits.chunkBytes` at a time. Expected problems are failed outcomes the model sees;
+ * only the run's own failures throw.
+ *
+ * With a sandbox, our engine also decides where and when the skills' files are in it (protocol
+ * 15): before each `sandbox` call it mounts each skill version of the turn's tree (the agent and
+ * the agents it uses as tools, which share its sandbox) at its folder (`skillFolderOf`) with
+ * `executors.files.mount` (`mountSkills`). The host only writes the files, and answers `present`
+ * for a folder the sandbox already holds since it last started.
+ */
+import {
+  SKILL_ENTRY,
+  SKILLS_MOUNT,
+  pluginFolderOf,
+  skillFolderOf,
+  skillInstructions,
+  type AgentManifest,
+  type SkillManifest,
+} from "@nylorun/core/define";
+import {
+  LOAD_SKILL_TOOL,
+  READ_SKILL_RESOURCE_TOOL,
+  pluginSkill,
+  pluginSkills,
+  SKILLS_USAGE,
+  formatSkillCatalog,
+} from "@nylorun/core/engine";
+import { fromBase64, type HarnessChannel } from "@nylorun/core/harness-api";
+import type { HostEffect } from "../run/durable.js";
+import type { FailedFileOutcome, HarnessFiles, HarnessRun } from "../api/executors.js";
+
+export {
+  DEFAULT_SKILL_READ_BYTES,
+  LOAD_SKILL_TOOL,
+  READ_SKILL_RESOURCE_TOOL,
+  SKILLS_USAGE,
+  formatSkillCatalog,
+  skillFolderNote,
+  skillTools,
+} from "@nylorun/core/engine";
+
+/** True when `name` is one of our engine's skill tools. */
+export function isSkillTool(name: string | undefined): boolean {
+  return name === LOAD_SKILL_TOOL || name === READ_SKILL_RESOURCE_TOOL;
+}
+
+/** What the model reads of an agent's skills: when to load one, and the catalog (block `skills`). */
+export function skillCatalogText(
+  skills: readonly { readonly name: string; readonly description: string }[],
+): string[] {
+  return [
+    SKILLS_USAGE,
+    formatSkillCatalog(skills.map(({ name, description }) => ({ name, description }))),
+  ];
+}
+
+/** What a skill tool runs with. */
+export interface SkillToolContext {
+  readonly channel: Pick<HarnessChannel, "request">;
+  readonly run: HarnessRun;
+  /** The agent whose skill the call reads: the turn's agent, or the agent used as a tool. */
+  readonly agent: Pick<AgentManifest, "skills" | "engine" | "plugins">;
+  /**
+   * The most bytes of one file read into the model's context: the harness's `skillReadBytes`.
+   * The answer is also held to the run's `limits.recordEntryBytes`, since it is one record entry.
+   */
+  readonly readBytes: number;
+  /** The session has a sandbox: the skill's files are in it. */
+  readonly sandboxed: boolean;
+  readonly signal: AbortSignal;
+}
+
+type Outcome =
+  { readonly kind: "completed"; readonly output: Record<string, unknown> } | FailedFileOutcome;
+
+const failed = (code: string, message: string): FailedFileOutcome => ({
+  kind: "failed",
+  code,
+  message,
+});
+
+/** UTF-8 text, or undefined for bytes that are not (a NUL byte, or invalid UTF-8). */
+function textOf(bytes: Uint8Array): string | undefined {
+  if (bytes.includes(0)) return undefined;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The bytes of definition file `sha256`, or undefined once it passes `maxBytes`. */
+async function readDefinitionFile(
+  context: SkillToolContext,
+  sha256: string,
+  maxBytes: number,
+): Promise<Uint8Array | undefined> {
+  const { channel, run, signal } = context;
+  // No range asks for more than one byte past what the file may hold.
+  const length = Math.min(run.start.limits.chunkBytes, maxBytes + 1);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (let offset = 0; ; offset += length) {
+    const { base64 } = await channel.request(
+      "definition.file",
+      { runId: run.runId, sha256, offset, length },
+      signal,
+    );
+    const chunk = fromBase64(base64);
+    total += chunk.byteLength;
+    if (total > maxBytes) return undefined;
+    if (chunk.byteLength > 0) chunks.push(chunk);
+    if (chunk.byteLength < length) break;
+  }
+  const bytes = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return bytes;
+}
+
+/** The size of `value` as JSON, in UTF-8 bytes. */
+const jsonBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+/** Runs a call of one of our engine's skill tools, as its outcome. */
+export async function runSkillTool(
+  effect: HostEffect,
+  context: SkillToolContext,
+): Promise<Outcome> {
+  const input = (effect.input ?? {}) as { name?: unknown; path?: unknown };
+  const skills = new Map(
+    Object.values(context.agent.skills ?? {}).map((skill) => [skill.name, skill]),
+  );
+  const name = typeof input.name === "string" ? input.name : "";
+  const skill = skills.get(name);
+  // A skill of a Runtime plugin the agent declares is the plugin's: served from the bundle.
+  const declared = (context.agent.engine?.plugins ?? []).map((plugin) => plugin.name);
+  const ofPlugin = skill ? undefined : pluginSkill(declared, name);
+  if (ofPlugin)
+    return effect.toolName === LOAD_SKILL_TOOL
+      ? {
+          kind: "completed",
+          output: { name: ofPlugin.name, content: skillInstructions(ofPlugin.text) },
+        }
+      : failed(
+          "skill.unknown_resource",
+          `Skill '${ofPlugin.name}' has no resource '${typeof input.path === "string" ? input.path : ""}'.`,
+        );
+  if (!skill)
+    return effect.toolName === LOAD_SKILL_TOOL
+      ? {
+          kind: "completed",
+          output: {
+            unknown: name,
+            available: [
+              ...skills.keys(),
+              ...pluginSkills(declared).map((item) => item.name),
+            ].sort(),
+          },
+        }
+      : failed("skill.unknown", `There is no skill '${name}'.`);
+  const { sandboxed } = context;
+  const recordBytes = context.run.start.limits.recordEntryBytes;
+  const maxBytes = Math.min(context.readBytes, recordBytes);
+  const directory = `${skillFolderOf(skill)}/`;
+  // The folder of the Agent Plugin the skill came from, when that plugin is mounted whole: where the
+  // skill's references to the plugin's own files (agents/…, resources/…) are found.
+  const mounted =
+    skill.plugin &&
+    (context.agent.plugins ?? []).find(
+      (plugin) => plugin.name === skill.plugin!.name && plugin.files,
+    );
+  const pluginPath = mounted?.files
+    ? `${pluginFolderOf({ name: mounted.name, files: mounted.files })}/`
+    : undefined;
+  const tooLarge = (path: string) =>
+    failed(
+      "skill.resource_too_large",
+      sandboxed
+        ? `${path} is larger than ${maxBytes} bytes, too large to read here. It is in the sandbox at ${directory}${path}; use it there.`
+        : `${path} is larger than ${maxBytes} bytes; only smaller files can be read without a sandbox.`,
+    );
+  /** The answer, unless it is larger than one record entry holds. */
+  const answer = (path: string, output: Record<string, unknown>): Outcome => {
+    const outcome = { kind: "completed" as const, output };
+    return jsonBytes(outcome) > recordBytes ? tooLarge(path) : outcome;
+  };
+
+  if (effect.toolName === LOAD_SKILL_TOOL) {
+    const entry = await readDefinitionFile(context, skill.files[SKILL_ENTRY]!, maxBytes);
+    if (!entry) return tooLarge(SKILL_ENTRY);
+    const text = textOf(entry);
+    if (text === undefined)
+      return failed("skill.binary_resource", `${SKILL_ENTRY} of '${skill.name}' is not text.`);
+    const resources = Object.keys(skill.files)
+      .filter((path) => path !== SKILL_ENTRY)
+      .sort();
+    return answer(SKILL_ENTRY, {
+      name: skill.name,
+      content: skillInstructions(text),
+      ...(resources.length === 0 ? {} : { resources }),
+      ...(sandboxed ? { sandboxPath: directory } : {}),
+      ...(sandboxed && pluginPath ? { pluginPath } : {}),
+    });
+  }
+
+  const path = typeof input.path === "string" ? input.path : "";
+  if (skill.files[path] === undefined)
+    return failed("skill.unknown_resource", `Skill '${skill.name}' has no resource '${path}'.`);
+  const bytes = await readDefinitionFile(context, skill.files[path]!, maxBytes);
+  if (!bytes) return tooLarge(path);
+  const content = textOf(bytes);
+  if (content === undefined)
+    return failed(
+      "skill.binary_resource",
+      sandboxed
+        ? `${path} is not a text file. It is in the sandbox at ${directory}${path}; use it there.`
+        : `${path} is not a text file; only text files can be read without a sandbox.`,
+    );
+  return answer(path, { name: skill.name, path, content });
+}
+
+/** A skill's files, by path in its folder, as `sha256:<hex>`. */
+export type SkillFiles = Readonly<Record<string, string>>;
+
+/**
+ * The skill versions of `manifest` and of the agents it uses as tools (they share its sandbox),
+ * by folder (`/skills/<name>@<hash>`): each distinct version once.
+ */
+export function sandboxSkillsOf(
+  manifest: AgentManifest | undefined,
+  into = new Map<string, SkillFiles>(),
+): Map<string, SkillFiles> {
+  for (const skill of Object.values(manifest?.skills ?? {})) {
+    const folder = skillFolderOf(skill);
+    if (!into.has(folder)) into.set(folder, skill.files);
+  }
+  for (const tool of manifest?.tools ?? [])
+    if (tool.agent !== undefined && !("kind" in tool.agent))
+      sandboxSkillsOf(tool.agent as AgentManifest, into);
+  return into;
+}
+
+/**
+ * A definition file's bytes over `definition.file`, a range of at most the run's
+ * `limits.chunkBytes` at a time, as they come: a file may be larger than one frame holds.
+ */
+export async function* definitionFileChunks(
+  channel: Pick<HarnessChannel, "request">,
+  run: HarnessRun,
+  sha256: string,
+  signal: AbortSignal,
+): AsyncGenerator<Uint8Array> {
+  const length = run.start.limits.chunkBytes;
+  for (let offset = 0; ; offset += length) {
+    const { base64 } = await channel.request(
+      "definition.file",
+      { runId: run.runId, sha256, offset, length },
+      signal,
+    );
+    const chunk = fromBase64(base64);
+    if (chunk.byteLength > 0) yield chunk;
+    if (chunk.byteLength < length) return;
+  }
+}
+
+/**
+ * The Agent Plugins mounted whole by `manifest` and by the agents it uses as tools (they share its
+ * sandbox), by folder (`/plugins/<name>@<hash>`): each distinct version once.
+ */
+export function sandboxPluginsOf(
+  manifest: AgentManifest | undefined,
+  into = new Map<string, SkillFiles>(),
+): Map<string, SkillFiles> {
+  for (const plugin of manifest?.plugins ?? []) {
+    if (!plugin.files) continue;
+    const folder = pluginFolderOf({ name: plugin.name, files: plugin.files });
+    if (!into.has(folder)) into.set(folder, plugin.files);
+  }
+  for (const tool of manifest?.tools ?? [])
+    if (tool.agent !== undefined && !("kind" in tool.agent))
+      sandboxPluginsOf(tool.agent as AgentManifest, into);
+  return into;
+}
+
+/**
+ * Mounts the skill folders of the run's tree in its sandbox, and the folders of the Agent Plugins
+ * it mounts whole, before a `sandbox` call: each one the sandbox does not hold yet is written,
+ * read-only. A failed outcome (the call's, then) when one cannot be; nothing when the tree has none.
+ */
+export async function mountSkills(
+  files: HarnessFiles,
+  channel: Pick<HarnessChannel, "request">,
+  run: HarnessRun,
+  signal: AbortSignal,
+): Promise<FailedFileOutcome | undefined> {
+  const manifest = run.start.manifest as AgentManifest;
+  for (const [folder, skill] of [...sandboxSkillsOf(manifest), ...sandboxPluginsOf(manifest)]) {
+    const mounted = await files.mount(
+      run,
+      folder,
+      skill,
+      (sha256) => definitionFileChunks(channel, run, sha256, signal),
+      signal,
+    );
+    if (mounted.kind === "failed") return mounted;
+  }
+  return undefined;
+}

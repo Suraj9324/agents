@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.data/
+.env
+.env.local
+.nylorun/
+
+# Legacy local settings remain private until migrated.
+config/model.json
+
+.nylorun/

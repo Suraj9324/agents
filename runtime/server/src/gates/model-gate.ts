@@ -1,0 +1,62 @@
+/**
+ * The Model Gate seam. Every vault-backed model call of the loop goes
+ * through one `ModelGate`: the call, who it is for, and nothing else. The gate owns what the
+ * call needs that the loop must not hold: the provider credential, pi-ai, its retries and
+ * idle watchdog, failure classification and scrubbing.
+ *
+ * Three implementations: `inProcessModelGate` (embedding, the ephemeral Runtime, tests), the
+ * HTTP client of the gates service (the `gateway` container), which keeps the credential out
+ * of the loop process, and `providerModelGate`, which serves a Runtime's scripted model (tests,
+ * `model: {kind: "scripted"}`) the same way, metered. Both return what `piModel` returns, so the effect journal is the same
+ * either way.
+ */
+import type { AgentRef } from "@nylorun/core/define";
+import type { RuntimeModelAdapter, RuntimeModelCall } from "../contracts.js";
+
+export type { ModelCallSettings } from "../model/pi-model.js";
+
+/**
+ * One model call, as the loop hands it to the gate. JSON-safe: it crosses the network. Over
+ * HTTP the session, turn and agent travel in the run token, not the body: the gate's route
+ * fills them in from its claims.
+ */
+export interface ModelGateRequest {
+  readonly tenantId: string;
+  readonly sessionId: string;
+  readonly turnId: string;
+  /** The session's agent, for the usage ledger and its budgets. */
+  readonly agentId: string;
+  /** The effect's journal id; sent as `Idempotency-Key`. */
+  readonly effectId: string;
+  readonly invocationId: string;
+  /**
+   * The agent used as a tool the call is for; absent for the session's root agent. In process
+   * only: a scripted provider reads it (`providerModelGate`).
+   */
+  readonly agent?: AgentRef;
+  /** A call that summarizes history for a compaction (protocol 15); in process only, like `agent`. */
+  readonly purpose?: "summary";
+  readonly call: RuntimeModelCall;
+}
+
+/** A model candidate or a failure outcome: exactly what `piModel` returns. */
+export type ModelGateOutcome = Awaited<ReturnType<RuntimeModelAdapter>>;
+
+export interface ModelGate {
+  /**
+   * Calls the model. A provider or gate failure comes back as a failure outcome; only an abort
+   * of `signal` throws, so the advance decides what the abort means.
+   */
+  call(request: ModelGateRequest, signal: AbortSignal): Promise<ModelGateOutcome>;
+  /**
+   * True when a call outlives the caller's process (the gates service): after a takeover
+   * or a shutdown, re-sending the journaled request joins the call or returns its outcome
+   * instead of calling the provider again. The in-process gate dies with the loop.
+   */
+  readonly recovers?: boolean;
+  /**
+   * Stops a call that outlives its caller (a user cancel). Best-effort: never rejects. Only a
+   * gate that `recovers` needs it; for the others aborting `signal` already stops the call.
+   */
+  cancel?(request: Pick<ModelGateRequest, "tenantId" | "sessionId" | "effectId">): Promise<void>;
+}

@@ -1,0 +1,191 @@
+import { z } from "zod";
+import type { BuiltAgent } from "../types/agent.js";
+import type { AgentManifest, PluginLabel } from "../types/manifest.js";
+import type { WorkflowManifest } from "../types/workflow.js";
+import type { BuiltWorkflow } from "./workflow/types.js";
+import type { JsonObject } from "../types/shared.js";
+import type { ToolDefinition } from "../types/tool.js";
+import { ToolError } from "./tool-error.js";
+import { normalizeSchema } from "./schema.js";
+import { schemaFromJSON } from "./schema-json.js";
+
+/** Survives duplicate installed copies of core, like the error brands. */
+const DELEGATE = Symbol.for("@nylorun/core/delegate");
+
+/** An agent used as another agent's tool. The engine runs it; customer code never does. */
+export interface Delegate {
+  /**
+   * The child's manifest, inlined into the parent's tool. A flow agent's workflow manifest
+   * v3 runs in its own linked session on the Runtime, not inside the parent's run.
+   */
+  readonly manifest: AgentManifest | WorkflowManifest;
+  /** The authored child, when available locally. Absent when rebuilt from a manifest. */
+  readonly agent?: BuiltAgent;
+  /** The authored flow agent, when the child is one and available locally. */
+  readonly workflow?: BuiltWorkflow;
+  /** The Agent Plugin the child came from, kept from the manifest's tool entry: identity only. */
+  readonly plugin?: PluginLabel;
+}
+
+/** True when the delegate is a flow agent, which runs in its own linked session. */
+export function isFlowDelegate(
+  delegate: Delegate
+): delegate is Delegate & { readonly manifest: WorkflowManifest } {
+  return (delegate.manifest as { kind?: unknown }).kind === "workflow";
+}
+
+/**
+ * The longest tool name every model provider accepts: OpenAI's and Anthropic's
+ * `^[a-zA-Z0-9_-]{1,64}$`. A provider's ceiling, not a setting.
+ */
+export const MODEL_TOOL_NAME_MAX = 64;
+/** Model-facing tool names: what every supported provider accepts. */
+export const DELEGATE_NAME_PATTERN = new RegExp(`^[A-Za-z0-9_-]{1,${MODEL_TOOL_NAME_MAX}}$`);
+
+const taskSchema = z
+  .object({
+    task: z
+      .string()
+      .min(1)
+      .describe("A complete, self-contained task. The agent sees nothing else."),
+  })
+  .strict();
+
+/** The input every agent used as a tool accepts. Part of the hashed manifest; change deliberately. */
+export const DELEGATE_INPUT_SCHEMA: JsonObject = normalizeSchema(taskSchema, "input").jsonSchema;
+
+/**
+ * Whether a subagent's own `inputSchema` can take the task a tool call hands it: any string.
+ * False when its `type` excludes `"string"`, when it pins the value (`const`, `enum`), or when
+ * no branch of `anyOf`/`oneOf` (or not every branch of `allOf`) can take one. Other keywords
+ * (`minLength`, `pattern`) narrow which strings fit and are left to the run.
+ */
+export function acceptsTaskInput(schema: unknown): boolean {
+  if (schema === true || schema === undefined) return true;
+  if (schema === false || schema === null || typeof schema !== "object" || Array.isArray(schema)) return false;
+  const value = schema as Record<string, unknown>;
+  if ("const" in value || "enum" in value) return false;
+  const type = value.type;
+  if (typeof type === "string" && type !== "string") return false;
+  if (Array.isArray(type) && !type.includes("string")) return false;
+  const branches = (key: string) => (Array.isArray(value[key]) ? (value[key] as unknown[]) : undefined);
+  const anyOf = branches("anyOf");
+  if (anyOf && !anyOf.some(acceptsTaskInput)) return false;
+  const oneOf = branches("oneOf");
+  if (oneOf && !oneOf.some(acceptsTaskInput)) return false;
+  const allOf = branches("allOf");
+  if (allOf && !allOf.every(acceptsTaskInput)) return false;
+  return true;
+}
+
+/** Why a subagent used as a tool can't take its task, or undefined when it can. */
+export function delegateInputIssue(id: string, inputSchema: unknown): string | undefined {
+  if (inputSchema === undefined || acceptsTaskInput(inputSchema)) return undefined;
+  return `'${id}' is used as a tool, so it receives { task } as a string; its inputSchema must accept a string or be left out`;
+}
+
+async function engineOnly(): Promise<never> {
+  throw new ToolError(
+    "delegation.engine-only",
+    "Agents used as tools are run by the Nylorun engine, not by an executor"
+  );
+}
+
+/** A built agent or an agent builder; both expose getBinding() and manifest. */
+export function isAgentItem(value: unknown): value is Pick<BuiltAgent, "id" | "manifest" | "getBinding"> & {
+  build?: () => BuiltAgent;
+} {
+  if (value === null || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.getBinding === "function" &&
+    typeof item.execute !== "function" &&
+    typeof item.run !== "function"
+  );
+}
+
+/** Turn an agent placed in `tools` into the tool that delegates to it. */
+export function delegateTool(item: unknown): ToolDefinition {
+  const candidate = item as { build?: () => BuiltAgent | BuiltWorkflow } & BuiltAgent;
+  const built = typeof candidate.build === "function" ? candidate.build() : candidate;
+  if ((built.manifest as { kind?: unknown }).kind === "workflow") {
+    const workflow = built as unknown as BuiltWorkflow;
+    return withDelegate(workflow.manifest as WorkflowManifest, undefined, undefined, workflow);
+  }
+  return withDelegate(built.manifest as AgentManifest, built as BuiltAgent);
+}
+
+/** Rebuild the delegating tool from a manifest's `agent` body, with its entry's `plugin` label. */
+export function delegateFromManifest(
+  manifest: AgentManifest | WorkflowManifest,
+  tool: { readonly description?: string; readonly inputSchema: JsonObject; readonly plugin?: PluginLabel }
+): ToolDefinition {
+  return withDelegate(manifest, undefined, tool);
+}
+
+function withDelegate(
+  manifest: AgentManifest | WorkflowManifest,
+  agent: BuiltAgent | undefined,
+  declared?: { readonly description?: string; readonly inputSchema: JsonObject; readonly plugin?: PluginLabel },
+  workflow?: BuiltWorkflow
+): ToolDefinition {
+  const description = declared ? declared.description : manifest.description;
+  const definition: ToolDefinition = {
+    name: manifest.id,
+    ...(description === undefined ? {} : { description }),
+    inputSchema: declared ? schemaFromJSON(declared.inputSchema) : taskSchema,
+    execute: engineOnly,
+  };
+  const delegate: Delegate = Object.freeze({
+    manifest,
+    ...(agent ? { agent } : {}),
+    ...(workflow ? { workflow } : {}),
+    ...(declared?.plugin ? { plugin: declared.plugin } : {}),
+  });
+  Object.defineProperty(definition, DELEGATE, { value: delegate, enumerable: false });
+  return Object.freeze(definition);
+}
+
+/** The delegate behind a tool definition, or behind the bound snapshot of one. */
+export function delegateOf(tool: unknown): Delegate | undefined {
+  if (tool === null || typeof tool !== "object") return undefined;
+  const value = tool as Record<symbol, Delegate | undefined> & { source?: unknown };
+  return value[DELEGATE] ?? (value.source === tool ? undefined : delegateOf(value.source));
+}
+
+/**
+ * The ReAct agents a manifest delegates to, which the engine runs inside the parent's run.
+ * Flow agents are in `flowDelegatesOf`.
+ */
+export function delegatesOf(manifest: AgentManifest): readonly { readonly manifest: AgentManifest }[] {
+  const found: { manifest: AgentManifest }[] = [];
+  for (const tool of manifest.tools ?? [])
+    if (tool.agent && !("kind" in tool.agent)) found.push({ manifest: tool.agent });
+  return found;
+}
+
+/** The flow agents a manifest delegates to: each runs in its own linked session. */
+export function flowDelegatesOf(
+  manifest: AgentManifest
+): readonly { readonly manifest: WorkflowManifest }[] {
+  const found: { manifest: WorkflowManifest }[] = [];
+  for (const tool of manifest.tools ?? [])
+    if (tool.agent && "kind" in tool.agent) found.push({ manifest: tool.agent });
+  return found;
+}
+
+/** The flow agent `id` a manifest delegates to, or undefined. */
+export function flowDelegateManifest(
+  manifest: AgentManifest,
+  id: string
+): WorkflowManifest | undefined {
+  return flowDelegatesOf(manifest).find((item) => item.manifest.id === id)?.manifest;
+}
+
+/** The manifest of the delegated agent `id`, or undefined. One level deep by construction. */
+export function delegateManifest(
+  manifest: AgentManifest,
+  id: string
+): AgentManifest | undefined {
+  return delegatesOf(manifest).find((item) => item.manifest.id === id)?.manifest;
+}

@@ -1,0 +1,97 @@
+{
+  "name": "@nylorun/core",
+  "version": "0.54.0-beta",
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Shared agent definitions and wire contracts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nylorun/agents.git",
+    "directory": "core"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": "^22.14.0 || ^24.0.0 || >=26.0.0"
+  },
+  "scripts": {
+    "build": "npm run clean && node ../scripts/check-typescript-version.mjs && tsc -p tsconfig.json && node scripts/harness-api-schema.mjs && node scripts/manifest-schemas.mjs",
+    "clean": "node -e \"import('node:fs').then(({rmSync})=>rmSync('dist',{recursive:true,force:true}))\"",
+    "check": "npm run build && npm test && node scripts/check-package.mjs",
+    "test": "vitest run --passWithNoTests",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vitest": "^5.1.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./define": {
+      "types": "./dist/define.d.ts",
+      "import": "./dist/define.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "import": "./dist/contracts.js"
+    },
+    "./compatibility": {
+      "types": "./dist/compatibility.d.ts",
+      "import": "./dist/compatibility.js"
+    },
+    "./transport": {
+      "types": "./dist/transport.d.ts",
+      "import": "./dist/transport.js"
+    },
+    "./project": {
+      "types": "./dist/project.d.ts",
+      "import": "./dist/project.js"
+    },
+    "./harness-api": {
+      "types": "./dist/harness-api/index.d.ts",
+      "import": "./dist/harness-api/index.js"
+    },
+    "./harness-api/schema.json": "./dist/harness-api/harness-api.schema.json",
+    "./manifest-schemas": {
+      "types": "./dist/manifest-schemas.d.ts",
+      "import": "./dist/manifest-schemas.js"
+    },
+    "./folder": {
+      "types": "./dist/folder/index.d.ts",
+      "import": "./dist/folder/index.js"
+    },
+    "./engine": {
+      "types": "./dist/engine/index.d.ts",
+      "import": "./dist/engine/index.js"
+    },
+    "./schemas/agent-manifest.json": "./dist/schemas/agent-manifest.schema.json",
+    "./schemas/harness-manifest.json": "./dist/schemas/harness-manifest.schema.json",
+    "./schemas/runtime-manifest.json": "./dist/schemas/runtime-manifest.schema.json",
+    "./schemas/agent-folder-agent-md.json": "./dist/schemas/agent-folder/agent-md.schema.json",
+    "./schemas/agent-folder-trigger-md.json": "./dist/schemas/agent-folder/trigger-md.schema.json",
+    "./schemas/agent-folder-runtime.json": "./dist/schemas/agent-folder/runtime.schema.json",
+    "./schemas/agent-folder-tool.json": "./dist/schemas/agent-folder/tool.schema.json",
+    "./schemas/agent-folder-mcp.json": "./dist/schemas/agent-folder/mcp.schema.json",
+    "./schemas/agent-folder-flow.json": "./dist/schemas/agent-folder/flow.schema.json"
+  },
+  "peerDependencies": {
+    "zod": "^4.6.7"
+  },
+  "sideEffects": false
+}

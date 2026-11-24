@@ -1,0 +1,540 @@
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { z } from "zod";
+import { SendMessageRequest, TaskState } from "@a2a-js/sdk";
+import {
+  ClientFactory,
+  ClientFactoryOptions,
+  DefaultAgentCardResolver,
+  JsonRpcTransportFactory,
+  type Client,
+} from "@a2a-js/sdk/client";
+import { Agent, createClient } from "@nylorun/agents";
+import { createA2aHandler, toNodeListener } from "@nylorun/agents/a2a";
+import type { ModelProvider } from "../../src/core/provider.js";
+import { contextSessionId } from "../../src/api/a2a/tasks.js";
+import { startTestTenant } from "../support/tenant.js";
+import { manifestOf, saveManifest } from "../support/agents.js";
+import { withTestSessionStore } from "../support/store.js";
+import { startToolServer, type ToolServer } from "../support/tool-server.js";
+import { setToolPolicy } from "../support/tool-policy.js";
+
+/**
+ * A2A v1 exit gate: partners reach the Tenant's agents through a gateway
+ * (`createA2aHandler` behind a stub app server that authenticates `x-partner-key`), and the
+ * Runtime speaks A2A 1.0 JSON-RPC. The official `@a2a-js/sdk` client drives the main flows;
+ * raw JSON-RPC checks the exact wire answers.
+ */
+
+const APP = "a2a-e2e-app-token-aaaaaaaaaaaaaaaa";
+const PARTNERS: Record<string, string | { subject: string; agents: string[] }> = {
+  "key-acme": "a2a:acme",
+  "key-beta": "a2a:beta",
+  "key-limited": { subject: "a2a:limited", agents: ["support"] },
+};
+
+type Step = { text?: string; call?: { name: string; args: object } };
+const SCRIPTS: Record<string, { steps: Step[]; closing: (results: string) => string }> = {
+  support: { steps: [], closing: () => "Hello from support." },
+  guarded: {
+    steps: [{ call: { name: "save", args: { note: "hi" } } }],
+    closing: () => "Saved.",
+  },
+  slow: {
+    steps: [{ text: "Starting.", call: { name: "wait", args: {} } }],
+    closing: () => "Finished.",
+  },
+  tooled: { steps: [], closing: () => "Done." },
+  roled: { steps: [], closing: () => "Built." },
+};
+
+/** The tools each of `tooled`'s model calls was offered, by name. */
+const offered: string[][] = [];
+
+/** Plays each agent's script, one step per model call within a turn. */
+function scriptedModel(): ModelProvider {
+  const baseline = new Map<string, number>();
+  return async (effect) => {
+    const script = SCRIPTS[effect.agentId]!;
+    if (effect.agentId === "tooled")
+      offered.push(((effect.input as { tools?: { name: string }[] }).tools ?? []).map((tool) => tool.name).sort());
+    const prompt = (effect.input as { prompt?: { kind?: string }[] }).prompt ?? [];
+    const results = prompt.filter((item) => item.kind === "tool-result");
+    if (!baseline.has(effect.turnId)) baseline.set(effect.turnId, results.length);
+    const index = results.length - baseline.get(effect.turnId)!;
+    const step = script.steps[index];
+    if (!step)
+      return {
+        output: [{ type: "text", text: script.closing(JSON.stringify(results.slice(-1))) }],
+      };
+    return {
+      output: [
+        ...(step.text ? [{ type: "text", text: step.text }] : []),
+        ...(step.call
+          ? [
+              {
+                type: "tool-call",
+                id: `call-${effect.turnId}-${index}`,
+                name: step.call.name,
+                args: step.call.args,
+              },
+            ]
+          : []),
+      ],
+    };
+  };
+}
+
+let release: () => void = () => {};
+let held: Promise<void> = Promise.resolve();
+
+/** The Tenant's agents; their HTTP tools are answered by the app's own service. */
+function agents(service: ToolServer) {
+  const support = Agent({ id: "support", name: "Support", description: "Answers questions." }).build();
+  const guarded = Agent({ id: "guarded", name: "Guarded" })
+    .tools(service.tool("save", { input: z.object({ note: z.string() }) }))
+    .build();
+  const slow = Agent({ id: "slow", name: "Slow" })
+    .tools(service.tool("wait", { input: z.object({}) }))
+    .build();
+  const tooled = Agent({ id: "tooled", name: "Tooled" })
+    .tools(service.tool("note", { input: z.object({}) }), service.tool("keep", { input: z.object({}) }))
+    .build();
+  // Declares the model role `builder` (Host feature `model-roles`) once its manifest is saved again.
+  const roled = Agent({ id: "roled", name: "Roled" }).build();
+  return [support, guarded, slow, tooled, roled];
+}
+
+let runtime: Awaited<ReturnType<typeof startTestTenant>>;
+let runtimeClient: ReturnType<typeof createClient>;
+let service: ToolServer;
+let server: Server;
+let base: string;
+
+beforeAll(async () => {
+  runtime = await startTestTenant({
+    applicationKey: APP,
+    vaultKek: null,
+    modelProvider: scriptedModel(),
+  });
+  const client = createClient({
+    url: runtime.url,
+    key: runtime.applicationKey,
+    tenant: runtime.tenantId,
+  });
+  service = await startToolServer({
+    save: () => ({ saved: true }),
+    wait: async () => {
+      await held;
+      return "waited";
+    },
+  });
+  runtimeClient = client;
+  const built = agents(service);
+  // Each agent's manifest, and an Agent of the same id made from it (protocol 16).
+  for (const agent of built) {
+    await client.agentManifests.save({ agent });
+    await client.agents.put(agent.id, { manifest: agent.id });
+  }
+  // The roled agent's next version declares a role; its Agent tracks it.
+  const roled = built.find((agent) => agent.id === "roled")!;
+  await saveManifest(runtime.url, runtime.headers(), manifestOf(roled, { name: "roled", roles: { builder: "anthropic/claude-sonnet-4-5" } }));
+  // The guarded agent's save waits for a person.
+  await setToolPolicy(runtime, [{ effect: "ask", tool: "save", agent: "guarded" }]);
+  const handler = createA2aHandler({
+    basePath: "/a2a",
+    agents: built,
+    client,
+    subject: (request) => PARTNERS[request.headers.get("x-partner-key") ?? ""],
+    card: {
+      provider: { organization: "Example Inc.", url: "https://example.com" },
+      securitySchemes: {
+        partnerKey: { apiKeySecurityScheme: { location: "header", name: "X-Partner-Key" } },
+      },
+      securityRequirements: [{ schemes: { partnerKey: { list: [] } } }],
+    },
+  });
+  const listener = toNodeListener(handler);
+  server = createServer((req, res) => {
+    // The app server's rule: a client never names a subject or scopes itself.
+    for (const name of Object.keys(req.headers))
+      if (name.startsWith("nylorun-")) delete req.headers[name];
+    listener(req, res);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/a2a`;
+}, 60_000);
+
+afterAll(async () => {
+  release();
+  server?.closeAllConnections();
+  await new Promise((resolve) => server?.close(resolve));
+  await service?.close();
+  await runtime?.close();
+});
+
+/** A `fetch` that sends a partner's key, as a partner's A2A client would. */
+function fetchAs(key: string): typeof fetch {
+  return (input, init) => {
+    const headers = new Headers(init?.headers);
+    headers.set("x-partner-key", key);
+    return fetch(input, { ...init, headers });
+  };
+}
+
+async function sdkClient(agent: string, key = "key-acme"): Promise<Client> {
+  const factory = new ClientFactory(
+    ClientFactoryOptions.createFrom(ClientFactoryOptions.default, {
+      transports: [new JsonRpcTransportFactory({ fetchImpl: fetchAs(key) })],
+      cardResolver: new DefaultAgentCardResolver({ fetchImpl: fetchAs(key) }),
+    })
+  );
+  return factory.createFromUrl(`${base}/${agent}/.well-known/agent-card.json`, "");
+}
+
+let messages = 0;
+/** A `SendMessageRequest` from its ProtoJSON wire form. */
+function send(
+  text: string,
+  options: { taskId?: string; contextId?: string; returnImmediately?: boolean; messageId?: string } = {}
+) {
+  return SendMessageRequest.fromJSON({
+    message: {
+      messageId: options.messageId ?? `m-${++messages}`,
+      role: "ROLE_USER",
+      parts: [{ text }],
+      ...(options.taskId ? { taskId: options.taskId } : {}),
+      ...(options.contextId ? { contextId: options.contextId } : {}),
+    },
+    ...(options.returnImmediately ? { configuration: { returnImmediately: true } } : {}),
+  });
+}
+
+/** The task a `SendMessage` returned (v1 never answers with a bare message). */
+function taskOf(result: unknown) {
+  expect(result).toHaveProperty("status");
+  return result as {
+    id: string;
+    contextId: string;
+    status: { state: TaskState; message?: { parts: { content?: { $case: string; value: unknown } }[] } };
+    artifacts: { artifactId: string; parts: { content?: { $case: string; value: unknown } }[] }[];
+    history: { role: number; parts: { content?: { $case: string; value: unknown } }[] }[];
+  };
+}
+
+const textOf = (parts: { content?: { $case: string; value: unknown } }[] | undefined) =>
+  (parts ?? []).map((part) => (part.content?.$case === "text" ? part.content.value : "")).join("");
+
+interface RpcOptions {
+  key?: string | null;
+  version?: string | null;
+  agent?: string;
+  body?: string;
+}
+
+/** One raw JSON-RPC call through the gateway. */
+async function rpc(method: string, params: unknown, options: RpcOptions = {}) {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (options.key !== null) headers["x-partner-key"] = options.key ?? "key-acme";
+  if (options.version !== null) headers["A2A-Version"] = options.version ?? "1.0";
+  const response = await fetch(`${base}/${options.agent ?? "support"}`, {
+    method: "POST",
+    headers,
+    body: options.body ?? JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  return { status: response.status, body: (await response.json()) as any };
+}
+
+const wireMessage = (text: string, extra: Record<string, unknown> = {}) => ({
+  message: { messageId: `raw-${++messages}`, role: "ROLE_USER", parts: [{ text }], ...extra },
+});
+
+describe("Agent Card", () => {
+  it("is served by the gateway with its URL, provider and schemes", async () => {
+    const response = await fetch(`${base}/support/.well-known/agent-card.json`);
+    expect(response.status).toBe(200);
+    const card = await response.json();
+    // An agent manifest v8 has no display name: the card names the agent by its manifest's
+    // name, and its version by the manifest version the Agent runs.
+    expect(card).toMatchObject({
+      name: "support",
+      description: "Answers questions.",
+      version: "support@1",
+      supportedInterfaces: [
+        { url: `${base}/support`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      ],
+      provider: { organization: "Example Inc.", url: "https://example.com" },
+      capabilities: { streaming: false, pushNotifications: false, extendedAgentCard: false },
+      securityRequirements: [{ schemes: { partnerKey: { list: [] } } }],
+      skills: [{ id: "support", name: "support", description: "Answers questions.", tags: [] }],
+    });
+    expect(JSON.stringify(card)).not.toContain("instructions");
+  });
+
+  it("is 404 for an agent the gateway does not serve", async () => {
+    expect((await fetch(`${base}/nope/.well-known/agent-card.json`)).status).toBe(404);
+  });
+});
+
+describe("the official A2A client", () => {
+  it("sends a blocking message and gets the completed task", async () => {
+    const client = await sdkClient("support");
+    const task = taskOf(await client.sendMessage(send("Hi")));
+    expect(task.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(textOf(task.artifacts[0]!.parts)).toBe("Hello from support.");
+    expect(task.history.map((m) => textOf(m.parts))).toEqual(["Hi", "Hello from support."]);
+    const again = taskOf(await client.getTask({ id: task.id, historyLength: 0 } as never));
+    expect(again.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(again.history ?? []).toEqual([]);
+  });
+
+  it("leaves out of a new message's turn the tools its metadata.removeTools names (remove-tools)", async () => {
+    offered.length = 0;
+    const narrowed = await rpc("SendMessage", wireMessage("Go", { metadata: { removeTools: ["note"] } }), { agent: "tooled" });
+    expect(narrowed.body.result.task.status.state).toBe("TASK_STATE_COMPLETED");
+    expect(offered.at(-1)).toContain("keep");
+    expect(offered.at(-1)).not.toContain("note");
+    const whole = await rpc("SendMessage", wireMessage("Go"), { agent: "tooled" });
+    expect(whole.body.result.task.status.state).toBe("TASK_STATE_COMPLETED");
+    expect(offered.at(-1)).toEqual(expect.arrayContaining(["keep", "note"]));
+    const bad = await rpc("SendMessage", wireMessage("Go", { metadata: { removeTools: "note" } }), { agent: "tooled" });
+    expect(bad.body.error.code).toBe(-32602);
+  });
+
+  it("opens a new context's session on the role its metadata.role names, and refuses an undeclared one (model-roles)", async () => {
+    const built = await rpc("SendMessage", wireMessage("Build it", { metadata: { role: "builder" } }), { agent: "roled" });
+    expect(built.body.result.task.status.state, JSON.stringify(built.body)).toBe("TASK_STATE_COMPLETED");
+    const sessionId = contextSessionId("a2a:acme", "roled", built.body.result.task.contextId);
+    // The session was opened with the role. (Its model's provider is not connected here, so it runs
+    // on the Tenant's: `session-model.test.ts` covers the role's model.)
+    const stored = await withTestSessionStore(runtime, (store) => store.tx((t) => t.get("sessions", sessionId)));
+    expect(stored).toMatchObject({ role: "builder", creation: { role: "builder" } });
+    expect((await rpc("SendMessage", wireMessage("Again"), { agent: "roled" })).body.result.task.status.state).toBe("TASK_STATE_COMPLETED");
+
+    const unknown = await rpc("SendMessage", wireMessage("Design it", { metadata: { role: "designer" } }), { agent: "roled" });
+    expect(unknown.body.error.code).toBe(-32602);
+    expect(unknown.body.error.message).toContain("designer");
+    const bad = await rpc("SendMessage", wireMessage("Go", { metadata: { role: "Not a role" } }), { agent: "roled" });
+    expect(bad.body.error.code).toBe(-32602);
+  });
+
+  it("returns immediately and lets the caller poll", async () => {
+    let unblock!: () => void;
+    held = new Promise((resolve) => (unblock = resolve));
+    release = unblock;
+    const client = await sdkClient("slow");
+    const started = taskOf(await client.sendMessage(send("Go", { returnImmediately: true })));
+    expect(started.status.state).toBe(TaskState.TASK_STATE_WORKING);
+    unblock();
+    let state = started.status.state;
+    for (let i = 0; i < 100 && state !== TaskState.TASK_STATE_COMPLETED; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      state = taskOf(await client.getTask({ id: started.id } as never)).status.state;
+    }
+    expect(state).toBe(TaskState.TASK_STATE_COMPLETED);
+  });
+
+  it("cancels a working task, idempotently", async () => {
+    held = new Promise(() => {});
+    const client = await sdkClient("slow");
+    const started = taskOf(await client.sendMessage(send("Go", { returnImmediately: true })));
+    const cancelled = taskOf(await client.cancelTask({ id: started.id } as never));
+    expect(cancelled.status.state).toBe(TaskState.TASK_STATE_CANCELED);
+    const again = taskOf(await client.cancelTask({ id: started.id } as never));
+    expect(again.status.state).toBe(TaskState.TASK_STATE_CANCELED);
+  });
+});
+
+describe("contexts and retries", () => {
+  it("runs a new task in the same context on the same conversation", async () => {
+    const first = await rpc("SendMessage", wireMessage("One"));
+    const contextId = first.body.result.task.contextId;
+    const second = await rpc("SendMessage", wireMessage("Two", { contextId }));
+    const task = second.body.result.task;
+    expect(task.contextId).toBe(contextId);
+    expect(task.id).not.toBe(first.body.result.task.id);
+    expect(task.status.state).toBe("TASK_STATE_COMPLETED");
+  });
+
+  it("returns the same task for a retried message", async () => {
+    const params = wireMessage("Once");
+    const first = await rpc("SendMessage", params);
+    const retry = await rpc("SendMessage", params);
+    expect(retry.body.result.task.id).toBe(first.body.result.task.id);
+    const reused = await rpc("SendMessage", {
+      message: { ...params.message, parts: [{ text: "Different" }] },
+    });
+    expect(reused.body.error.code).toBe(-32602);
+  });
+
+  it("keeps each partner to its own tasks", async () => {
+    const mine = await rpc("SendMessage", wireMessage("Mine"));
+    const taskId = mine.body.result.task.id;
+    const theirs = await rpc("GetTask", { id: taskId }, { key: "key-beta" });
+    expect(theirs.body.error.code).toBe(-32001);
+    const cancel = await rpc("CancelTask", { id: taskId }, { key: "key-beta" });
+    expect(cancel.body.error.code).toBe(-32001);
+  });
+});
+
+describe("files sent inline", () => {
+  /** A 1×1 PNG. */
+  const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  const artifactsOf = (contextId: string) =>
+    runtimeClient.artifacts.list({ sessionId: contextSessionId("a2a:acme", "support", contextId) });
+
+  it("stores a raw part as an artifact of the context's session, once for a retried message", async () => {
+    const params = {
+      message: {
+        messageId: `file-${++messages}`,
+        role: "ROLE_USER",
+        parts: [{ text: "What is this?" }, { raw: PNG, mediaType: "image/png", filename: "room.png" }],
+      },
+    };
+    const first = await rpc("SendMessage", params);
+    const task = first.body.result.task;
+    expect(task.status.state).toBe("TASK_STATE_COMPLETED");
+    const stored = await artifactsOf(task.contextId);
+    expect(stored).toMatchObject([{ name: "room.png", contentType: "image/png" }]);
+    // The task's history names the file by its artifact, never its bytes.
+    expect(task.history[0].parts).toEqual([
+      { text: "What is this?" },
+      { data: { type: "file", artifactId: stored[0]!.artifactId, version: 1 } },
+    ]);
+    const retry = await rpc("SendMessage", params);
+    expect(retry.body.result.task.id).toBe(task.id);
+    expect(await artifactsOf(task.contextId)).toHaveLength(1);
+  });
+
+  it("refuses bad base64, files with data, and a reply with files", async () => {
+    const bad = await rpc("SendMessage", {
+      message: { messageId: `file-${++messages}`, role: "ROLE_USER", parts: [{ raw: "%%%", mediaType: "image/png" }] },
+    });
+    expect(bad.body.error).toMatchObject({ code: -32602, message: expect.stringMatching(/base64/) });
+    const mixed = await rpc("SendMessage", {
+      message: { messageId: `file-${++messages}`, role: "ROLE_USER", parts: [{ data: 1 }, { raw: PNG }] },
+    });
+    expect(mixed.body.error.code).toBe(-32005);
+    const task = (await rpc("SendMessage", wireMessage("Hi"))).body.result.task;
+    const reply = await rpc("SendMessage", {
+      message: { messageId: `file-${++messages}`, role: "ROLE_USER", taskId: task.id, parts: [{ raw: PNG }] },
+    });
+    expect(reply.body.error.code).toBe(-32005);
+  });
+
+  it("deletes the files of a refused message", async () => {
+    const first = await rpc("SendMessage", wireMessage("Text first"));
+    const { contextId } = first.body.result.task;
+    // The same message id with a file is another message: refused, and its file deleted.
+    const reused = await rpc("SendMessage", {
+      message: {
+        messageId: `raw-${messages}`,
+        role: "ROLE_USER",
+        contextId,
+        parts: [{ text: "Text first" }, { raw: PNG, mediaType: "image/png" }],
+      },
+    });
+    expect(reused.body.error.code).toBe(-32602);
+    expect(await artifactsOf(contextId)).toEqual([]);
+  });
+});
+
+describe("explicit answers for what v1 does not do", () => {
+  it.each([
+    ["SendStreamingMessage", { message: {} }, -32004],
+    ["SubscribeToTask", { id: "x" }, -32004],
+    ["CreateTaskPushNotificationConfig", {}, -32003],
+    ["GetExtendedAgentCard", {}, -32004],
+    ["tasks/send", {}, -32601],
+  ])("%s", async (method, params, code) => {
+    const { status, body } = await rpc(method, params);
+    expect(status).toBe(200);
+    expect(body.error.code).toBe(code);
+    expect(body.error.data[0]["@type"]).toBe("type.googleapis.com/google.rpc.ErrorInfo");
+  });
+
+  it("refuses a missing version as 0.3", async () => {
+    const { body } = await rpc("SendMessage", wireMessage("Hi"), { version: null });
+    expect(body.error.code).toBe(-32009);
+  });
+
+  it("accepts the version as a query parameter", async () => {
+    const response = await fetch(`${base}/support?A2A-Version=1.0`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-partner-key": "key-acme" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "SendMessage", params: wireMessage("Hi") }),
+    });
+    const body = await response.json();
+    expect(body.id).toBe(9);
+    expect(body.result.task.status.state).toBe("TASK_STATE_COMPLETED");
+  });
+
+  it("answers invalid JSON with a parse error", async () => {
+    const { body } = await rpc("", undefined, { body: "{" });
+    expect(body).toMatchObject({ jsonrpc: "2.0", id: null, error: { code: -32700 } });
+  });
+
+  it("refuses unreachable file URLs and mismatched contexts", async () => {
+    // A private address the Runtime is not allowed to reach (a2a.push.allowHosts).
+    const file = await rpc("SendMessage", {
+      message: { messageId: "f-1", role: "ROLE_USER", parts: [{ url: "http://127.0.0.1:9/y.pdf" }] },
+    });
+    expect(file.body.error.code).toBe(-32602);
+    const task = (await rpc("SendMessage", wireMessage("Hi"))).body.result.task;
+    const mismatch = await rpc(
+      "SendMessage",
+      wireMessage("Hi", { taskId: task.id, contextId: "other" })
+    );
+    expect(mismatch.body.error.code).toBe(-32602);
+    const terminal = await rpc("SendMessage", wireMessage("More", { taskId: task.id }));
+    expect(terminal.body.error.code).toBe(-32004);
+    const done = await rpc("CancelTask", { id: task.id });
+    expect(done.body.error.code).toBe(-32002);
+  });
+
+  it("pauses an approval as AUTH_REQUIRED, refuses a text reply, and cancels", async () => {
+    const asked = (await rpc("SendMessage", wireMessage("Save it"), { agent: "guarded" })).body
+      .result.task;
+    expect(asked.status.state).toBe("TASK_STATE_AUTH_REQUIRED");
+    expect(asked.status.message.parts).toEqual([{ text: "Approve save?" }]);
+    const reply = await rpc("SendMessage", wireMessage("yes", { taskId: asked.id }), {
+      agent: "guarded",
+    });
+    expect(reply.body.error.code).toBe(-32004);
+    expect(reply.body.error.message).toContain("approval");
+    const cancelled = await rpc("CancelTask", { id: asked.id }, { agent: "guarded" });
+    expect(cancelled.body.result.status.state).toBe("TASK_STATE_CANCELED");
+  });
+});
+
+describe("the gateway and the Runtime route", () => {
+  it("answers 401 without a partner, and 404 for an agent the partner may not use", async () => {
+    expect((await rpc("GetTask", { id: "x" }, { key: null })).status).toBe(401);
+    expect((await rpc("GetTask", { id: "x" }, { key: "key-limited", agent: "guarded" })).status).toBe(
+      404
+    );
+    expect((await rpc("GetTask", { id: "x" }, { key: "key-limited" })).body.error.code).toBe(-32001);
+  });
+
+  it("needs a subject with sessions:own at the Runtime", async () => {
+    const call = (headers: Record<string, string>) =>
+      fetch(`${runtime.url}/v1/a2a/agents/support`, {
+        method: "POST",
+        headers: { ...runtime.headers(), "content-type": "application/json", "A2A-Version": "1.0", ...headers },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "GetTask", params: { id: "x" } }),
+      });
+    const noSubject = await call({});
+    expect(noSubject.status).toBe(400);
+    expect((await noSubject.json()).code).toBe("subject_required");
+    const readOnly = await call({ "Nylorun-Subject": "a2a:acme", "Nylorun-Scopes": "agents:read" });
+    expect(readOnly.status).toBe(403);
+    const card = await fetch(`${runtime.url}/v1/a2a/agents/support/card`, {
+      headers: runtime.headers(),
+    });
+    expect(card.status).toBe(200);
+    expect((await card.json()).supportedInterfaces).toEqual([
+      { url: `${runtime.url}/v1/a2a/agents/support`, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+    ]);
+  });
+});

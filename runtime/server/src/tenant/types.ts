@@ -1,0 +1,239 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type {
+  HarnessStatus,
+  HostTenant,
+  TenantEnvelope,
+} from "@nylorun/core/contracts";
+import type { HarnessChannel } from "@nylorun/core/harness-api";
+import type { HarnessPeer } from "../harness-api/server.js";
+import type { HostAuthority } from "../sandbox/join.js";
+import type { SessionStore } from "../store/types.js";
+import type { SandboxBackend } from "../sandbox/types.js";
+import type { TenantCause } from "./cause.js";
+import type { OutboundPolicy } from "./outbound.js";
+import type { TenantWorker } from "./worker.js";
+
+export type TenantMode = "shared" | "ephemeral" | "test";
+
+/**
+ * The Tenant directory on the Host root (`<Host root>/tenant/`). The Tenant's data lives in
+ * its database; this holds what stays on the Host: the vault key, logs, and the private home
+ * and sandbox directories.
+ */
+export interface TenantPaths {
+  // all absolute; derived by tenantPaths()
+  root: string;
+  kek: string;
+  home: string;
+  sandboxes: string;
+  /** The `fs` BlobStore's directory, used when the Host has no Object store. */
+  blobs: string;
+  logs: string;
+  log: string;
+}
+
+export type TenantModelConfig =
+  | { kind: "vault" } // shared default: Tenant vault selection, served by the Model Gate
+  | { kind: "fixture" }
+  | { kind: "scripted"; output?: string }; // ephemeral/test only
+
+export interface TenantConfig {
+  // internal read model, never client-supplied
+  tenantId: string;
+  mode: TenantMode;
+  paths: TenantPaths;
+  sandbox: {
+    backend: "auto" | "virtual";
+    backends?: readonly SandboxBackend[];
+  };
+  model: TenantModelConfig;
+  /**
+   * Segment rollover: a turn ends its segment at a step boundary after this
+   * many steps or milliseconds and continues in a new one, so no advance reaches its
+   * deadline. Default the Host tuning's `harnessApi.rolloverSteps` and `rolloverMs` (50 steps,
+   * 20 minutes).
+   */
+  rollover?: { steps?: number; ms?: number };
+  /**
+   * How the Runtime may call MCP servers and HTTP tools (Host settings). Default: http and
+   * private addresses allowed.
+   */
+  delivery?: OutboundPolicy;
+  /** Bounds the default Tenant sweep interval (`sweepIntervalMs`). Default: no bound. */
+  leaseMs?: number;
+  /**
+   * Ownership lease of an advance; renewed every third while it runs. Default the Host
+   * tuning's `tenant.ownerLeaseMs` (30 s).
+   */
+  ownerLeaseMs?: number;
+  /**
+   * Delay between Tenant sweep passes when the Tenant runs its own in-process execution.
+   * Default `min(leaseMs, sweep.intervalMs)` (Host tuning, 5 s). A Host-level execution sets its
+   * own.
+   */
+  sweepIntervalMs?: number;
+  /**
+   * The trusted issuers whose JWTs the Runtime API accepts (Host feature `trusted-issuers`), from
+   * the identity file (`NYLORUN_IDENTITY_FILE`). Absent: none.
+   */
+  issuers?: import("./issuers.js").TrustedIssuers;
+  /**
+   * The URL clients reach the Runtime API at (`NYLORUN_PUBLIC_URL`, no trailing slash): the base
+   * of webhook URLs and the OAuth resource. Absent: the origin each request reached.
+   */
+  publicUrl?: string;
+  /** The A2A server's settings (Runtime config `a2a`, Host feature `a2a-profile-v2`). */
+  a2a?: A2aConfig;
+  logger: Logger;
+}
+
+/**
+ * Runtime config `a2a` (`NYLORUN_A2A_*`): how the A2A server pushes task updates (profile v2).
+ * Without `push.secret` the Runtime serves no push notifications: the card says
+ * `pushNotifications: false` and the push methods answer `PushNotificationNotSupportedError`.
+ */
+export interface A2aConfig {
+  push?: {
+    /**
+     * `a2a.push.secret` (`NYLORUN_A2A_PUSH_SECRET`): the installation's Standard Webhooks secret,
+     * `whsec_<base64>`, that signs every push (`webhook-signature`). Receivers verify with it.
+     */
+    secret?: string;
+    /**
+     * `a2a.push.allowHosts` (`NYLORUN_A2A_PUSH_ALLOW_HOSTS`, comma-separated): the `host:port`s
+     * (`host:*` for any port) a push, or a file `url` part the Runtime fetches, may reach although they are private,
+     * loopback or link-local (a receiver on the Docker bridge). Every other URL of those is
+     * refused, whatever `delivery.privateAddresses` says.
+     */
+    allowHosts?: readonly string[];
+  };
+}
+
+export interface Logger {
+  info(message: string, fields?: Record<string, unknown>): void;
+  warn(message: string, fields?: Record<string, unknown>): void;
+  error(message: string, fields?: Record<string, unknown>): void;
+}
+
+export interface TenantSummary {
+  // redacted; counts only
+  ready: boolean;
+  runningSessions: number;
+  uncertainEffects: number;
+  /** The Tenant's harnesses. */
+  harness?: HarnessStatus;
+}
+
+/**
+ * The Node request and response behind a `Request`, for what still writes to Node directly
+ * (event streams). The shape of `@hono/node-server`'s `HttpBindings`.
+ */
+export interface NodeBindings {
+  readonly incoming: IncomingMessage;
+  readonly outgoing: ServerResponse;
+}
+
+/** An open Tenant Runtime. Created only by the Tenant module. */
+export interface TenantHandle {
+  readonly envelope: TenantEnvelope;
+  /** The handlers Durable Session Execution calls for this Tenant (`worker.ts`). */
+  readonly worker?: TenantWorker;
+  /**
+   * A Runtime or Management API request whose headers the Host has validated: authenticates, authorizes,
+   * dispatches. A response already written to `node.outgoing` is `RESPONSE_ALREADY_SENT`.
+   */
+  fetch(request: Request, node: NodeBindings): Promise<Response>;
+  summary(): Promise<TenantSummary>;
+  /** Stop scheduling; wait for or cancel active turns. */
+  drain(activeWork: "drain" | "cancel", timeoutMs?: number): Promise<void>;
+  close(): Promise<void>; // ends every stream this Tenant holds
+  /** Serves a harness's Harness API channel until it closes. Returns a function that detaches it. */
+  attachHarness?(channel: HarnessChannel, peer: HarnessPeer): () => void;
+  /** The Tenant's side of a sandbox pod's join; absent without sandbox pods. */
+  hostAuthority?(): HostAuthority | undefined;
+  /** The custom harness a per-harness token is for, or undefined. */
+  harnessOfToken?(token: string): Promise<string | undefined>;
+  /** The Tenant's harnesses, for `/ready`. */
+  harnessStatus?(): HarnessStatus;
+}
+
+/**
+ * The Host's Tenant for a request: open, or unavailable. `cause` says why when opening it
+ * failed; without one the Host is starting or closing. Either way the request gets the opaque
+ * 404.
+ */
+export type TenantResolution =
+  | { kind: "open"; handle: TenantHandle }
+  | { kind: "unavailable"; cause?: TenantCause };
+
+/**
+ * The deep module: the one Tenant a Host serves. HTTP, the Worker and
+ * tests use only this.
+ *
+ * `start` opens the Tenant; the Host has it open from readiness to shutdown. There is no
+ * Tenant list, no opening on demand of other Tenants and no quarantine cache: when opening
+ * fails for a reason in the Tenant (a `TenantCause`), the Host fails readiness and reports
+ * the cause until it is restarted. A failure outside the Tenant (`TenantUnavailableError`:
+ * Postgres unreachable) is retried in the background and by the next request.
+ */
+export interface TenantModule {
+  /** Opens the Tenant. Never rejects: a failure is recorded and reported by `tenant()`. */
+  start(): Promise<void>;
+  /** The Tenant is open (`/ready`). */
+  readonly ready: boolean;
+  /**
+   * The open Tenant, waiting for an open in progress. Rejects with `TenantUnavailableError`
+   * when it cannot be reached for a reason outside it.
+   */
+  resolve(): Promise<TenantResolution>;
+  /**
+   * The Tenant's Worker handlers when `id` is the open Tenant's, for `TenantWorkers.resolve`.
+   * Undefined otherwise, or once the module is closed.
+   */
+  worker(id: string): Promise<TenantWorker | undefined>;
+  /** The Tenant, open or why not. */
+  tenant(): HostTenant;
+  /** The open Tenant's harnesses (`/ready`); undefined while it is not open. */
+  harnessStatus(): HarnessStatus | undefined;
+  close(): Promise<void>;
+}
+
+/**
+ * Opens the Host's Tenant (`store-pg.ts`): migrates its database, creates the Tenant when it
+ * has none, and opens the Tenant Runtime. Rejects with a `TenantOpenError` (`cause.ts`) when
+ * the Tenant itself cannot be opened, and with `TenantUnavailableError` when something
+ * outside it failed.
+ */
+export type TenantOpener = () => Promise<TenantHandle>;
+
+/**
+ * Thrown when the Tenant cannot be reached for a reason outside it (the database or Durable
+ * Session Execution is unavailable). Not a cause: the next use tries again. The Host answers
+ * 503.
+ */
+export class TenantUnavailableError extends Error {
+  readonly status = 503;
+  constructor(options?: { cause?: unknown }) {
+    super("Tenant is temporarily unavailable", options);
+    this.name = "TenantUnavailableError";
+  }
+}
+
+/** What the Tenant opener hands the Tenant Runtime it opens. */
+export interface OpenedTenant {
+  /** The isolated read pool, owned and closed with the Tenant. */
+  reads?: import("../reads/types.js").ReadStore;
+  /**
+   * The Tenant's opened Session Store. The Tenant Runtime owns it from here on and closes it
+   * on close or on a failed open.
+   */
+  store: SessionStore;
+  /** The Tenant envelope as its store reports it. */
+  envelope: TenantEnvelope;
+}
+
+/** Opens the Tenant Runtime on an opened store (injected, so tests can fake it). */
+export type OpenTenantRuntime = (
+  config: TenantConfig,
+  opened: OpenedTenant,
+) => Promise<TenantHandle>;

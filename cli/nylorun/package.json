@@ -1,0 +1,52 @@
+{
+  "name": "nylorun",
+  "version": "0.35.0-beta",
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Set up and run local Nylorun Tenants (Runtime and Studio) with Docker Compose, and act on a Tenant through its Runtime and Management APIs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nylorun/agents.git",
+    "directory": "cli/nylorun"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "npm run clean && node ../../scripts/check-typescript-version.mjs && tsc -p tsconfig.json",
+    "clean": "node -e \"import('node:fs').then(({rmSync})=>rmSync('dist',{recursive:true,force:true}))\"",
+    "check": "npm run build && npm test && node scripts/check-package.mjs",
+    "test": "vitest run --passWithNoTests",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@nylorun/admin": "0.22.3-beta",
+    "@nylorun/agents": "0.43.0-beta",
+    "@nylorun/core": "0.54.0-beta"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+    "@nylorun/agents": "file:../../sdks/agents",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "@types/node": "^26.6.6",
+    "vitest": "^5.1.0"
+  },
+  "bin": {
+    "nylorun": "dist/cli.js",
+    "nylo": "dist/nylo.js"
+  },
+  "nylorun": {
+    "runtime": "0.58.0-beta",
+    "studio": "0.39.3-beta"
+  }
+}

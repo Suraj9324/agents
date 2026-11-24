@@ -1,0 +1,401 @@
+{
+  "POST /v1/sessions/s1/commands": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agent-manifests": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/agent-manifests/bot": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agent-manifests/bot": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agent-manifests/bot/versions": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agent-manifests/bot/versions/1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agent-manifests/missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "DELETE /v1/agent-manifests/missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/files/sha256:0000000000000000000000000000000000000000000000000000000000000000": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "HEAD /v1/files/sha256:0000000000000000000000000000000000000000000000000000000000000000": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/sessions": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/sessions/s2": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/sessions/s1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/sessions/missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/sessions/s1/items": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/sessions/s1/events": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/sessions/s1/sandbox/bash": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/sessions/s1/model": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/sessions/s1/model": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "DELETE /v1/sessions/missing/model": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents?label=project=acme": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents?limit=1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/agents/bot": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/agents/team%2Fagent-missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/team%2Fagent-missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/team%2Fagent-missing/events": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/agents/team%2Fagent-missing/stop": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/agents/team%2Fagent-missing/reset": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/agents/team%2Fagent-missing/snapshot": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/agents/team%2Fagent-missing/restore": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/agents/team%2Fagent-missing/fork": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/team%2Fagent-missing/versions": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "DELETE /v1/agents/team%2Fagent-missing/versions/1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "DELETE /v1/agents/team%2Fagent-missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/agent-1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/agent-1/events": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/agents/agent-1/stop": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/agents/agent-1/fork": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/agent-1/versions": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/agent-1/secrets": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/agents/agent-1/secrets/missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/agents/agent-1/secrets/token": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "DELETE /v1/agents/agent-1/secrets/missing": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/artifacts?name=&sessionId=s1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/artifacts/af_00000000000000000000000000/versions": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts?sessionId=s1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts/af_00000000000000000000000000": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts/af_00000000000000000000000000/versions/latest/content": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts/af_00000000000000000000000000/versions/latest/tree": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts/af_00000000000000000000000000/versions/1/files/app%2Findex.html": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts/af_00000000000000000000000000/versions/2/diff?from=1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifacts/af_00000000000000000000000000/versions/latest/zip": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/artifacts/af_00000000000000000000000000/links": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "DELETE /v1/artifacts/af_00000000000000000000000000": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/artifact-links/not-a-token": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/artifacts": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/artifacts": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/skills": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/skills": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/limits": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/limits": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/tenant/reset": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/config/seed": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/models": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/sandbox": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/sandbox": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/providers": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/usage?scope=manifest&id=bot&period=month": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/budgets": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/budgets": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/tool-policy": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/tool-policy": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/model": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/model": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PUT /v1/tenant/model/selection": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/tenant/mcp/preview": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/tenant/credential-coverage": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/access/jwks": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/me": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/audit": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/tenant/audit/studio-sign-in": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/tenant/signing-keys": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/tenant/signing-keys/rotate": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/tenant/signing-keys/kid-missing/revoke": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/ag-ui/agents/bot": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/ag-ui/agents/bot/threads/t1/messages": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/ag-ui/agents/bot/threads/t1/events": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/ag-ui/agents/bot/threads/t1/cancel": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/a2a/agents/bot": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/a2a/agents/bot/card": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/sessions/s1/unknown": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "POST /v1/vaults/v1/unknown/deeper": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /v1/ag-ui/anything": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "PATCH /v1/sessions/s1": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "GET /health": {
+    "status": 403
+  },
+  "GET /v1/admin/tenants": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  },
+  "no Origin: OPTIONS /v1/agents": {
+    "status": 204,
+    "allow": "GET, POST, PUT, DELETE, OPTIONS"
+  }
+}

@@ -1,0 +1,367 @@
+# @nylorun/runtime
+
+The independent OSS **Runtime Host** consumes `@nylorun/harness/run` and
+`@nylorun/core/contracts`. Cloud installs published `@nylorun/harness` from npm
+and does not import this package. Every Tenant serves two APIs on one URL: the
+**Runtime API** for developers (agents, sessions with AG-UI and
+A2A, Environments and their secrets, artifacts), whose client is `@nylorun/agents`, and the
+**Management API** for operators (`/v1/tenant/*`), whose client is `@nylorun/admin`.
+
+Requires Node 24+. Build from the repository root:
+
+```sh
+npm install
+npm run build --workspace @nylorun/core
+npm run build --workspace @nylorun/harness
+npm run build --workspace @nylorun/runtime
+```
+
+## Running the Runtime
+
+The Runtime runs as the `ghcr.io/nylorun/runtime` image, next to Postgres,
+Restate and S2: `nylorun start` runs them, as a local Tenant, on a developer machine. The
+package is a library with no bin; its Host entry is `@nylorun/runtime/server`
+(`dist/host/main.js`), which requires `NYLORUN_DATABASE_URL`. For tests and
+ephemeral embeds, use `startEphemeralRuntime()` from `@nylorun/runtime/core`.
+See [migration notes](../../docs/upgrading/migration.md).
+
+A Runtime serves one **Tenant**: an installation is one Runtime with its own
+Postgres database, Restate and S2 basin, and two Tenants are two installations. No
+Tenant state lives only in the Runtime process. The Tenant's data is its Postgres
+database, in the fixed schemas `nylorun` (its state: the Session Store) and
+`nylorun_streams` (the record of its session events). Drizzle defines the tables
+(`src/store/postgres/schema.ts`) and generates the migrations, which ship in the package
+(`dist/store/postgres/drizzle/`). At startup the Host applies the missing ones in one
+transaction under an advisory lock, records them in `nylorun.__drizzle_migrations`, and
+refuses a database holding a migration it does not ship (`schema-too-new`); then, on
+first start, it creates the Tenant there: its id (`NYLORUN_TENANT_ID`, default a
+new one), its name (`NYLORUN_TENANT_NAME`, default `default`) and its Studio principal,
+whose key the admin key derives (the only derived key). Management keys come from
+`nylorun-operate` or `NYLORUN_MANAGEMENT_KEY_FILE` (below), and a management key adds,
+rotates and deletes the Tenant's application keys (`PUT /v1/tenant/keys/{keyId}`); a rotated
+or deleted key stops authenticating at once. A database written by a Runtime that kept several Tenants in one
+database (`tenant_<id>` schemas), or by a pre-release build of one Tenant per database
+(`schema_version` tables), is refused: this release starts fresh on a new database. Restate runs one advance of a session at a time, delivers its wakes and holds
+its timers and the Tenant's sweep (Durable Session Execution), and journals no effect:
+checkpoints, effects, events and the outbox are the Session Store's, and a wake or a pod
+Environment's reconcile is written to the outbox in the transaction that causes it, so a commit
+never loses it; every session's events are relayed from the record to
+its own S2 stream, which history and SSE read (Durable Streams). One image runs every **service**,
+and `--service` picks what a process runs: `core` serves the Runtime API, the
+Management API and SSE and runs the stream relay, `loop` runs advances (the Worker), and
+`gates` is the Model Gate, the only process that reads a model credential and
+calls providers. `core` and `loop` may share a process; `gates` never joins
+them. A local Tenant packs `core,loop` into the `runtime` container and
+`gates` into the `gateway` container (the combined packing). `--role
+api|worker|all` is the deprecated name of `--service core`, `loop` and
+`core,loop`.
+
+`harness` runs alone: agent turns and workspaces, apart from core. With `NYLORUN_HARNESS=remote`, core runs no turn itself and opens the
+Harness API listener (`NYLORUN_HARNESS_LISTEN_HOST`, `NYLORUN_HARNESS_LISTEN_PORT`,
+default 4200, `NYLORUN_HARNESS_ALLOWED_HOSTS`), which accepts only
+`NYLORUN_HARNESS_TOKEN`; `in-process` (the default outside Compose) runs turns in
+core's process. A `harness` process needs `NYLORUN_HARNESS_URL`,
+`NYLORUN_HARNESS_TOKEN`, `NYLORUN_GATES_URL` and `NYLORUN_HARNESS_ROOT` (default
+`/harness`), answers `/health` on `127.0.0.1:4300`, and refuses to start with a
+database, Restate, keys or gates credential in its environment. A local Tenant
+runs it in the `harness` container, on a network with only the runtime and the
+gateway ([Docker Compose reference](../../docs/self-hosting/docker-compose.md#the-harness-agent-turns-mcp-servers-and-workspaces)).
+
+The container is configured by its environment, which a local Tenant's Compose file
+sets: `NYLORUN_DATABASE_URL` (required), `NYLORUN_RESTATE_INGRESS_URL`,
+`NYLORUN_RESTATE_ADMIN_URL`, `NYLORUN_WORKER_URL`, `NYLORUN_WORKER_VERSION` and
+`NYLORUN_RESTATE_IDENTITY_KEY` (Restate), `NYLORUN_S2_ENDPOINT` and
+`NYLORUN_S2_TOKEN`, and in container mode `NYLORUN_LISTEN_HOST`,
+`NYLORUN_LISTEN_PORT`, `NYLORUN_ALLOWED_HOSTS` and `NYLORUN_PUBLIC_URL`.
+A Worker registers its Restate deployment at a versioned URL,
+`<NYLORUN_WORKER_URL>/nylorun/<version>`, where the version is `NYLORUN_WORKER_VERSION`
+(letters, digits, `.`, `_`, `-`) or, by default, the Runtime's own. In a container it never
+replaces a deployment already registered there (`force: false`): during a rolling upgrade
+the new version's Workers register next to the old ones, Restate sends new invocations to
+the new deployment and lets the old one finish what it started, and every Worker of one
+version shares its deployment through one load-balanced `NYLORUN_WORKER_URL`. A build that
+changes the Worker's code without changing the Runtime's version (an image built from a
+branch) sets its own `NYLORUN_WORKER_VERSION`: without force Restate keeps the deployment it
+already has at a URL and does not discover the Worker again, so the changed code would run
+under the old deployment's registration, and a Worker whose services that deployment lacks
+refuses to start. Outside a container (a development
+Host) the registration replaces the deployment at that URL.
+`NYLORUN_MANAGEMENT_KEY_FILE` names the bootstrap secret (below).
+`NYLORUN_IDENTITY_FILE` names the identity
+file, a YAML list of the trusted issuers whose JWTs the Runtime API accepts
+(Host feature `trusted-issuers`), read once at boot; a malformed file stops the
+boot ([Docker Compose reference](../../docs/self-hosting/docker-compose.md#trusted-issuers)). A process that runs `loop` sends its model
+calls to the gate at `NYLORUN_GATES_URL`; in a container it refuses to start
+without it and `NYLORUN_GATES_TOKEN`. That token is core's credential: the gate
+accepts only it for vault writes and token signing. Model, HTTP tool and
+remote MCP calls carry a run token instead, which the loop mints for each
+session it advances, and the gate takes the call's session, turn and agent from
+it; a token whose turn was cancelled or whose session another process took over
+is refused with `409 run_stale`. A `gates` process needs only
+`NYLORUN_DATABASE_URL`, `NYLORUN_GATES_TOKEN`, its listener
+(`NYLORUN_GATES_LISTEN_HOST`, `NYLORUN_GATES_LISTEN_PORT`, default 4100, and
+`NYLORUN_GATES_ALLOWED_HOSTS`) and the Host's `tenant/` directory, which it
+never writes; it serves the database's one Tenant. A session's MCP servers and
+HTTP tools get their credentials from the vault of its Environment only: a `bearer` token
+or a `headers` map per URL, sent to an MCP gateway instead when it has `via`,
+with the session owner in its identity header
+([Docker Compose reference](../../docs/self-hosting/docker-compose.md#mcp-servers-and-http-tools)); the credential resolver is gone
+(protocol 10), and a process that still sets a `NYLORUN_RESOLVER_*` variable logs
+`resolver_removed` and ignores it. With `egress`
+(`--service gates,keys,egress`, for pod sandboxes) the same process runs
+egress-gate on `NYLORUN_EGRESS_LISTEN_HOST`:`NYLORUN_EGRESS_LISTEN_PORT`
+(default `0.0.0.0:4200`): a CONNECT proxy that admits a pod's egress token and
+tunnels only to the hosts its Environment allows (`network.allowedHosts`), on 443 or 80, never to a
+private address. `NYLORUN_PACKING` (`combined` or `split`) is logged at startup.
+
+The Host has one listener, which serves both APIs. Host work runs on the machine
+instead, with `nylorun-operate`, the image's operator command, inside the runtime
+container (`docker compose exec runtime nylorun-operate …`, or
+`kubectl exec … -- nylorun-operate …`). It reads the Tenant's database from
+`NYLORUN_DATABASE_URL`, does one job and exits: being able to run it is the
+authorization.
+
+```sh
+nylorun-operate status [--json]      # version, protocol, the Tenant's id, name, state and cause; exit 2 when not open
+nylorun-operate keys list [--json]   # every key: id, role, when issued
+nylorun-operate keys put <id> [--role application|management] [--json]   # prints the key once
+nylorun-operate keys rm <id> [--json]
+```
+
+`status` needs no key, so it reports why a Tenant cannot open. Where no one can run
+`nylorun-operate`, `NYLORUN_MANAGEMENT_KEY_FILE` names a file holding a management key
+(64 hex characters), the **bootstrap secret**: the Host registers it as the key
+`bootstrap` at every start, and replaces it when the file changes. Stop the Host with
+SIGTERM.
+
+The Host root is `NYLORUN_HOME` or `~/.nylorun` (for a local Tenant,
+`~/.nylorun/tenants/<name>/`, bind-mounted at `/nylorun` in its containers). What stays on the Host is under `tenant/`.
+
+## Layout
+
+```text
+<host root>/
+  host.json                 # format 1: hostId, host, port, runtimeVersion, …
+  host-credentials.json     # adminKey (0600): the root secret Studio's key derives from
+  identity.yaml             # optional: trusted issuers (NYLORUN_IDENTITY_FILE)
+  docker/                   # compose.yaml, .env (0600), Restate identity key
+  tenant/                   # logs, home, sandboxes
+```
+
+## HTTP surface
+
+| Route | Auth | Notes |
+| --- | --- | --- |
+| `GET /health` | none | `service: "nylorun-runtime"`, `hostId`, protocol `{min,max,features}`, pid |
+| `GET /ready` | none | Listener up, the Tenant open, and Postgres and Restate answer (`checks`). S2 is not checked: its health is in `GET /v1/tenant` (`streams.reachable`); `harness: { mode, connected }` while the Tenant is open |
+| `GET /openapi/runtime.json` | none | The Runtime API's OpenAPI 3.2 document (below); alias `GET /openapi.json`. Refuses an `Origin` |
+| `GET /openapi/management.json` | none | The Management API's OpenAPI 3.2 document. Refuses an `Origin` |
+| `/v1/*` Runtime API routes (all but `/v1/tenant/*`) | application key or trusted issuer's token | Require `Nylorun-Protocol`; nothing names the Tenant. A management key is `403 key_role_mismatch`, except on `/v1/me` and the public `GET /v1/access/jwks` |
+| `/v1/tenant/*` Management API routes | management key | Require `Nylorun-Protocol`. An application key, alone or acting for a subject, is `403 key_role_mismatch`; a management key with `Nylorun-Subject` or `Nylorun-Scopes` is `403 subject_invalid` |
+| `PUT /v1/tenant/keys/{keyId}` | management key | Creates application key `keyId` or rotates it, and returns it once; `GET /v1/tenant/keys` lists every key (id, role, when issued, never the keys) and `DELETE` deletes one. `studio`, `bootstrap` and management keys are refused |
+| `PUT /v1/tenant/models/inputs` | management key | What a catalog model reads beyond its catalog's inputs (protocol 12): only inputs in its `addableInputs`; an empty list removes them. `GET /v1/tenant/models` gives each model `inputs` and `addableInputs`. A custom endpoint sets `settings.inputs` on `PUT /v1/tenant/model` (text only by default) |
+| `GET /v1/artifact-links/{token}` | the link itself | A capability link to one artifact version (protocol 6): no credential, no `Nylorun-Protocol`, Range supported; a folder's link opens its zip, or one of its files |
+
+Every route checks `Host` first (`421 host_rejected`) and rejects non-JSON bodies
+with `415 unsupported_media_type`, except an artifact upload (`POST /v1/artifacts`,
+`POST /v1/artifacts/{id}/versions`), whose body is the file in any media type. An `Origin` is `403 origin_rejected` on
+`/health`, `/ready` and the OpenAPI documents. On `/v1` routes a browser
+presents a trusted issuer's token; keys (application and management)
+are refused from browsers before they are looked up. The Runtime sends no CORS headers, and answers
+`OPTIONS` with `204` and `Allow` only: the operator's reverse proxy answers preflights
+([Docker Compose reference](../../docs/self-hosting/docker-compose.md#calling-the-runtime-from-browsers-and-apps)). Missing or
+unsupported protocol → `426` before authentication, unless the request sends neither
+`Nylorun-Protocol` nor `Authorization` (the Host serves protocol 15 only; protocol 15 moves
+`read_artifact` and `save_artifact` to our harness, which runs them over the Harness API's
+artifact seam, and closes every agent session that pinned them; protocol 14 adds
+environment manifests (`/v1/environment-manifests/{name}`): an Environment is made from one
+version and never changes what it runs (a new version reaches it through
+`POST /v1/environments/{id}/fork`), a manifest's `secrets` declare slots and an agent's
+`requires` is checked when a session opens; sessions on one Environment run their turns in
+parallel, and egress connections are `environment.egress` events on the Environment's stream,
+in no session log or trace; protocol 13 makes the
+manifest flat, manifest 7: no `capabilities`, tools known by name, the Runtime's own tools in the
+pinned manifest's `runtime` block and no `capabilityId` on events, tool call rows or the Harness
+API, now 3; it closes every session opened before it; protocol 12 adds
+model inputs and `read_artifact` for every agent (its accept check, `422
+attachment_unsupported`, left with protocol 15: the harness decides how the model sees a file),
+and changes nothing a protocol 11 client sends; protocol 11 replaces
+sandbox resources, the Tenant's default sandbox, inline sandboxes and user and installation
+vaults with Environments, each one sandbox and one vault, under `/v1/environments`, and
+removes the Management API's vault routes, so a protocol 10 client gets `426`; protocol 10 removes
+the MCP OAuth connect, the vault's `oauth` credentials and the credential resolver, and adds
+`headers` credentials, `via` and the identity header, manifest v6 and
+`POST /v1/tenant/mcp/preview`; protocol 9 makes the Runtime API an OAuth 2.1 resource server: a missing or rejected credential is `401
+credential_required` or `credential_invalid` with a `WWW-Authenticate: Bearer` challenge, a
+token without a route's scope gets `error="insufficient_scope"`, and
+`/.well-known/oauth-protected-resource` lists the trusted issuers (RFC 9728); protocol 8 gives keys roles, moves vaults and signing keys under `/v1/tenant` and removes
+the Admin API, and those old paths answer `404` with no alias; protocol 7 removes subject tokens, the access policy, revocations, browser keys and
+derived principals, whose routes answer `404`; protocol 6 adds file and folder artifacts and message `parts`; at each turn's end
+our harness saves `/workspace/outputs` of the session's sandbox as a version of its
+`outputs` folder (over the artifact seam since protocol 15), read at `/v1/artifacts/{id}/versions/{n|latest}/tree`, `/files/{path}`,
+`/diff?from=` and `/zip`). Clients name no Tenant (since protocol 5). A Tenant that
+could not be opened → opaque `404` with identical body. A path or method no route serves is `404 Route not found`
+once the caller is known.
+
+## API reference (OpenAPI)
+
+The Runtime describes its APIs as OpenAPI 3.2 documents, generated from the routes it serves,
+so they cannot drift from its answers:
+
+| Document | In the package | Served (no key) | On each release |
+| --- | --- | --- | --- |
+| Runtime API | `@nylorun/runtime/openapi.json` | `GET /openapi/runtime.json` (alias `GET /openapi.json`) | `openapi.json` |
+| Management API | `@nylorun/runtime/management-openapi.json` | `GET /openapi/management.json` | `management-openapi.json` |
+
+The release assets are on the `@nylorun/runtime@<version>` GitHub Release. Point any OpenAPI 3.2
+tool at one of them; for [Scalar](https://scalar.com), the package file of a version works as is:
+
+```text
+https://cdn.jsdelivr.net/npm/@nylorun/runtime@<version>/dist/openapi.json
+https://cdn.jsdelivr.net/npm/@nylorun/runtime@<version>/dist/management-openapi.json
+```
+
+Each document has described tags, in the order a developer uses them. The Runtime API's are
+grouped (`x-tagGroups`): Agents (Agents, Definition files), Sessions (Sessions API, AG-UI,
+A2A), Environments, Artifacts and Service (health, readiness, `/v1/me`, the JWKS and the
+document; the `/openapi.json` alias is served but not listed). The Management API's are
+Tenant, Application keys, Models, Credential coverage, MCP servers, Signing keys and Settings. Each operation's
+`security` says which credentials it takes (application key and trusted issuer's token in
+the Runtime API; management key in the Management API), and its
+`x-nylorun-credentials` and `x-nylorun-scopes` (the subject scopes that reach it) fields say
+who may call it. Event streams are `text/event-stream` with an `itemSchema`. `runtime/server/openapi/` holds the committed snapshots: a change to a route changes
+them (`node scripts/build-openapi.mjs --write`), and `check-package` fails until they are
+updated.
+
+## Embedding and tests
+
+Tests and ephemeral embeds use `startEphemeralRuntime()` from
+`@nylorun/runtime/core`: private Host on port 0, temporary Host root, one Tenant,
+returns `{ url, tenantId, applicationKey, managementKey, adminKey, close() }`
+(`managementKey` is the key `bootstrap`, for the Management API). Its Tenant is the
+one Tenant of the Postgres database you pass as `database` (required): a pool, which
+you end, or a URL, for which it opens a pool and ends it on `close()`. It creates the
+Tenant there on first start, as a Host does (with `tenantId`, `name` and an application
+principal for `applicationKey`), and serves the Tenant a database already holds. The
+data stays after `close()`; give each test Tenant its own database and drop it
+afterwards. Its
+streams and scheduling are in process and gone after `close()`. The smoke checks do
+not use it; they reset and seed a temporary local Tenant
+(`scripts/lib/stack-tenant.mjs`).
+
+```ts
+const runtime = await startEphemeralRuntime({
+  hostRoot, // a temporary directory
+  database: "postgres://nylorun:nylorun@127.0.0.1:55432/my_test_db",
+});
+```
+
+Save agents with `PUT /v1/agents/{agentId}` using the application principal (`saveAgent`
+in `@nylorun/agents`). The Runtime runs the agent from its manifest and never calls your
+code during a session: a definition with a tool that would (`tool({ run })`, a flow's tool
+stage) is refused. Your services are reached as tools: HTTP tools, POSTed from the Runtime,
+so their URLs must be reachable from it, and remote MCP servers. Each URL gets a
+credential in the vault of the Environment a session names (`PUT
+/v1/environments/{id}/secrets/{name}`), the operator previews an MCP server's tools
+(`nylorun tenant mcp inspect --environment <id>`),
+and the manifest says which tools are enabled, and which to defer (a hint the harness
+follows; [Docker Compose reference](../../docs/self-hosting/docker-compose.md#mcp-servers-and-http-tools)). Which calls wait for a
+person, or are refused, is the Tenant's tool policy, which names an MCP tool by `server` and
+its own name ([Docker Compose reference](../../docs/self-hosting/docker-compose.md#tool-policy)). Model gateway
+and sandbox backend are Tenant configuration (the Tenant's own vault, Tenant
+settings and seed), not Host process env.
+
+## Session behaviour
+
+The session-first `/v1` API is specified in
+[HOST_CONTRACT.md](../harness/HOST_CONTRACT.md). Application tokens authorize
+definition/session APIs.
+
+Postgres transactions persist session checkpoints, command receipts, individual
+effects, waits and the record of session events — in the Tenant's database; history is
+read from Durable Streams (S2). An advance owns its session through a lease with
+an epoch; a Worker that takes over after a crash marks in-flight model effects
+`uncertain`, and sends an interrupted MCP or HTTP tool call again with the same key. Vault ciphertext needs that Tenant's own KEK.
+
+A session that names an Environment of kind `virtual` or `pod` gets a sandbox, its spec pinned
+on the session: our harness offers the sandbox tools and `save_artifact` and writes their notes
+(protocol 15), and runs the calls in it. The agent declares nothing, and no tool name is
+reserved: each call names what runs it. The Tenant owns each Environment; backend names are
+prefixed `nylorun-<tenant-id>-`.
+
+## Local Project workflow
+
+A project depends on `@nylorun/agents` only. `npx nylorun start` in the project
+runs its local Tenant (Docker), named after the project directory, and writes
+the Project link (outside a project it runs the Tenant `default`); the project's `npm run dev` runs `src/main.ts` under
+`tsx watch`; `npx nylorun studio` opens Studio on that Tenant.
+
+## Troubleshooting
+
+| Symptom | What to do |
+| --- | --- |
+| `kek-missing` | Restore `vault-kek` in the Tenant directory |
+| `GET /ready` is 503 with `checks.tenant: false` | The Tenant could not be opened; every `/v1` request is the opaque `404`. `nylorun status` on a local Tenant, or `nylorun-operate status` in the runtime container, names the cause and its repair. Follow it, then restart the Runtime; otherwise the Runtime's log names the cause |
+| `corrupt` / `migration-failed` / `envelope-invalid` / `open-failed` / `open-timeout` | Follow the cause's `repair` string |
+| `schema-too-new` | Run a Runtime at least as new as the one that migrated the database |
+| `database-layout-old` | The database holds `tenant_<id>` schemas of an older Runtime, or the `schema_version` tables of a pre-release one: point the Runtime at a new database (locally, a new Tenant: `nylorun start --tenant <new name>`); the old one is left as it is |
+| `426 protocol_unsupported` | Upgrade clients or Host to a compatible set |
+| `421 host_rejected` / `403 origin_rejected` | In a container, list the `Host` in `NYLORUN_ALLOWED_HOSTS`. From a browser, send a trusted issuer's token, never a key |
+| A turn fails `model.unsupported_input` | A custom harness sent the Model Gate a part the model cannot take (a text file as media, or a kind the model does not read): it should decide by `turn.start.model`. With our harness, the model was switched mid-turn: send the message again |
+| `403 key_role_mismatch` | The key belongs to the other API: use a management key on `/v1/tenant/*` (`@nylorun/admin`) and an application key everywhere else (`@nylorun/agents`) |
+| `503` for a Tenant | Postgres or Restate is unreachable; `GET /ready` names which |
+| Port in use | Change `NYLORUN_PORT` in `~/.nylorun/tenants/<name>/docker/.env` and run `nylorun start` |
+| Logs | `nylorun local logs runtime` |
+
+Definitions have no `agent.run()`; applications use `@nylorun/agents`.
+
+## Session reads
+
+Hosts advertising `session-reads` serve pinned session manifests, recorded usage, model-call
+pages and opt-in session/history/Environment pagination. `calls-export` adds the Management API's
+unfiltered, resumable model ledger export (`GET /v1/tenant/calls/model`, a management key) in
+safe transaction order. `tool-calls` adds `GET /v1/sessions/{id}/calls/tool`: each tool call of
+the session from the effect journal, with its input, status and sends. Existing list/history
+requests without `limit` retain their response shapes. These are public APIs for Studio,
+CLI and custom clients; clients never need database access.
+
+## Turns
+
+Hosts advertising `turns` keep a turn index, written with the events that change each turn, and
+serve it as a change feed: `GET /v1/turns?changedAfter=<cursor>&limit=<1..500>` pages the turns a
+caller may see in the order they changed (a turn again each time it changes), each with its
+session, Agent, status, start and end, last change, totals and A2A context and task. Pass the
+page's `cursor` as `changedAfter` to read on; `sessionId` reads one session's turns. An application
+key reads the whole Tenant, a subject only its own sessions'. The A2A endpoint answers `ListTasks`
+from the same index.
+
+## Artifact pages
+
+Hosts advertising `artifact-reads` accept `GET /v1/artifacts?limit=50`, returning
+`{ artifacts: ArtifactListItem[], nextCursor: string | null }`. An explicit `limit`
+of 1–200 opts into paging; without it the existing `{ artifacts: ArtifactView[] }`
+list remains oldest first. Pages order by `(createdAt DESC, artifactId DESC)` and
+contain metadata only: id, kind, name, current content type, latest version number,
+optional session and labels, and creation/update timestamps. Use the existing
+artifact detail, numbered version and download APIs for history and bytes.
+
+Paged reads accept equality filters `sessionId`, `kind=file|folder` and repeated
+`label=key=value` (all labels must match). `sessionId` includes only that session's
+artifacts, excluding Tenant-owned artifacts. An application key acting as itself
+sees every artifact; subjects and issuer tokens see only artifacts of their owned
+sessions and permitted agents. Missing or inaccessible session filters return 404.
+Management keys cannot use this Runtime API route.
+
+Send `nextCursor` as `cursor` with the same normalized filters until it is null.
+Cursors are bound to the Tenant, route and filters; invalid or mismatched cursors
+return 400 (`cursor_invalid` or `cursor_mismatch`). Each page reapplies current
+authorization and is an independent read: it is not a frozen snapshot. Newer
+inserts require a fresh traversal; deleted rows disappear and versions/metadata
+may change between pages. Creation time and ID remain the paging position.
+
+These pages reuse the separate bounded, read-only Drizzle pool (four connections,
+two-second statement timeout). Migration `0023_artifact_pages` adds only the
+creation-order index; the existing session index also serves session pages in
+reverse order. No data backfill, protocol bump or direct client database access is
+required. Studio can discover `artifact-reads` through `/health` before enabling
+a tenant-wide table; `@nylorun/agents` exposes the same API as `artifacts.page()`.

@@ -1,0 +1,177 @@
+/**
+ * What the gates service opens of the Tenant: its vault's host model, and nothing else. The
+ * full Tenant (`TenantRuntime.open`) migrates its database, creates its key file and starts
+ * its services; the gate does none of that. The database holds one Tenant:
+ * the gate reads which one from it, refuses a database whose Tenant schema isn't at this
+ * build's version (the Runtime migrates it when it opens the Tenant) and never creates a vault
+ * key. The vault is opened once and kept.
+ */
+import type { Credential } from "@earendil-works/pi-ai";
+import type { ModelFailureOutcome } from "@nylorun/core/define";
+import { isTenantId } from "@nylorun/core/compatibility";
+import { failure } from "../model/classify.js";
+import type { PostgresClient } from "../store/postgres/connect.js";
+import { database } from "../store/postgres/db.js";
+import { expectedSchemaVersion, readSchemaVersion } from "../store/postgres/migrate.js";
+import { readTenantEnvelope } from "../store/postgres/tenant.js";
+import { createPostgresSessionStore } from "../store/postgres/store.js";
+import { tenantPaths } from "../tenant/paths.js";
+import { readVaultKek } from "../vault/kek.js";
+import { HostModelVault } from "../vault/host-model.js";
+import { VaultService, type AuthorizeResult, type HostModelSecret } from "../vault/service.js";
+import { sessionCredentials, type McpCredentialRequest } from "../vault/sources.js";
+import type { SessionStore } from "../store/types.js";
+import type { OutboundPolicy } from "../tenant/outbound.js";
+import type { Session } from "../tenant/context.js";
+import { inProcessKeys, type Keys } from "../keys/keys.js";
+import { SigningKeys } from "../tenant/signing-keys.js";
+
+/** The Tenant, as a model call needs it. */
+export interface TenantVault {
+  readonly tenantId: string;
+  /** The Tenant's store, for the usage ledger. */
+  readonly store: SessionStore;
+  /** The Tenant's home: secrets found there are redacted from failure messages. */
+  readonly root: string;
+  /** The host model a call uses: its session's own model (`session-model`), else the Tenant's. */
+  readHostModel(sessionId?: string): Promise<HostModelSecret | undefined>;
+  /** Writes back a credential pi-ai refreshed (OAuth) to `provider`'s, else the active one's. */
+  writeHostCredential(credential: Credential, provider?: string): Promise<void>;
+  /** A session, for the remote MCP servers and HTTP tools its pinned manifest declares. */
+  session(sessionId: string): Promise<Session | undefined>;
+  /**
+   * The authorization of one request to a session's remote MCP server or HTTP tool: its
+   * credential from the vault of the session's Agent.
+   */
+  authorizeMcp(sessionId: string, request: McpCredentialRequest): Promise<AuthorizeResult>;
+  /** Vault writes and token signing with the Tenant's vault key (the keys service). */
+  keys(): Keys;
+  /** Whether the Environment's vault has an `environment_secret` bound to `host`. */
+  environmentSecretBound(environmentId: string, host: string): Promise<boolean>;
+  /** The header an `environment_secret` sets on one request to `host`. */
+  releaseEnvironmentSecret(environmentId: string, host: string): ReturnType<VaultService["releaseEnvironmentSecret"]>;
+}
+
+export interface TenantVaults {
+  /**
+   * Opens the Tenant's vault, or rejects with a `GateRefusal`. `tenantId`, when the caller
+   * names one, must be the database's Tenant.
+   */
+  open(tenantId?: string): Promise<TenantVault>;
+}
+
+/** A call the gate refuses before the provider is called; it answers with `outcome`. */
+export class GateRefusal extends Error {
+  constructor(readonly outcome: ModelFailureOutcome) {
+    super(outcome.message);
+    this.name = "GateRefusal";
+  }
+}
+
+export interface TenantVaultsOptions {
+  readonly sql: PostgresClient;
+  /** The Host root; the gate reads `keys/vault-kek` and `tenant/home` under it. */
+  readonly hostRoot: string;
+  /** How the keys service's tool preview reaches a server (`NYLORUN_ENDPOINT_*`). */
+  readonly delivery?: OutboundPolicy;
+}
+
+export function createTenantVaults(options: TenantVaultsOptions): TenantVaults {
+  const { sql, hostRoot } = options;
+  let opened: TenantVault | undefined;
+
+  function build(tenantId: string): TenantVault {
+    const paths = tenantPaths(hostRoot);
+    const store = createPostgresSessionStore({ sql, tenantId });
+    let kek: Buffer | undefined;
+    const readKek = () => {
+      kek ??= readVaultKek({ vaultKekPath: paths.kek });
+      if (!kek)
+        throw new GateRefusal(
+          failure(
+            "auth",
+            "The Tenant's vault key is missing on the gateway container; check that it mounts the Host's keys directory, which `nylorun start` creates",
+            false,
+          ),
+        );
+      return kek;
+    };
+    const vault = new HostModelVault({ store, kek: readKek });
+    const credentials = new VaultService({ store, kek: readKek });
+    const keys = inProcessKeys({
+      store,
+      vault: credentials,
+      signingKeys: new SigningKeys({ tenantId, kek: readKek }),
+      kek: readKek,
+      ...(options.delivery ? { policy: options.delivery } : {}),
+    });
+    const session = (sessionId: string) =>
+      store.tx((t) => t.get<Session>("sessions", sessionId));
+    return {
+      tenantId,
+      store,
+      root: paths.home,
+      readHostModel: (sessionId) => vault.readHostModel(sessionId),
+      writeHostCredential: (credential, provider) => vault.updateHostCredential(credential, provider),
+      session,
+      authorizeMcp: (sessionId, request) =>
+        authorizeSessionMcp(credentials, session, sessionId, request),
+      keys: () => keys,
+      environmentSecretBound: (environmentId, host) => credentials.environmentSecretBound(environmentId, host),
+      releaseEnvironmentSecret: (environmentId, host) => credentials.releaseEnvironmentSecret({ environmentId, host }),
+    };
+  }
+
+  /** The database's Tenant, once its schema is at this build's version. */
+  async function load(): Promise<TenantVault> {
+    const version = await readSchemaVersion(database(sql));
+    const expected = expectedSchemaVersion();
+    if (version === undefined || version === 0)
+      throw new GateRefusal(
+        failure("transient", "The Tenant's database is not migrated yet; the Runtime does that when it starts", true),
+      );
+    if (version !== expected)
+      throw new GateRefusal(
+        failure(
+          "transient",
+          `The Tenant is at schema version ${version}; the gateway serves version ${expected}`,
+          version < expected,
+        ),
+      );
+    const envelope = await readTenantEnvelope(sql).catch(() => undefined);
+    if (!envelope)
+      throw new GateRefusal(
+        failure("transient", "The database holds no Tenant yet; the Runtime creates it when it starts", true),
+      );
+    return build(envelope.id);
+  }
+
+  return {
+    async open(tenantId) {
+      if (tenantId !== undefined && !isTenantId(tenantId))
+        throw new GateRefusal(failure("invalid_request", "Not a Tenant id", false));
+      opened ??= await load();
+      if (tenantId !== undefined && tenantId !== opened.tenantId)
+        throw new GateRefusal(
+          failure("invalid_request", `Tenant ${tenantId} is not this installation's Tenant`, false),
+        );
+      return opened;
+    },
+  };
+}
+
+/**
+ * A request to a session's remote MCP server, authorized from its Environment's vault: what the
+ * loop does in its own process (`tenant/effects.ts` `authorize`). The Environment comes from the
+ * session row.
+ */
+export async function authorizeSessionMcp(
+  vault: Pick<VaultService, "authorize">,
+  session: (sessionId: string) => Promise<Session | undefined>,
+  sessionId: string,
+  request: McpCredentialRequest,
+): Promise<AuthorizeResult> {
+  const found = await session(sessionId);
+  if (!found) throw new Error(`Session ${sessionId} not found`);
+  return sessionCredentials(vault, { ...found, id: sessionId }, request);
+}

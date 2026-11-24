@@ -1,0 +1,147 @@
+/**
+ * The harness service (`--service harness`): the process that runs the Tenant's agent
+ * segments, MCP servers and sandboxes, apart from core. It holds one credential, the harness
+ * token, for core's Harness API; its model and MCP calls present the run token of the run they
+ * belong to (from the `lease` answer and each renewal), never the gates' credential. It opens no
+ * database, no Restate, no keys.
+ *
+ * Its files live under `NYLORUN_HARNESS_ROOT` (`/harness`): `sandboxes/` (workspaces and their
+ * records). `/health` answers on 127.0.0.1 only.
+ *
+ * In a pod sandbox (`NYLORUN_SANDBOX_KIND=pod`) it is that sandbox's engine: it first waits
+ * until the pod's NetworkPolicy is in force (`awaitNetworkPolicy`; quickly on a wake, when its
+ * disk already holds the volume id an earlier pod wrote), then joins with the
+ * pod's join token instead of a harness token (`pod.ts`), runs its disk's setup on a new volume
+ * (`setup.ts`), and runs its sandbox's tools in the pod itself (the `local` backend), with egress
+ * through egress-gate. SIGTERM (tini forwards
+ * it; the pod's grace is 10 s by default) gives its runs back and exits. On Agent Substrate
+ * (`NYLORUN_SANDBOX_SUBSTRATE=1`), SIGTERM means the worker pod is stopping: the engine logs it and
+ * keeps running, so the sandboxes service can suspend the actor within Substrate's 30 minutes.
+ */
+import { existsSync, mkdirSync } from "node:fs";
+import { createServer } from "node:http";
+import { join } from "node:path";
+import { httpModelGate } from "../gates/http-client.js";
+import { httpToolGate } from "../gates/tool-client.js";
+import { createHostLogger } from "../host/logger.js";
+import type { StackConfig } from "../host/stack-config.js";
+import { RUNTIME_VERSION } from "../version.js";
+import { localBackend, localExec } from "../adapters/sandbox/local.js";
+import { awaitNetworkPolicy } from "../sandbox/pods/network-gate.js";
+import { firstJoin, podHost, type PodHost } from "./pod.js";
+import { prepareDisk } from "./setup.js";
+import { harnessRunTokens } from "./run-tokens.js";
+import { startHarnessService } from "./service.js";
+import { hostTuning } from "../tuning.js";
+
+/**
+ * `baseline` is the allowlisted environment of a pod's sandbox tools (`baselineEnvironment`),
+ * read by `host/main.ts`: nothing here reads the process environment.
+ */
+export async function runHarness(
+  stack: StackConfig,
+  baseline: Readonly<Record<string, string>>
+): Promise<void> {
+  const config = stack.harness!;
+  const logger = createHostLogger();
+  const paths = { sandboxes: join(config.root, "sandboxes") };
+  mkdirSync(paths.sandboxes, { recursive: true });
+  logger.info("host_stack_config", { services: [...stack.services], harness: config.url, gates: config.gatesUrl });
+
+  // A pod's engine trusts the network only once its NetworkPolicy blocks what it must.
+  let pod: PodHost | undefined;
+  let prepare: (() => Promise<void>) | undefined;
+  if (config.pod) {
+    // A disk with a volume id has had a pod of this sandbox in this namespace: a wake.
+    const wake = existsSync(join(config.root, "volume-id"));
+    const { waitedMs, check } = await awaitNetworkPolicy({
+      addresses: config.pod.blocked,
+      wake,
+      log: (message, fields) => logger.info(message, fields),
+    });
+    logger.info("sandbox_network_policy_in_force", { sandboxId: config.pod.sandboxId, waitedMs, wake, check });
+    pod = podHost(config.pod, logger, {
+      volumeFile: join(config.root, "volume-id"),
+      caBundleFile: join(config.root, "egress-ca-bundle.pem"),
+      ...(config.pod.egressCaFile ? { extraCaFile: config.pod.egressCaFile } : {}),
+    });
+    // Join, then make the disk ready before taking any turn. The first join is tried
+    // again while the edge can't be reached yet (a new Agent Substrate actor's egress policy).
+    await firstJoin(pod, (message, fields) => logger.warn(message, fields));
+    const host = pod;
+    prepare = () =>
+      prepareDisk({
+        host,
+        exec: localExec({ env: baseline, proxyEnv: () => host.proxyEnv() }),
+        volumeFile: join(config.root, "volume-id"),
+        markerFile: join(config.root, "setup.json"),
+        logger,
+      });
+    // A fork onto other setup runs it after connecting: core writes its disk through the connection.
+    if (!pod.afterSeed) await prepare();
+  }
+  const token = pod ? (signal?: AbortSignal) => pod.token(signal) : config.token;
+  if (token === undefined) throw new Error("--service harness needs NYLORUN_HARNESS_TOKEN");
+
+  const runTokens = harnessRunTokens();
+  const service = startHarnessService({
+    url: config.url,
+    token,
+    // A pod's engine may be frozen and resumed (an Agent Substrate restore): redial at once.
+    ...(pod ? { redialOnClockJump: true } : {}),
+    ...(pod
+      ? { sandboxBackends: [localBackend({ env: baseline, proxyEnv: () => pod.proxyEnv(), harnessRoot: config.root })] }
+      : {}),
+    paths,
+    modelGate: httpModelGate({ url: config.gatesUrl, runTokens }),
+    toolGate: httpToolGate({ url: config.gatesUrl, runTokens }),
+    logger,
+    version: RUNTIME_VERSION,
+    onGrant: (grant) => runTokens.grant(grant),
+  });
+  if (pod?.afterSeed && prepare)
+    void prepare().catch((error: unknown) =>
+      logger.warn("environment_setup_failed", { message: error instanceof Error ? error.message : String(error) }),
+    );
+
+  const health = createServer((request, response) => {
+    if (request.url !== "/health") {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ status: "ok", service: "nylorun-harness", connected: service.client.connected }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    health.once("error", reject);
+    health.listen(config.healthPort, "127.0.0.1", () => resolve());
+  });
+  logger.info("harness_ready", { health: `http://127.0.0.1:${config.healthPort}/health` });
+
+  let stopping = false;
+  let workerStopping = false;
+  for (const signal of ["SIGINT", "SIGTERM"] as const)
+    process.on(signal, () => {
+      // On Agent Substrate, SIGTERM means the worker pod is stopping: the actor has 30 minutes to
+      // be suspended, and the sandboxes service suspends it. A process that exits can't be, so the
+      // engine keeps running, and keeps its runs (Substrate's eviction contract).
+      if (signal === "SIGTERM" && config.pod?.substrate) {
+        if (!workerStopping) logger.info("harness_worker_stopping", { sandboxId: config.pod.sandboxId });
+        workerStopping = true;
+        return;
+      }
+      if (stopping) return;
+      stopping = true;
+      // Runs are given back (core resumes them in its next advance), then MCP and sandboxes stop.
+      pod?.stop();
+      void service
+        .stop(pod ? hostTuning().harness.podStopMs : hostTuning().harness.stopMs)
+        .catch((error: unknown) =>
+          logger.warn("harness_stop_failed", { message: error instanceof Error ? error.message : String(error) })
+        )
+        .finally(() => {
+          health.close();
+          process.exit(0);
+        });
+    });
+}

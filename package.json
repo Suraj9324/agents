@@ -1,0 +1,87 @@
+{
+  "name": "nylorun-agents-workspace",
+  "private": true,
+  "description": "Public workspace for Nylorun's TypeScript agents and runtime.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "core",
+    "runtime/harness",
+    "sdks/agents",
+    "sdks/admin",
+    "runtime/server",
+    "studio",
+    "cli/nylorun",
+    "cli/legacy",
+    "cli/create-agent"
+  ],
+  "engines": {
+    "node": "^24.0.0",
+    "npm": "^11.0.0"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "configure": "npm run configure --prefix examples",
+    "dev": "node scripts/dev.mjs",
+    "dev:starter": "node scripts/starter.mjs",
+    "build": "node scripts/validate.mjs build",
+    "check": "node scripts/validate.mjs check",
+    "check:stack": "node scripts/validate.mjs stack",
+    "test": "node scripts/validate.mjs test",
+    "test:tooling": "node --test scripts/test/*.test.mjs",
+    "test:docs": "node scripts/doc-tests.mjs",
+    "test:dev": "node scripts/smoke-development.mjs",
+    "test:setup": "node scripts/smoke-setup.mjs",
+    "test:starter": "node cli/create-agent/scripts/smoke-starter.mjs",
+    "test:acceptance": "node scripts/acceptance/installation.mjs",
+    "test:acceptance:access": "node scripts/acceptance/access.mjs",
+    "test:remote": "node scripts/acceptance/remote.mjs",
+    "test:stack": "node scripts/smoke-stack.mjs",
+    "test:failure": "node scripts/smoke-failure.mjs",
+    "test:redteam": "node scripts/smoke-redteam.mjs",
+    "test:sandboxes": "node scripts/sandbox/suite.mjs",
+    "test:sandboxes:service": "node scripts/sandbox/service-suite.mjs",
+    "test:sandboxes:network": "node scripts/sandbox/network-invariant.mjs",
+    "test:sandboxes:redteam": "node scripts/sandbox/redteam.mjs",
+    "test:sandboxes:harness": "node scripts/sandbox/harness-pod.mjs",
+    "test:t2-exit": "node scripts/sandbox/t2-exit.mjs",
+    "test:t3-exit": "node scripts/sandbox/t3-exit.mjs",
+    "test:t4-exit": "node scripts/t4-exit.mjs",
+    "test:t5-exit": "node scripts/t5-exit.mjs",
+    "examples:sync": "npm run examples:sync --workspace @nylorun/create-agent",
+    "examples:check": "npm run examples:check --workspace @nylorun/create-agent",
+    "changeset": "changeset",
+    "release:prepare": "node scripts/release/prepare.mjs",
+    "release:check": "node scripts/release/check.mjs"
+  },
+  "packageManager": "npm@11.15.0",
+  "overrides": {
+    "@scalar/json-magic": {
+      "undici": "7.30.1"
+    },
+    "just-bash": {
+      "guarded-fetch": {
+        "undici": "7.30.1"
+      }
+    }
+  },
+  "devDependencies": {
+    "@changesets/apply-release-plan": "^8.1.1",
+    "@changesets/cli": "^3.0.3",
+    "@changesets/config": "^4.0.1",
+    "@changesets/read": "^1.0.1",
+    "@manypkg/get-packages": "^3.1.0",
+    "chokidar": "^5.0.0",
+    "semver": "^7.8.6"
+  },
+  "dependencies": {
+    "@ag-ui/client": "^1.0.4",
+    "@scalar/openapi-parser": "^0.29.21",
+    "@types/node": "^26.6.6",
+    "@vitejs/plugin-react": "^6.3.0",
+    "lucide-react": "^1.71.0",
+    "radix-ui": "^1.8.1",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  }
+}

@@ -1,0 +1,244 @@
+/**
+ * One reconcile of a pod sandbox (S5): the `Sandbox` object's handler
+ * (`WorkerHandlers.sandbox`, serialized per sandbox). It reads the row and the Tenant's
+ * settings, asks the sandboxes service for the Sandbox's status, decides (`lifecycle.ts`),
+ * then carries the decision out:
+ *
+ * 1. a join token rotation is written first (its hash and a new `rev`), so the token the
+ *    service writes to the join Secret is always the one the row names;
+ * 2. deletes and the apply go to the service, outside any transaction;
+ * 3. the row's patch and the events are written under the row's lock, unless the row changed
+ *    since it was read (an API call or a join): then nothing is written and the reconcile runs
+ *    again at once. A host epoch the decision moves is recomputed from the locked row.
+ *
+ * It answers when to look again (`retryAfterMs`) and the timers to arm (idle, TTL). Only
+ * infrastructure errors throw; Restate retries those.
+ */
+import { randomBytes } from "node:crypto";
+import type { SandboxPodPatch } from "../../store/types.js";
+import type { TenantContext } from "../../tenant/context.js";
+import { DEFAULT_SANDBOX_IMAGE } from "../policy.js";
+import { effectiveSandboxConfig, readSandboxConfig } from "../tenant-config.js";
+import { podSandboxSpecOf } from "../resolve.js";
+import { sha256Hex } from "../join.js";
+import { recoverLostVolume, renewRefusedVolume } from "../../artifacts/disk.js";
+import type { PodStatus } from "./client.js";
+import { decide, type PodRow, type PodTimer, type PodTrigger } from "./lifecycle.js";
+import { podLifecycleConfig, podSpecOf } from "./spec.js";
+import { podKeysOf } from "./keys.js";
+import { hostTuning } from "../../tuning.js";
+import { idleMsOf, revertStart } from "../../tenant/agent-versions.js";
+import { computerActivity, computerDiskBytes, measureDiskNow } from "../computer.js";
+
+/** What a reconcile asks of the `Sandbox` object next. */
+export interface SandboxReconcileResult {
+  readonly retryAfterMs?: number;
+  readonly arm?: readonly { readonly timer: PodTimer; readonly at: number }[];
+}
+
+export async function reconcileSandbox(
+  ctx: TenantContext,
+  sandboxId: string,
+  trigger: PodTrigger,
+): Promise<SandboxReconcileResult> {
+  const pods = ctx.pods;
+  if (!pods || ctx.closed) return {};
+  const read = await ctx.store.tx(async (t) => {
+    const row = await t.environment(sandboxId);
+    if (!row || row.kind !== "pod" || !row.pod) return undefined;
+    const config = await readSandboxConfig(t);
+    const busy = (await t.sessionsOnEnvironment(sandboxId)).some(
+      (session) => (session as { activeTurnId?: string | null }).activeTurnId != null,
+    );
+    return { row: row as PodRow, config, busy };
+  });
+  if (!read) return {};
+  const { row, config } = read;
+  const status = async (name: string): Promise<PodStatus | undefined> => {
+    try {
+      return await pods.client.status(name);
+    } catch (error) {
+      ctx.config.logger.warn("sandboxes service status failed", {
+        sandboxId,
+        name,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  };
+  // While a start would apply a new version, it idles at most `tenant.upgradeIdleMs`.
+  const lifecycle = { ...podLifecycleConfig(config, row.recipe), idleMs: idleMsOf(config, row) };
+  const current = await status(row.pod.k8sName);
+  let decision = decide({
+    row,
+    image: row.applied.image ?? DEFAULT_SANDBOX_IMAGE,
+    config: lifecycle,
+    status: current,
+    ...(row.pod.retiring ? { retiring: await status(row.pod.retiring) } : {}),
+    busy: read.busy,
+    now: Date.now(),
+    trigger,
+  });
+  // A running computer (its sandbox ready) about to be suspended as idle is asked first whether a
+  // command still runs on it: a command that outlives its turn holds it until none has started or
+  // ended for the idle period, and a suspend never lands on one. Then its disk is measured, at most
+  // hourly, and the size recorded on `agent.suspended`. A measure that fails records none and
+  // holds nothing up; a turn or a use since the row was read decides again instead.
+  const idleSuspend = decision.events.find(
+    (item) => item.type === "agent.suspended" && (item.payload as { reason?: string }).reason === "idle",
+  );
+  if (pods.computer && idleSuspend && current?.ready) {
+    const activity = await computerActivity(ctx, row.pod.k8sName);
+    if (activity) {
+      const now = Date.now();
+      const due = activity.running > 0 ? now + lifecycle.idleMs : (activity.lastActivityAt ?? 0) + lifecycle.idleMs;
+      if (due > now) return { arm: [{ timer: "idle", at: due }] };
+    }
+    const measure = measureDiskNow(`${ctx.config.tenantId}/${row.pod.k8sName}`);
+    const diskBytes = measure ? await computerDiskBytes(ctx, row.pod.k8sName) : undefined;
+    if (diskBytes !== undefined)
+      decision = {
+        ...decision,
+        events: decision.events.map((item) =>
+          item === idleSuspend ? { ...item, payload: { ...item.payload, diskBytes } } : item,
+        ),
+      };
+    const since = await ctx.store.tx(async (t) => ({
+      row: await t.environment(sandboxId),
+      busy: (await t.sessionsOnEnvironment(sandboxId)).some(
+        (session) => (session as { activeTurnId?: string | null }).activeTurnId != null,
+      ),
+    }));
+    if (since.busy || since.row?.pod?.lastActiveAt !== row.pod.lastActiveAt) return { retryAfterMs: 0 };
+    ctx.config.logger.info("computer suspended", { agentId: sandboxId, ...(diskBytes === undefined ? {} : { diskBytes }) });
+  }
+  // Its Sandbox can't take the spec on its volume: a new volume, before any apply or patch. When
+  // none is made yet (an earlier volume still deleting) the rest of the decision goes on, so that
+  // deletion, which the decision carries, finishes.
+  if (decision.renew) {
+    const renewed = await renewRefusedVolume(ctx, sandboxId, row.pod.k8sName, decision.renew.reason);
+    if (renewed) return { retryAfterMs: 0 };
+  }
+  let patch: SandboxPodPatch = { ...decision.patch };
+  const unchanged = (current: PodRow["pod"] | undefined) =>
+    current !== undefined &&
+    current.rev === row.pod.rev &&
+    current.k8sName === row.pod.k8sName &&
+    current.desired === row.pod.desired;
+
+  let keys: Awaited<ReturnType<typeof podKeysOf>> | undefined;
+  if (decision.apply) {
+    // The keyed hosts are read at every apply: a host bound or connected later reaches
+    // the sandbox's rules on its next start, resume or reset.
+    try {
+      keys = await podKeysOf(ctx, {
+        sandboxId,
+        ...(row.ownerUserId === undefined ? {} : { owner: row.ownerUserId }),
+        ...(config.limits?.network === undefined ? {} : { ceiling: config.limits.network }),
+      });
+    } catch (error) {
+      ctx.config.logger.warn("sandbox keys unread", {
+        sandboxId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return { retryAfterMs: decision.retryAfterMs ?? hostTuning().pods.reconcileRetryMs };
+    }
+  }
+
+  // A new join token is recorded before the service writes it to the Sandbox's Secret.
+  let joinToken: string | undefined;
+  let rev = patch.rev ?? row.pod.rev;
+  if (decision.apply?.rotateJoin) {
+    joinToken = randomBytes(32).toString("base64url");
+    rev += 1;
+    const recorded = await ctx.store.tx(async (t) => {
+      const current = await t.environment(sandboxId, { lock: true });
+      if (!unchanged(current?.pod)) return false;
+      await t.updateEnvironmentPod(
+        sandboxId,
+        { joinTokenHash: sha256Hex(joinToken!), rev },
+        new Date().toISOString(),
+      );
+      return true;
+    });
+    if (!recorded) return { retryAfterMs: 0 };
+    row.pod.rev = rev;
+    row.pod.joinTokenHash = sha256Hex(joinToken);
+    patch = { ...patch, rev };
+  }
+
+  for (const name of decision.delete) {
+    try {
+      await pods.client.delete(name, `${name}.delete`);
+    } catch (error) {
+      ctx.config.logger.warn("sandboxes service delete failed", {
+        sandboxId,
+        name,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (decision.apply) {
+    const spec = podSpecOf({
+      environmentId: sandboxId,
+      spec: podSandboxSpecOf(row.applied, effectiveSandboxConfig(config).limits.idle),
+      pod: { ...row.pod, rev },
+      config,
+      mode: decision.apply.mode,
+      harnessImage: pods.harnessImage,
+      harness: row.applied.harness,
+      ...(joinToken ? { joinToken } : {}),
+      keys,
+      ...(pods.computer ? { computer: true } : {}),
+    });
+    try {
+      await pods.client.put(row.pod.k8sName, spec);
+    } catch (error) {
+      ctx.config.logger.warn("sandboxes service apply failed", {
+        sandboxId,
+        name: row.pod.k8sName,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      // Nothing of the decision is written: the next reconcile decides again.
+      return { retryAfterMs: decision.retryAfterMs ?? hostTuning().pods.reconcileRetryMs };
+    }
+  }
+
+  const written = await ctx.store.tx(async (t) => {
+    const current = await t.environment(sandboxId, { lock: true });
+    if (!current?.pod) return { kind: "gone" as const };
+    if (!unchanged(current.pod)) return { kind: "changed" as const };
+    if (decision.removeRow) {
+      await t.deleteEnvironment(sandboxId);
+      return { kind: "removed" as const };
+    }
+    const epochMoved = patch.hostEpoch !== undefined && patch.hostEpoch !== null;
+    const finalPatch: SandboxPodPatch = {
+      ...patch,
+      ...(epochMoved ? { hostEpoch: current.pod.hostEpoch + 1 } : {}),
+    };
+    if (Object.keys(finalPatch).length > 0)
+      await t.updateEnvironmentPod(sandboxId, finalPatch, new Date().toISOString());
+    for (const item of decision.events) await t.agentEvent(sandboxId, item.type, item.payload as never);
+    if (epochMoved) await t.signal({ type: "host.revoked", sandboxId, epoch: finalPatch.hostEpoch! });
+    // A pod that failed to start on a new version goes back to the version it ran.
+    if (finalPatch.observed === "failed" && current.startCheck) {
+      const failed = (await t.environment(sandboxId, { lock: true }))!;
+      await revertStart(t, failed, finalPatch.reason ?? "The pod failed", new Date().toISOString());
+      return { kind: "changed" as const };
+    }
+    return { kind: "written" as const };
+  });
+  if (written.kind === "changed") return { retryAfterMs: 0 };
+  if (written.kind === "removed") {
+    await ctx.sandbox.removeSandbox(sandboxId).catch(() => undefined);
+    return {};
+  }
+  // A lost volume with a disk version starts again from the latest one.
+  if (patch.observed === "lost" && (await recoverLostVolume(ctx, sandboxId).catch(() => false)))
+    return { retryAfterMs: 0 };
+  return {
+    ...(decision.retryAfterMs === undefined ? {} : { retryAfterMs: decision.retryAfterMs }),
+    ...(decision.arm.length > 0 ? { arm: decision.arm } : {}),
+  };
+}

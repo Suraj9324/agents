@@ -1,0 +1,344 @@
+/**
+ * The engine in a pod sandbox: its credentials. It holds no harness token. Before
+ * each connection to the Harness API it renews its host token (`host/renew`), or, with none or
+ * one refused (its epoch moved), exchanges the join token mounted in the pod (`host/join`,
+ * read afresh each time: a reset writes a new one). The egress token minted with the host token
+ * is the password of the proxy every command gets (`proxyEnv`); both are renewed every
+ * `RENEW_MS`, well inside their 15-minute life.
+ *
+ * The join answer also carries the installation's egress CA. The engine writes it,
+ * after the public roots, to a trust bundle on the pod (`caBundleFile`) and points every
+ * command's trust variables at it, so a CLI trusts the leaf egress-gate presents for a host an
+ * `environment_secret` is bound to. The bundle is rewritten only when the CA changes.
+ */
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { rootCertificates } from "node:tls";
+import { dirname } from "node:path";
+import type { PodHostConfig } from "../host/stack-config.js";
+import { hostTuning } from "../tuning.js";
+
+interface Held {
+  readonly hostToken: string;
+  readonly egressToken: string;
+  readonly epoch: number;
+  readonly expiresAt: number;
+  readonly caCertificate?: string;
+}
+
+/** What to run and copy on a new disk (`sandbox/setup.ts` in core), from the join answer. */
+export interface DiskSetup {
+  readonly recipeVersion: number;
+  /** The sha256 of the commands and files: a marker with another runs the setup again. */
+  readonly setupHash?: string;
+  readonly commands: readonly { readonly command: string; readonly cwd: string; readonly timeoutMs: number }[];
+  readonly files: readonly { readonly index: number; readonly path: string }[];
+  readonly environment: Readonly<Record<string, string>>;
+}
+
+/** How a setup ended, as the engine reports it. */
+export interface DiskSetupReport {
+  readonly status: "ok" | "failed";
+  readonly index?: number;
+  readonly exitCode?: number;
+  readonly output?: string;
+}
+
+/** The variables CLIs read their trust bundle from: OpenSSL, Node, Python, curl, git, AWS. */
+export const TRUST_VARIABLES = [
+  "SSL_CERT_FILE",
+  "NODE_EXTRA_CA_CERTS",
+  "REQUESTS_CA_BUNDLE",
+  "CURL_CA_BUNDLE",
+  "GIT_SSL_CAINFO",
+  "AWS_CA_BUNDLE",
+] as const;
+
+export interface PodHost {
+  /**
+   * A current host token, for the next connection. Throws when neither renewal nor join works,
+   * or when `signal` drops the attempt.
+   */
+  token(signal?: AbortSignal): Promise<string>;
+  /** `HTTPS_PROXY` and friends with the current egress token; none before the first join. */
+  proxyEnv(): Record<string, string>;
+  /** The host epoch of the tokens held. */
+  readonly epoch: number | undefined;
+  /** The disk's setup from the last join, if its recipe has one. */
+  readonly setup: DiskSetup | undefined;
+  /** The last join's volume starts from a disk version core writes: no setup runs on it… */
+  readonly seeded: boolean;
+  /**
+   * …unless it is a fork onto other setup: the setup runs once core has written the
+   * version, which it does through this engine's connection, so the engine connects first.
+   */
+  readonly afterSeed: boolean;
+  /** Whether to run the setup again after a failure, with the plan to run now. */
+  setupState(): Promise<{ retry: boolean; setup?: DiskSetup }>;
+  /** Reports how the setup ended. */
+  reportSetup(report: DiskSetupReport): Promise<void>;
+  /** Input file `index` (a file's bytes or a folder's listing), or one file of a folder. */
+  setupFile(index: number, path?: string): Promise<Response>;
+  stop(): void;
+}
+
+class Refused extends Error {}
+
+/**
+ * The engine's first join, tried again while the edge can't be reached. On Agent Substrate a new
+ * actor can start before its egress policy reaches the egress gateway, so its first request to
+ * the edge fails at the network ("fetch failed"), and an engine that then exited stayed down: an
+ * actor's main process is not restarted the way a pod's container is (2 of 3 first starts on
+ * a GitHub runner). A refusal (400, 401) is final at once; anything else is tried again with a
+ * pause from 250 ms doubling to 5 s, until `budgetMs` (default 4 min, inside the Runtime's 5-minute
+ * ready deadline) has passed.
+ */
+export async function firstJoin(
+  host: Pick<PodHost, "token">,
+  log: (message: string, fields: Record<string, unknown>) => void,
+  options: { budgetMs?: number; firstWaitMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number } = {},
+): Promise<void> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + (options.budgetMs ?? 240_000);
+  let wait = options.firstWaitMs ?? 250;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await host.token();
+      return;
+    } catch (error) {
+      if (error instanceof Refused || now() + wait > deadline) throw error;
+      log("sandbox_join_retry", { attempt, waitMs: wait, error: error instanceof Error ? error.message : String(error) });
+      await sleep(wait);
+      wait = Math.min(wait * 2, 5_000);
+    }
+  }
+}
+
+/** Whether `error` is the Runtime refusing a join or a renewal (final), not the network. */
+export function isRefused(error: unknown): boolean {
+  return error instanceof Refused;
+}
+
+export function podHost(
+  config: PodHostConfig,
+  logger: { info(message: string, fields?: Record<string, unknown>): void; warn(message: string, fields?: Record<string, unknown>): void },
+  options: {
+    fetch?: typeof fetch;
+    renewMs?: number;
+    /** Where the engine keeps the volume's id (on the volume): a new volume gets a new one. */
+    volumeFile?: string;
+    /** Where the engine writes the trust bundle: the public roots and the egress CA. */
+    caBundleFile?: string;
+    /**
+     * Agent Substrate's egress CA (`NYLORUN_SANDBOX_EGRESS_CA_FILE`): Substrate's egress
+     * ends TLS for the hosts whose keys it adds, so commands trust it with no proxy in between.
+     */
+    extraCaFile?: string;
+  } = {},
+): PodHost {
+  const call = options.fetch ?? fetch;
+  let held: Held | undefined;
+  let setup: DiskSetup | undefined;
+  let seeded = false;
+  let afterSeed = false;
+  /** The CA in the bundle on disk, once one is written. */
+  let bundled: string | undefined;
+
+  const post = async (path: string, init: { body?: unknown; bearer?: string }, signal?: AbortSignal): Promise<Held> => {
+    const timeout = AbortSignal.timeout(hostTuning().harness.podJoinTimeoutMs);
+    const response = await call(`${config.httpUrl}/nylorun/harness/v1/host/${path}`, {
+      method: "POST",
+      headers: {
+        ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+        ...(init.bearer ? { authorization: `Bearer ${init.bearer}` } : {}),
+      },
+      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
+    });
+    const text = await response.text();
+    if (response.status === 401 || response.status === 400) throw new Refused(`host/${path} refused: ${response.status}`);
+    if (!response.ok) throw new Error(`host/${path} answered ${response.status}`);
+    const body = JSON.parse(text) as {
+      hostToken: string;
+      egressToken: string;
+      epoch: number;
+      expiresAt: string;
+      caCertificate?: string;
+      setup?: DiskSetup;
+      seeded?: boolean;
+      afterSeed?: boolean;
+    };
+    if (typeof body.caCertificate === "string" || options.extraCaFile) await writeBundle(body.caCertificate ?? "");
+    if (path === "join") {
+      setup = body.setup;
+      seeded = body.seeded === true;
+      afterSeed = body.afterSeed === true;
+    }
+    return {
+      hostToken: body.hostToken,
+      egressToken: body.egressToken,
+      epoch: body.epoch,
+      expiresAt: Date.parse(body.expiresAt),
+      ...(typeof body.caCertificate === "string" ? { caCertificate: body.caCertificate } : {}),
+    };
+  };
+
+  const writeBundle = async (ca: string): Promise<void> => {
+    const file = options.caBundleFile;
+    let extra = "";
+    if (options.extraCaFile) {
+      try {
+        extra = (await readFile(options.extraCaFile, "utf8")).trim();
+      } catch {
+        // Not mounted (yet): the bundle holds the roots and the join's CA.
+      }
+    }
+    const content = [ca.trim(), extra].filter((part) => part !== "").join("\n");
+    if (!file || content === bundled) return;
+    await mkdir(dirname(file), { recursive: true });
+    // Written beside it and renamed, so a command never reads half a bundle.
+    const next = `${file}.${randomUUID()}`;
+    await writeFile(next, `${rootCertificates.join("\n")}\n${content}\n`, { mode: 0o644 });
+    await rename(next, file);
+    bundled = content;
+  };
+
+  /** The volume's id, created on a volume that has none. */
+  const volumeId = async (): Promise<string | undefined> => {
+    const file = options.volumeFile;
+    if (!file) return undefined;
+    try {
+      return (await readFile(file, "utf8")).trim();
+    } catch {
+      const id = randomUUID();
+      await mkdir(dirname(file), { recursive: true });
+      await writeFile(file, `${id}\n`, { mode: 0o600 });
+      return id;
+    }
+  };
+
+  const join = async (signal?: AbortSignal): Promise<Held> => {
+    const joinToken = (await readFile(config.joinFile, "utf8")).trim();
+    const volume = await volumeId();
+    held = await post(
+      "join",
+      {
+        body: {
+          sandboxId: config.sandboxId,
+          podUid: config.podUid,
+          joinToken,
+          ...(volume === undefined ? {} : { volumeId: volume }),
+        },
+      },
+      signal,
+    );
+    logger.info("sandbox_host_joined", { sandboxId: config.sandboxId, epoch: held.epoch });
+    return held;
+  };
+
+  /** A request with a current host token: the held one, renewed near expiry, or a new join. */
+  const authorized = async (path: string, init: RequestInit): Promise<Response> => {
+    const current =
+      held && held.expiresAt - Date.now() > hostTuning().harness.podRenewEarlyMs
+        ? held
+        : ((await renew()) ?? (await join()));
+    return call(`${config.httpUrl}/nylorun/harness/v1/host/${path}`, {
+      ...init,
+      headers: { ...(init.headers as Record<string, string> | undefined), authorization: `Bearer ${current.hostToken}` },
+      signal: AbortSignal.timeout(hostTuning().harness.podRequestTimeoutMs),
+    });
+  };
+
+  const renew = async (signal?: AbortSignal): Promise<Held | undefined> => {
+    if (!held) return undefined;
+    try {
+      held = await post("renew", { bearer: held.hostToken }, signal);
+      return held;
+    } catch (error) {
+      if (error instanceof Refused) {
+        logger.warn("sandbox_host_renew_refused", { sandboxId: config.sandboxId, epoch: held.epoch });
+        held = undefined;
+        return undefined;
+      }
+      throw error;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void renew().catch((error: unknown) =>
+      logger.warn("sandbox_host_renew_failed", { message: error instanceof Error ? error.message : String(error) }),
+    );
+  }, options.renewMs ?? hostTuning().harness.podRenewMs);
+  timer.unref();
+
+  return {
+    async token(signal?: AbortSignal) {
+      const current = (await renew(signal)) ?? (await join(signal));
+      return current.hostToken;
+    },
+    proxyEnv(): Record<string, string> {
+      if (!held) return {};
+      const trustOnly =
+        bundled !== undefined && options.caBundleFile
+          ? Object.fromEntries(TRUST_VARIABLES.map((name) => [name, options.caBundleFile!]))
+          : {};
+      // On Agent Substrate there is no proxy: Substrate's egress adds keys on its own,
+      // and commands only need to trust its CA.
+      if (!config.egressProxy) return options.extraCaFile ? trustOnly : {};
+      const url = new URL(config.egressProxy);
+      url.username = "nylorun";
+      url.password = held.egressToken;
+      const proxy = url.toString().replace(/\/$/, "");
+      const trust =
+        bundled !== undefined && options.caBundleFile
+          ? Object.fromEntries(TRUST_VARIABLES.map((name) => [name, options.caBundleFile!]))
+          : {};
+      return {
+        ...trust,
+        HTTPS_PROXY: proxy,
+        HTTP_PROXY: proxy,
+        https_proxy: proxy,
+        http_proxy: proxy,
+        NO_PROXY: "localhost,127.0.0.1",
+        no_proxy: "localhost,127.0.0.1",
+        // Node's fetch (and corepack's pnpm and yarn) use the proxy only with this set; the engine
+        // drops `*_PROXY` names from the image's own environment, so it comes from here.
+        NODE_USE_ENV_PROXY: "1",
+      };
+    },
+    get epoch() {
+      return held?.epoch;
+    },
+    get setup() {
+      return setup;
+    },
+    get seeded() {
+      return seeded;
+    },
+    get afterSeed() {
+      return afterSeed;
+    },
+    async setupState() {
+      const response = await authorized("setup", { method: "GET" });
+      if (!response.ok) throw new Error(`host/setup answered ${response.status}`);
+      return (await response.json()) as { retry: boolean; setup?: DiskSetup };
+    },
+    async reportSetup(report) {
+      const response = await authorized("setup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(report),
+      });
+      await response.body?.cancel();
+      if (!response.ok) throw new Error(`host/setup answered ${response.status}`);
+    },
+    setupFile(index, path) {
+      const suffix = path === undefined ? "" : `/${path.split("/").map(encodeURIComponent).join("/")}`;
+      return authorized(`files/${index}${suffix}`, { method: "GET" });
+    },
+    stop() {
+      clearInterval(timer);
+    },
+  };
+}

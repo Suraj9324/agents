@@ -1,0 +1,550 @@
+/**
+ * Pod Agents in the Runtime (S3–S8, protocol 16; pod Environments from protocol 11) against
+ * an in-memory sandboxes service (`fake-sandboxes.ts`): create at once, join → host token, a turn
+ * whose harness runs in the pod (its own engine, the `local` backend, over the Harness API
+ * listener with a host token), relaunch, stop, idle, a pod that moves at its next start, PVC
+ * loss → `agent.lost`, reset, delete.
+ */
+import { providerModelGate } from "../../src/gates/provider-gate.js";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { Agent } from "@nylorun/core/define";
+import type { RuntimeSection } from "@nylorun/core/contracts";
+import type { ModelProvider } from "../../src/core/provider.js";
+import { localBackend } from "../../src/adapters/sandbox/local.js";
+import { startHarnessListener, type HarnessListener } from "../../src/harness-api/ws-server.js";
+import { podHost } from "../../src/harness/pod.js";
+import { startHarnessService, type HarnessService } from "../../src/harness/service.js";
+import { HostAuthError, type HostAuthority } from "../../src/sandbox/join.js";
+import { podName } from "../../src/sandbox/pods/name.js";
+import { fakeSandboxes, type FakeSandboxes } from "../support/fake-sandboxes.js";
+import { attachHost } from "../support/custom-harness.js";
+import { startTestTenant } from "../support/tenant.js";
+import { deploy, manifestOf, saveManifest, writeManifest } from "../support/agents.js";
+
+const APP = "sandbox-pods-app-key-aaaaaaaaaaaaa";
+const KEK = Buffer.alloc(32, 7).toString("base64");
+
+let runtime: Awaited<ReturnType<typeof startTestTenant>>;
+let fake: FakeSandboxes;
+let hosts: HostAuthority;
+let listener: HarnessListener;
+let tenantId: string;
+
+/** The pod engine's model: one bash call per turn, then a text answer with what it printed. */
+const podModel: ModelProvider = async (effect) => {
+  const prompt = (effect.input as { prompt?: { kind?: string; content?: unknown }[] }).prompt ?? [];
+  const last = prompt.at(-1);
+  if (last?.kind === "tool-result") return { output: [{ type: "text", text: `ran: ${JSON.stringify(last.content)}` }] };
+  return {
+    output: [{ type: "tool-call", id: `call-${effect.turnId}`, name: "bash", args: { command: "echo pod > from-pod.txt; pwd" } }],
+  };
+};
+/** The Runtime's own harness answers without tools: a turn it ran would write nothing. */
+const coreModel: ModelProvider = async () => ({ output: [{ type: "text", text: "core" }] });
+
+async function call(method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
+  const response = await fetch(`${runtime.url}${path}`, {
+    method,
+    headers: {
+      // The Tenant's settings are the Management API's (protocol 8).
+      authorization: `Bearer ${path.startsWith("/v1/tenant") ? runtime.managementKey : APP}`,
+      "content-type": "application/json",
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const text = await response.text();
+  try {
+    return { status: response.status, body: JSON.parse(text) };
+  } catch {
+    return { status: response.status, body: text };
+  }
+}
+const path = (id: string) => `/v1/agents/${encodeURIComponent(id)}`;
+const headers = { authorization: `Bearer ${APP}`, "content-type": "application/json" };
+const bot = Agent({ id: "bot", name: "Bot" }).instructions("Work in the sandbox.").build();
+/** The agent manifest an Agent id names here: the id with `-` for `/`. */
+const manifestName = (id: string) => id.replaceAll("/", "-");
+/** Saves agent manifest `name`: bot's loop on `section`. */
+const save = (name: string, section: RuntimeSection) =>
+  writeManifest(runtime.url, headers, manifestOf(bot, { name, runtime: section }));
+
+async function until<T>(what: string, read: () => Promise<T>, ok: (value: T) => boolean, ms = 20_000): Promise<T> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const value = await read();
+    if (ok(value)) return value;
+    if (Date.now() > deadline) throw new Error(`${what}: ${JSON.stringify(value)}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+const view = async (id: string) => (await call("GET", path(id))).body;
+const events = async (id: string) =>
+  ((await call("GET", `${path(id)}/events`)).body.events as { type: string; payload: any }[]).map((event) => event.type);
+const reconcile = (id: string) => runtime.handle.worker!.sandbox!(id, "reconcile", new AbortController().signal);
+
+let messages = 0;
+async function message(sessionId: string) {
+  messages += 1;
+  return call("POST", `/v1/sessions/${sessionId}/commands`, {
+    type: "message",
+    requestId: `m${messages}`,
+    idempotencyKey: `m${messages}`,
+    content: "go",
+  });
+}
+async function open(id: string, agent: string) {
+  return call("PUT", `/v1/sessions/${id}`, { requestId: `open-${id}`, agent, ownerUserId: "app:ada" });
+}
+async function settled(sessionId: string): Promise<any> {
+  return until("session settles", async () => (await call("GET", `/v1/sessions/${sessionId}`)).body, (body) =>
+    ["completed", "failed", "cancelled"].includes(body.status), 60_000);
+}
+
+/** Saves a pod manifest for `id`, makes the pod Agent and waits until the fake runs its pod. */
+async function createPod(id: string, section: Omit<RuntimeSection, "kind"> = {}) {
+  const saved = await save(manifestName(id), { kind: "pod", ...section });
+  expect(saved.status, JSON.stringify(saved.body)).toBe(200);
+  const created = await until(
+    "created",
+    () => call("PUT", path(id), { manifest: manifestName(id) }),
+    (reply) => reply.status !== 409,
+  );
+  expect(created.status, JSON.stringify(created.body)).toBe(200);
+  const name = podName(tenantId, id, created.body.compute.pod.volumeGeneration);
+  await until("the pod runs", async () => fake.podUid(name), (uid) => uid !== undefined);
+  return { name, view: created.body };
+}
+
+async function joinAs(id: string, name: string, podUid = fake.podUid(name)!) {
+  return hosts.join({ sandboxId: id, podUid, joinToken: fake.joinToken(name)! });
+}
+
+beforeAll(async () => {
+  fake = fakeSandboxes();
+  runtime = await startTestTenant({
+    applicationKey: APP,
+    vaultKek: KEK,
+    modelProvider: coreModel,
+    sandbox: { backend: "virtual" },
+    pods: { client: fake, harnessImage: "nylorun-runtime:test" },
+  });
+  hosts = runtime.handle.hostAuthority!()!;
+  tenantId = runtime.handle.envelope.id;
+  listener = await startHarnessListener({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [],
+    attach: async () => (channel, peer) => runtime.handle.attachHarness!(channel, peer),
+    hosts: async () => runtime.handle.hostAuthority?.(),
+    logger: { info: () => undefined, warn: () => undefined },
+  });
+  // Agent `bot`, of kind none.
+  await deploy(runtime.url, headers, bot);
+  expect(
+    (await call("PUT", "/v1/tenant/sandbox", { requestId: "cfg", limits: { idle: "2s" } })).status,
+  ).toBe(200);
+});
+
+afterAll(async () => {
+  await listener?.close();
+  await runtime?.close();
+});
+
+describe("pod Agents", { timeout: 90_000 }, () => {
+  it("reports the cluster", async () => {
+    const tenant = (await call("GET", "/v1/tenant/sandbox")).body;
+    expect(tenant.cluster).toEqual({
+      namespace: "nylorun-sbx-test",
+      context: "fake",
+      ready: true,
+      backend: "agent-sandbox",
+      controllerVersion: "v1.0.10",
+      networkPolicy: { enforced: true, probedAt: new Date(0).toISOString() },
+    });
+    expect(tenant.effective.placement).toEqual({ "*": { hosts: ["harness-container", "sandbox"] } });
+  });
+
+  it("creates a pod at once; its join token becomes a host token bound to the pod", async () => {
+    const { name, view: created } = await createPod("join/one", { image: "node:24-slim", network: { allowedHosts: ["pypi.org"] } });
+    expect(created).toMatchObject({
+      kind: "pod",
+      manifest: "join-one",
+      resolvedVersion: 1,
+      runtime: { image: "node:24-slim", network: { allowedHosts: ["pypi.org"] } },
+      compute: { state: "creating", pod: { desired: "running", volumeGeneration: 0 } },
+    });
+    const put = fake.calls.find((item) => item.method === "PUT" && item.name === name)!;
+    expect(put.spec).toMatchObject({ mode: "Running", image: "node:24-slim", harnessImage: "nylorun-runtime:test", env: { NYLORUN_SANDBOX_ID: "join/one" } });
+    expect(put.spec!.joinToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    await expect(hosts.join({ sandboxId: "join/one", podUid: fake.podUid(name)!, joinToken: "wrong" })).rejects.toBeInstanceOf(HostAuthError);
+    // A token copied to another pod is refused: the UID must be the Sandbox's current pod.
+    await expect(joinAs("join/one", name, "another-pod")).rejects.toMatchObject({ status: 401 });
+    const first = await joinAs("join/one", name);
+    expect(first.epoch).toBe(1);
+    expect((await hosts.renew(first.hostToken)).epoch).toBe(1);
+    await until("observed running", () => view("join/one"), (body) => body.compute.pod.observed === "running");
+    // The join is what made it running: its awake time starts there.
+    expect(await events("join/one")).toEqual(["agent.created", "agent.resumed", "agent.running"]);
+
+    // Relaunch: a new pod on the same volume joins; the old pod's tokens stop working.
+    const uid = fake.relaunch(name);
+    const second = await joinAs("join/one", name, uid);
+    expect(second.epoch).toBe(2);
+    await expect(hosts.renew(first.hostToken)).rejects.toMatchObject({ status: 401 });
+    await expect(hosts.verify(first.hostToken)).rejects.toBeInstanceOf(HostAuthError);
+    expect((await events("join/one")).at(-1)).toBe("agent.relaunched");
+  });
+
+  it("runs a turn in the pod's engine, never in the Runtime's harness", async () => {
+    const { name } = await createPod("run/one");
+    const workspace = await mkdtemp(join(tmpdir(), "nylorun-pod-ws-"));
+    const harnessRoot = await mkdtemp(join(tmpdir(), "nylorun-pod-harness-"));
+    const joinFile = join(harnessRoot, "join-token");
+    await writeFile(joinFile, fake.joinToken(name)!);
+    const host = podHost(
+      { sandboxId: "run/one", podUid: fake.podUid(name)!, joinFile, httpUrl: listener.url.replace(/^ws/, "http").replace(/\/nylorun.*$/, ""), blocked: [] },
+      { info: () => undefined, warn: () => undefined },
+    );
+    let service: HarnessService | undefined;
+    try {
+      service = startHarnessService({
+        url: listener.url,
+        token: () => host.token(),
+        paths: { sandboxes: join(harnessRoot, "sandboxes") },
+        modelGate: providerModelGate(podModel),
+        toolGate: {},
+        sandboxBackends: [localBackend({ workspace, env: { PATH: process.env.PATH }, proxyEnv: () => host.proxyEnv() })],
+        logger: { info: () => undefined, warn: () => undefined },
+        name: "pod",
+        backoff: { minMs: 50, maxMs: 200 },
+      });
+      await service.client.ready;
+      expect(host.epoch).toBeGreaterThan(0);
+      expect((await open("pod-s1", "run/one")).status).toBe(200);
+      expect((await message("pod-s1")).status).toBe(200);
+      const done = await settled("pod-s1");
+      expect(done.status).toBe("completed");
+      expect(await readFile(join(workspace, "from-pod.txt"), "utf8")).toBe("pod\n");
+      // The sandbox tool route reaches the pod's workspace too.
+      const read = await call("POST", "/v1/sessions/pod-s1/sandbox/read", { path: "from-pod.txt" });
+      expect(read.status, JSON.stringify(read.body)).toBe(200);
+      expect(JSON.stringify(read.body)).toContain("pod");
+    } finally {
+      host.stop();
+      await service?.stop(1_000);
+      await rm(workspace, { recursive: true, force: true });
+      await rm(harnessRoot, { recursive: true, force: true });
+    }
+    // With the pod gone, its workspace is unavailable rather than served elsewhere.
+    const refused = await call("POST", "/v1/sessions/pod-s1/sandbox/read", { path: "from-pod.txt" });
+    expect(refused.status).toBe(409);
+    expect(refused.body.code).toBe("agent_unavailable");
+  });
+
+  it("runs two sessions' turns at once in one pod's engine, their commands side by side", async () => {
+    const { name } = await createPod("run/two");
+    const workspace = await mkdtemp(join(tmpdir(), "nylorun-pod-ws-"));
+    const harnessRoot = await mkdtemp(join(tmpdir(), "nylorun-pod-harness-"));
+    const joinFile = join(harnessRoot, "join-token");
+    await writeFile(joinFile, fake.joinToken(name)!);
+    const host = podHost(
+      { sandboxId: "run/two", podUid: fake.podUid(name)!, joinFile, httpUrl: listener.url.replace(/^ws/, "http").replace(/\/nylorun.*$/, ""), blocked: [] },
+      { info: () => undefined, warn: () => undefined },
+    );
+    // a's command waits for the file b's command writes: it ends only if they run at once.
+    const commands: Record<string, string> = {
+      "pod-a": "for i in $(seq 1 200); do [ -f go ] && break; sleep 0.05; done; [ -f go ] && echo a > a.txt",
+      "pod-b": "echo b > b.txt; touch go",
+    };
+    const twoModel: ModelProvider = async (effect) => {
+      const prompt = (effect.input as { prompt?: { kind?: string }[] }).prompt ?? [];
+      if (prompt.at(-1)?.kind === "tool-result") return { output: [{ type: "text", text: "done" }] };
+      return { output: [{ type: "tool-call", id: `call-${effect.turnId}`, name: "bash", args: { command: commands[effect.sessionId]! } }] };
+    };
+    let service: HarnessService | undefined;
+    try {
+      service = startHarnessService({
+        url: listener.url,
+        token: () => host.token(),
+        paths: { sandboxes: join(harnessRoot, "sandboxes") },
+        modelGate: providerModelGate(twoModel),
+        toolGate: {},
+        sandboxBackends: [localBackend({ workspace, env: { PATH: process.env.PATH }, proxyEnv: () => host.proxyEnv() })],
+        logger: { info: () => undefined, warn: () => undefined },
+        name: "pod",
+        backoff: { minMs: 50, maxMs: 200 },
+      });
+      await service.client.ready;
+      expect((await open("pod-a", "run/two")).status).toBe(200);
+      expect((await open("pod-b", "run/two")).status).toBe(200);
+      expect((await message("pod-a")).status).toBe(200);
+      // The second session's turn starts while the first runs.
+      expect((await message("pod-b")).status).toBe(200);
+      expect((await settled("pod-a")).status).toBe("completed");
+      expect((await settled("pod-b")).status).toBe("completed");
+      expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("a\n");
+      expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("b\n");
+    } finally {
+      host.stop();
+      await service?.stop(1_000);
+      await rm(workspace, { recursive: true, force: true });
+      await rm(harnessRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("stops on request and when idle, and asks the pod to run again at the next turn", async () => {
+    const { name } = await createPod("idle/one");
+    await joinAs("idle/one", name);
+    const stopped = await call("POST", `${path("idle/one")}/stop`);
+    expect(stopped.status).toBe(200);
+    expect(stopped.body.compute.pod.desired).toBe("suspended");
+    await until("suspended", () => view("idle/one"), (body) => body.compute.pod.observed === "suspended");
+    expect((await view("idle/one")).compute.state).toBe("stopped");
+    expect(fake.calls.filter((item) => item.name === name).at(-1)?.spec?.mode).toBe("Suspended");
+    expect(await events("idle/one")).toContain("agent.suspended");
+    // The next turn start asks for Running again.
+    expect((await open("idle-s1", "idle/one")).status).toBe(200);
+    expect((await message("idle-s1")).status).toBe(200);
+    await until("resumed", async () => fake.podUid(name), (uid) => uid !== undefined);
+    await call("POST", "/v1/sessions/idle-s1/commands", { type: "cancel", requestId: "c-idle", idempotencyKey: "c-idle" });
+    await settled("idle-s1");
+
+    // Idle (the Tenant's limits.idle is 2 s): suspended with reason idle.
+    const { name: other } = await createPod("idle/two");
+    await until("idle suspended", () => view("idle/two"), (body) => body.compute.pod.desired === "suspended", 30_000);
+    const types = await events("idle/two");
+    expect(types).toContain("agent.suspended");
+    await until("pod gone", async () => fake.podUid(other), (uid) => uid === undefined);
+  });
+
+  it("moves a pod at its next start, on the same volume; its kind and storage are fixed", async () => {
+    const { name } = await createPod("recipe/one", { storage: "5GiB" });
+    await joinAs("recipe/one", name);
+    // Another manifest is refused, naming the fork.
+    await saveManifest(runtime.url, headers, manifestOf(bot, { name: "recipe-virtual", runtime: { kind: "virtual" } }));
+    const other = await call("PUT", path("recipe/one"), { manifest: "recipe-virtual" });
+    expect(other.status).toBe(409);
+    expect(other.body).toMatchObject({ code: "agent_fixed_field", details: { fields: [{ field: "manifest" }] } });
+    expect(other.body.message).toContain("/fork");
+    // The Tenant's limits.idle (2s) is the most a manifest may ask for: refused at save.
+    expect((await save("recipe-one", { kind: "pod", storage: "5GiB", lifecycle: { idle: "1h" } })).status).toBe(400);
+    // A version with other storage cannot move it: the tracking Agent stays on version 1.
+    const newer = await save("recipe-one", { kind: "pod", storage: "10GiB" });
+    expect(newer.status, JSON.stringify(newer.body)).toBe(200);
+    expect(newer.body.warnings.map((warning: { code: string }) => warning.code)).toContain("agents_behind");
+    expect(await view("recipe/one")).toMatchObject({ resolvedVersion: 1, targetVersion: null, runtime: { storage: "5GiB" } });
+    const plan = await call("PUT", `${path("recipe/one")}?dryRun=true`, { manifest: "recipe-one@2" });
+    expect(plan.body).toMatchObject({ dryRun: true, plan: { from: 1, to: 2, applies: "refused", refusals: [{ field: "storage", from: "5GiB", to: "10GiB" }] } });
+    const pinned = await call("PUT", path("recipe/one"), { manifest: "recipe-one@2" });
+    expect(pinned.status).toBe(409);
+    expect(pinned.body).toMatchObject({ code: "agent_fixed_field", details: { fields: [{ field: "storage" }] } });
+    // A new image waits for the pod's next start: the Agent is outdated meanwhile.
+    const image = await save("recipe-one", { kind: "pod", storage: "5GiB", image: "node:24-slim", network: { allowedHosts: ["pypi.org"] } });
+    expect(image.body.warnings.find((warning: { code: string }) => warning.code === "agents_move")?.message).toContain("1 at their pod's next start");
+    expect(await view("recipe/one")).toMatchObject({ resolvedVersion: 1, targetVersion: 3, waitingFor: "start", runtime: { storage: "5GiB" } });
+    expect((await call("GET", "/v1/agents?outdated=true")).body.agents.map((agent: { id: string }) => agent.id)).toEqual(["recipe/one"]);
+    const before = fake.calls.filter((item) => item.method === "PUT" && item.name === name).length;
+    expect((await call("POST", `${path("recipe/one")}/stop`)).status).toBe(200);
+    await until("suspended", () => view("recipe/one"), (body) => body.compute.pod.observed === "suspended");
+    // The next turn start applies it: the same pod name (same volume), the new image.
+    expect((await open("recipe-s1", "recipe/one")).status).toBe(200);
+    expect((await message("recipe-s1")).status).toBe(200);
+    await until(
+      "the pod runs again",
+      async () => fake.calls.filter((item) => item.method === "PUT" && item.name === name).slice(before),
+      (calls) => calls.some((item) => item.spec?.mode === "Running"),
+    );
+    const running = fake.calls.filter((item) => item.method === "PUT" && item.name === name).slice(before);
+    expect(running.filter((item) => item.spec?.mode === "Running").every((item) => item.spec?.image === "node:24-slim")).toBe(true);
+    expect(await view("recipe/one")).toMatchObject({
+      resolvedVersion: 3,
+      targetVersion: null,
+      waitingFor: null,
+      runtime: { storage: "5GiB", image: "node:24-slim", network: { allowedHosts: ["pypi.org"] } },
+    });
+    expect(await events("recipe/one")).toEqual(expect.arrayContaining(["agent.outdated", "agent.version_changed"]));
+    await call("POST", "/v1/sessions/recipe-s1/commands", { type: "cancel", requestId: "c-recipe", idempotencyKey: "c-recipe" });
+    await settled("recipe-s1");
+  });
+
+  it("stops and resets only a pod: kinds virtual and none are a 400", async () => {
+    for (const kind of ["virtual", "none"] as const) {
+      const id = `kinds/${kind}`;
+      expect((await save(manifestName(id), { kind })).status).toBe(200);
+      expect((await call("PUT", path(id), { manifest: manifestName(id) })).status).toBe(200);
+      for (const action of ["stop", "reset"]) {
+        const refused = await call("POST", `${path(id)}/${action}`);
+        expect(refused.status, `${kind} ${action}`).toBe(400);
+        expect(refused.body.message).toContain("only a pod Agent stops and resets");
+      }
+    }
+  });
+
+  it("records a drain once, when the moved pod's engine connects again (suspend before drain)", async () => {
+    const { name } = await createPod("drain/one");
+    await joinAs("drain/one", name);
+    const cleanups: (() => unknown)[] = [];
+    const drains = async () =>
+      ((await call("GET", `${path("drain/one")}/events`)).body.events as { type: string; payload: any }[]).filter(
+        (event) => event.type === "agent.suspended" && event.payload?.reason === "drain",
+      ).length;
+    try {
+      // Running with its engine connected: the sweep leaves it alone.
+      attachHost(runtime, "drain/one", cleanups);
+      await until("running", async () => (await view("drain/one")).compute.pod.observed, (observed) => observed === "running");
+      // Let the start's last polls finish: from here only a timer or a signal reconciles it.
+      await new Promise((resolve) => setTimeout(resolve, 8_000));
+      // Agent Substrate suspended it as its worker stopped and resumed it on another worker. Its
+      // engine is the same process, connected again; nothing has looked at the pod yet.
+      fake.sandboxes.get(name)!.drainedAt = new Date().toISOString();
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      expect(await drains()).toBe(0);
+      // The restored engine redials with its host token (no join): that asks for a reconcile.
+      attachHost(runtime, "drain/one", cleanups);
+      await until("the drain recorded", drains, (n) => n === 1, 2_000);
+      // Another connect, or another reconcile, records nothing new.
+      attachHost(runtime, "drain/one", cleanups);
+      await reconcile("drain/one");
+      expect(await drains()).toBe(1);
+      expect(await events("drain/one")).not.toContain("agent.failed");
+    } finally {
+      for (const cleanup of cleanups) await cleanup();
+    }
+  });
+
+  it("is lost when its volume goes, refuses turns until a reset, which starts a new volume", async () => {
+    const { name } = await createPod("lost/one");
+    const joined = await joinAs("lost/one", name);
+    fake.losePvc(name);
+    await reconcile("lost/one");
+    const lost = await view("lost/one");
+    expect(lost.compute.pod).toMatchObject({ observed: "lost", reason: "The Agent's volume is gone" });
+    expect(lost.state).toBe("failing");
+    expect(lost.compute.pod.hostEpoch).toBeGreaterThan(joined.epoch);
+    expect(await events("lost/one")).toContain("agent.lost");
+    await expect(hosts.renew(joined.hostToken)).rejects.toBeInstanceOf(HostAuthError);
+    expect((await open("lost-s1", "lost/one")).status).toBe(200);
+    const refused = await message("lost-s1");
+    expect(refused.body.code).toBe("agent_lost");
+
+    const reset = await call("POST", `${path("lost/one")}/reset`);
+    expect(reset.status, JSON.stringify(reset.body)).toBe(200);
+    expect(reset.body.compute.pod).toMatchObject({ volumeGeneration: 1, observed: "creating" });
+    const next = podName(tenantId, "lost/one", 1);
+    await until("new pod", async () => fake.podUid(next), (uid) => uid !== undefined);
+    await until("old Sandbox deleted", async () => fake.sandboxes.has(name), (has) => !has);
+    expect(fake.joinToken(next)).not.toBe(fake.joinToken(name));
+    expect((await events("lost/one")).at(-1)).toBe("agent.reset");
+    expect((await joinAs("lost/one", next)).epoch).toBeGreaterThan(lost.compute.pod.hostEpoch);
+  });
+
+  it("gets a new volume when its Sandbox can't take the Runtime's template on the old one", async () => {
+    const { name } = await createPod("refused/one");
+    const joined = await joinAs("refused/one", name);
+    // A Runtime upgrade adds a volume its actor can't take: the next start is refused.
+    const why = "Agent Substrate cannot move this sandbox to the requested template: its volumes would change (adds skills)";
+    fake.refuseTemplate(name, why);
+    expect((await call("POST", `${path("refused/one")}/stop`)).status).toBe(200);
+    await until("suspended", () => view("refused/one"), (body) => body.compute.pod.observed === "suspended");
+    expect((await open("refused-s1", "refused/one")).status).toBe(200);
+    expect((await message("refused-s1")).status).toBe(200);
+    // No wait for the ready deadline, no reset by hand: a new volume, the next generation.
+    const next = podName(tenantId, "refused/one", 1);
+    await until("new pod", async () => fake.podUid(next), (uid) => uid !== undefined);
+    await until("old Sandbox deleted", async () => fake.sandboxes.has(name), (has) => !has);
+    const reset = (await call("GET", `${path("refused/one")}/events`)).body.events.findLast(
+      (item: { type: string }) => item.type === "agent.reset",
+    );
+    expect(reset.payload).toMatchObject({ volumeGeneration: 1, reason: "template" });
+    expect((await view("refused/one")).compute.pod.volumeGeneration).toBe(1);
+    expect((await joinAs("refused/one", next)).epoch).toBeGreaterThan(joined.epoch);
+    await call("POST", "/v1/sessions/refused-s1/commands", { type: "cancel", requestId: "c-refused", idempotencyKey: "c-refused" });
+    await settled("refused-s1");
+  });
+
+  it("fails a new volume its Sandbox refuses again, instead of making another", async () => {
+    const { name } = await createPod("refused/twice");
+    await joinAs("refused/twice", name);
+    fake.refuseTemplate(name, "its volumes would change (adds skills)");
+    // The new volume's Sandbox refuses too, from its first PUT: set before it can be made, so its
+    // first status can't come back ready.
+    const next = podName(tenantId, "refused/twice", 1);
+    fake.refuseTemplate(next, "its volumes would change (adds more)");
+    expect((await call("POST", `${path("refused/twice")}/stop`)).status).toBe(200);
+    await until("suspended", () => view("refused/twice"), (body) => body.compute.pod.observed === "suspended");
+    expect((await open("refused-s2", "refused/twice")).status).toBe(200);
+    expect((await message("refused-s2")).status).toBe(200);
+    await until("new Sandbox", async () => fake.sandboxes.has(next), (has) => has);
+    await reconcile("refused/twice");
+    const failed = await until("failed", () => view("refused/twice"), (body) => body.compute.pod.observed === "failed");
+    expect(failed.compute.pod).toMatchObject({ volumeGeneration: 1 });
+    expect(failed.compute.pod.reason).toContain("RepointRefused");
+    expect((await events("refused/twice")).filter((type) => type === "agent.reset")).toHaveLength(1);
+    await call("POST", "/v1/sessions/refused-s2/commands", { type: "cancel", requestId: "c-refused2", idempotencyKey: "c-refused2" });
+    await settled("refused-s2");
+  });
+
+  it("is lost when a pod joins from a replaced volume (a deleted claim recreated empty)", async () => {
+    const { name } = await createPod("lost/volume");
+    const join = (podUid: string, volumeId: string) =>
+      hosts.join({ sandboxId: "lost/volume", podUid, joinToken: fake.joinToken(name)!, volumeId });
+    const first = await join(fake.podUid(name)!, "vol-aaaa");
+    // A relaunch on the same volume joins.
+    const same = await join(fake.relaunch(name), "vol-aaaa");
+    expect(same.epoch).toBeGreaterThan(first.epoch);
+    // A pod on a new, empty volume does not.
+    await expect(join(fake.relaunch(name), "vol-bbbb")).rejects.toMatchObject({ status: 401 });
+    const lost = await view("lost/volume");
+    expect(lost.compute.pod).toMatchObject({ observed: "lost", reason: "The sandbox's volume was replaced: its files are gone" });
+    expect(await events("lost/volume")).toContain("agent.lost");
+    await expect(hosts.renew(same.hostToken)).rejects.toBeInstanceOf(HostAuthError);
+    await until("the Sandbox is deleted", async () => fake.sandboxes.has(name), (has) => !has);
+  });
+
+  it("refuses engine.images, and copies the engine into every image", async () => {
+    const refused = await call("PUT", "/v1/tenant/sandbox", { requestId: "engine-on", limits: { idle: "10m" }, engine: { images: ["ghcr.io/nylorun/bot-worker"] } });
+    expect(refused.status).toBe(400);
+    const { name } = await createPod("engine/one", { image: "ghcr.io/nylorun/bot-worker:0.38.0-beta" });
+    const spec = fake.calls.filter((item) => item.method === "PUT" && item.name === name).at(-1)!.spec;
+    expect(spec).toMatchObject({ image: "ghcr.io/nylorun/bot-worker:0.38.0-beta", harnessImage: "nylorun-runtime:test" });
+    expect(spec).not.toHaveProperty("entrypoint");
+  });
+
+  it("deletes the Sandbox, then the row", async () => {
+    const { name } = await createPod("gone/one");
+    expect((await call("DELETE", path("gone/one"))).body).toEqual({ id: "gone/one", deleted: true });
+    expect((await call("GET", path("gone/one"))).status).toBe(404);
+    await until("Sandbox deleted", async () => fake.sandboxes.has(name), (has) => !has);
+    await until("created again", () => call("PUT", path("gone/one"), { manifest: "gone-one" }), (reply) => reply.status === 200);
+  });
+
+  it("places sessions as the Tenant allows, and needs the sandboxes service up", async () => {
+    await createPod("place/one");
+    expect(
+      (await call("PUT", "/v1/tenant/sandbox", { requestId: "p1", limits: { idle: "2s" }, placement: { nylorun: { hosts: ["harness-container"] } } })).status,
+    ).toBe(200);
+    const refused = await open("place-s1", "place/one");
+    expect(refused.status).toBe(409);
+    expect(refused.body.code).toBe("placement_refused");
+    expect(
+      (await call("PUT", "/v1/tenant/sandbox", { requestId: "p2", limits: { idle: "2s" }, placement: { "*": { hosts: ["sandbox"] } } })).status,
+    ).toBe(200);
+    const plain = await open("place-s2", "bot");
+    expect(plain.body.code).toBe("placement_refused");
+    expect((await open("place-s3", "place/one")).status).toBe(200);
+    expect((await call("PUT", "/v1/tenant/sandbox", { requestId: "p3", limits: { idle: "2s" } })).status).toBe(200);
+    fake.down = true;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 5_100)); // the readiness cache
+      const down = await open("place-s4", "place/one");
+      expect(down.status).toBe(409);
+      expect(down.body.code).toBe("agent_unavailable");
+    } finally {
+      fake.down = false;
+    }
+  });
+});

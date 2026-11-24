@@ -1,0 +1,201 @@
+/**
+ * The sandboxes service's client: the Go service (`sandboxes/`) that alone holds
+ * the cluster credentials and drives agent-sandbox Sandboxes in the Tenant's namespace. Core
+ * reaches it at `NYLORUN_SANDBOXES_URL` with `NYLORUN_SANDBOXES_TOKEN`; nothing else does.
+ *
+ * Pull, not push: the service never calls core. Core reads a Sandbox's status when it
+ * reconciles (`GET /v1/pods/{name}`, optionally blocking with `?wait=`), and every change it
+ * asks for carries an operation id, so a retried `PUT` is a no-op.
+ */
+import { hostTuning, SANDBOXES_MAX_WAIT_MS } from "../../tuning.js";
+
+/** `PUT /v1/pods/{name}`: the Sandbox the service applies (`driver.Spec` in Go). */
+export interface PodSpec {
+  readonly opId: string;
+  readonly mode: "Running" | "Suspended";
+  /** The workload image; the service defaults it to `python:3.13-slim`. */
+  readonly image?: string;
+  /**
+   * What the workload runs: `engine` (default), our engine copied from `harnessImage`; or
+   * `image`, the image's own entrypoint, for a custom harness built into it. No image
+   * carries our engine.
+   */
+  readonly entrypoint?: "engine" | "image";
+  /** The Runtime image the engine is copied from; not with `entrypoint: "image"`. */
+  readonly harnessImage?: string;
+  /** Replaces the engine command (diagnostics). */
+  readonly command?: readonly string[];
+  readonly cpus?: number;
+  readonly memoryMiB?: number;
+  readonly storageGiB?: number;
+  readonly stopGraceSeconds?: number;
+  /** RFC 3339: the Sandbox expires then (agent-sandbox `shutdownTime`). */
+  readonly shutdownTime?: string;
+  readonly shutdownPolicy?: "Retain" | "Delete";
+  readonly env?: Readonly<Record<string, string>>;
+  /** Written to the Sandbox's join Secret before it is applied. */
+  readonly joinToken?: string;
+  /**
+   * The Agent's resolved network. agent-sandbox ignores it (egress-gate enforces it); the
+   * Substrate backend renders the actor's egress policy from it.
+   */
+  readonly network?: {
+    readonly preset: string;
+    readonly hosts: readonly string[];
+    readonly suffixes: readonly string[];
+  };
+  /**
+   * The hosts the sandbox has a key for, each with its header (`keys.ts`). agent-sandbox
+   * ignores them; on Agent Substrate each becomes an https rule the keys provider fills.
+   */
+  readonly keys?: {
+    readonly sandbox: string;
+    readonly hosts: readonly { readonly host: string; readonly header: string }[];
+  };
+}
+
+/** A Sandbox as the service's informers see it (`driver.Status` in Go). */
+export interface PodStatus {
+  readonly name: string;
+  readonly exists: boolean;
+  readonly deleting: boolean;
+  readonly mode?: string;
+  readonly ready: boolean;
+  readonly suspended: boolean;
+  readonly expired: boolean;
+  readonly podUID?: string;
+  readonly podPhase?: string;
+  /** The workload container's image as the node pulled it (`repo@sha256:…`), once it runs. */
+  readonly imageID?: string;
+  readonly volume: "present" | "missing";
+  readonly opId?: string;
+  readonly shutdownTime?: string;
+  readonly reason?: string;
+  readonly message?: string;
+  /**
+   * Agent Substrate: when the sandbox was last suspended because its worker stopped. While it
+   * moves to another worker, `reason` is `Moving`.
+   */
+  readonly drainedAt?: string;
+  /** With `?wait=`: whether the state was reached before the timeout. */
+  readonly met?: boolean;
+}
+
+/** `GET /v1/info`: the cluster `nylorun local sandbox enable` recorded. */
+export interface ClusterInfo {
+  readonly namespace: string;
+  readonly context: string;
+  readonly controllerVersion?: string;
+  readonly apiVersion?: string;
+  /** `agent-sandbox` (also when absent: older services) or `substrate` (preview). */
+  readonly backend?: "agent-sandbox" | "substrate";
+  readonly atespace?: string;
+  readonly hostAddress?: string;
+  readonly ports?: Readonly<Record<string, number>>;
+  readonly networkPolicy?: { readonly enforced: boolean; readonly probedAt?: string };
+}
+
+export type PodWait = "ready" | "suspended" | "expired" | "gone";
+
+export interface SandboxesClient {
+  /** Whether the service is up and its informers synced (`GET /ready`). Never throws. */
+  ready(signal?: AbortSignal): Promise<boolean>;
+  info(signal?: AbortSignal): Promise<ClusterInfo>;
+  put(name: string, spec: PodSpec, signal?: AbortSignal): Promise<PodStatus>;
+  status(
+    name: string,
+    options?: { wait?: PodWait; timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<PodStatus>;
+  delete(name: string, opId: string, signal?: AbortSignal): Promise<PodStatus>;
+}
+
+/** The service refused a request, or did not answer. */
+export class SandboxesError extends Error {
+  override readonly name = "SandboxesError";
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** The sandboxes service over HTTP. */
+export function httpSandboxesClient(options: {
+  readonly url: string;
+  readonly token: string;
+  readonly fetch?: typeof fetch;
+  /** Per request, unless the request waits longer. Default `pods.requestTimeoutMs` (Host tuning, 20 s). */
+  readonly timeoutMs?: number;
+}): SandboxesClient {
+  const base = options.url.replace(/\/+$/, "");
+  const call = options.fetch ?? fetch;
+  const request = async <T>(
+    method: string,
+    path: string,
+    init: { body?: unknown; signal?: AbortSignal; timeoutMs?: number; auth?: boolean } = {},
+  ): Promise<T> => {
+    const timeout = AbortSignal.timeout(init.timeoutMs ?? options.timeoutMs ?? hostTuning().pods.requestTimeoutMs);
+    const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+    let response: Response;
+    try {
+      response = await call(`${base}${path}`, {
+        method,
+        headers: {
+          ...(init.auth === false ? {} : { authorization: `Bearer ${options.token}` }),
+          ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+        signal,
+      });
+    } catch (error) {
+      throw new SandboxesError(
+        0,
+        "unreachable",
+        `The sandboxes service did not answer: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const text = await response.text();
+    let body: unknown;
+    try {
+      body = text === "" ? undefined : JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
+    if (!response.ok) {
+      const error = (body as { error?: { code?: string; message?: string } } | undefined)?.error;
+      throw new SandboxesError(
+        response.status,
+        error?.code ?? "error",
+        error?.message ?? `The sandboxes service answered ${response.status}`,
+      );
+    }
+    return body as T;
+  };
+  const pod = (name: string) => `/v1/pods/${encodeURIComponent(name)}`;
+  return {
+    async ready(signal) {
+      try {
+        await request("GET", "/ready", { auth: false, timeoutMs: hostTuning().pods.readyProbeTimeoutMs, ...(signal ? { signal } : {}) });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    info: (signal) => request("GET", "/v1/info", signal ? { signal } : {}),
+    put: (name, spec, signal) => request("PUT", pod(name), { body: spec, ...(signal ? { signal } : {}) }),
+    status(name, { wait, timeoutMs, signal } = {}) {
+      const tuning = hostTuning().pods;
+      // The service waits at most `SANDBOXES_MAX_WAIT_MS`; the answer has `waitSlackMs` to arrive.
+      const waitMs = Math.min(timeoutMs ?? tuning.waitMs, SANDBOXES_MAX_WAIT_MS);
+      const query = wait ? `?wait=${wait}&timeoutMs=${waitMs}` : "";
+      return request("GET", `${pod(name)}${query}`, {
+        ...(signal ? { signal } : {}),
+        ...(wait ? { timeoutMs: waitMs + tuning.waitSlackMs } : {}),
+      });
+    },
+    delete: (name, opId, signal) =>
+      request("DELETE", `${pod(name)}?opId=${encodeURIComponent(opId)}`, signal ? { signal } : {}),
+  };
+}

@@ -1,0 +1,310 @@
+/**
+ * A harness: one long-running client of the Harness API that leases runs and runs them. It says
+ * `hello`, then always keeps one `lease` request waiting while it has room. Each run gets its
+ * own abort controller: core's `cancel` aborts it with core's reason, a renewal core refuses
+ * with `ownership.lost`, and `stop()` with `shutdown`. While a run is live it renews its lease
+ * every `renewEveryMs`; renewing stops once the run is aborted.
+ */
+import {
+  DEFAULT_HARNESS,
+  HARNESS_API_VERSION,
+  type AbortReason,
+  type HarnessChannel,
+  type ResultOf,
+  type RunGrant,
+  type TurnStart,
+} from "@nylorun/core/harness-api";
+import { sandboxToolLimitsOf, type SandboxToolLimits } from "../tools/sandbox.js";
+import { DEFAULT_SKILL_READ_BYTES } from "../tools/skills.js";
+import { mcpToolConfigOf, type McpToolConfig } from "../tools/mcp.js";
+import { toolResultConfigOf, type ToolResultConfig } from "../tools/results.js";
+import { outputsConfigOf, type OutputsConfig } from "../tools/outputs.js";
+import { ABORT_MESSAGES, RunAbort } from "./abort.js";
+import type { HarnessExecutors, HarnessRun } from "./executors.js";
+import { runTurn } from "./run.js";
+import { TranscriptCache } from "./transcript-cache.js";
+import { loopConfigOf } from "../loop/config.js";
+import { DEFAULT_FLOW_VALUE_CHARS } from "../flow/limits.js";
+import type { CompactionConfig } from "../loop/compaction/config.js";
+
+/** The transcript cache's budget when the harness sets none, in MiB. */
+export const DEFAULT_TRANSCRIPT_CACHE_MB = 256;
+/** How soon a `lease` request that failed is sent again, by default. */
+export const DEFAULT_LEASE_RETRY_MS = 100;
+/**
+ * The waits before each resend of a tool call whose gate hop lost its answer, by default;
+ * the last repeats.
+ */
+export const DEFAULT_RESEND_DELAYS_MS: readonly number[] = Object.freeze([1_000, 2_000, 4_000]);
+
+export interface HarnessLogger {
+  warn(message: string, fields?: Record<string, unknown>): void;
+}
+
+export interface HarnessOptions {
+  readonly channel: HarnessChannel;
+  readonly executors: HarnessExecutors;
+  readonly logger?: HarnessLogger;
+  /** Runs held at once. Default: no limit. */
+  readonly maxRuns?: number;
+  /** Byte budget of the transcript cache, in MiB. Default `DEFAULT_TRANSCRIPT_CACHE_MB` (256). */
+  readonly transcriptCacheMb?: number;
+  /** How soon a `lease` request that failed is sent again. Default `DEFAULT_LEASE_RETRY_MS` (100 ms). */
+  readonly leaseRetryMs?: number;
+  /**
+   * The waits before each resend of a tool call whose gate hop lost its answer; the last
+   * repeats. Default `DEFAULT_RESEND_DELAYS_MS` (1, 2, then 4 s).
+   */
+  readonly resendDelaysMs?: readonly number[];
+  /**
+   * Compaction: the kept tail, the reply's reserve, the estimate. Each left out
+   * is its default (`DEFAULT_COMPACTION_CONFIG`).
+   */
+  readonly compaction?: Partial<CompactionConfig>;
+  /**
+   * How many characters of a failed agent-as-tool's last output its parent sees. Default
+   * `DEFAULT_PARTIAL_OUTPUT_CHARS` (4,000).
+   */
+  readonly partialOutputChars?: number;
+  /**
+   * How many characters of a value a flow's failure message quotes. Default
+   * `DEFAULT_FLOW_VALUE_CHARS` (80).
+   */
+  readonly flowValueChars?: number;
+  /**
+   * The most bytes one `read_artifact` page holds, escaped as JSON: what one call shows the model
+   * of a text artifact. Default `DEFAULT_ARTIFACT_PAGE_BYTES` (32 KiB). A page is also held to the
+   * run's `turn.start.limits.chunkBytes`.
+   */
+  readonly artifactPageBytes?: number;
+  /**
+   * The sandbox tools' limits, which our engine writes into their schemas: the `bash` timeouts,
+   * the `read` and `grep` counts. Each left out is its default (`DEFAULT_SANDBOX_TOOL_LIMITS`).
+   * The executors that run the calls take the same (`harnessExecutors({ sandboxTools })`).
+   */
+  readonly sandboxTools?: Partial<SandboxToolLimits>;
+  /**
+   * The most bytes of one skill file `load_skill` and `read_skill_resource` read into the model's
+   * context. Default `DEFAULT_SKILL_READ_BYTES` (10 MiB); an answer is also held to the run's
+   * `turn.start.limits.recordEntryBytes`, since it is one record entry.
+   */
+  readonly skillReadBytes?: number;
+  /**
+   * How our engine offers the session's MCP tools: when it defers them (`deferShare` of the
+   * model's context window at `charsPerToken`, `fallbackContextWindow` without a model), how much
+   * of a server's instructions the deferred tools' note shows, and `tool_search`'s limits. Each
+   * left out is its default (`DEFAULT_MCP_TOOL_CONFIG`).
+   */
+  readonly mcpTools?: Partial<McpToolConfig>;
+  /**
+   * How our engine shapes tool results before it records them: the inline cap, the preview's head
+   * and tail, the step budget (held under the run's `limits.recordEntryBytes` less
+   * `entryEnvelopeBytes`), the stub and the size never shaped. Each left out is its default
+   * (`DEFAULT_TOOL_RESULT_CONFIG`).
+   */
+  readonly toolResults?: Partial<ToolResultConfig>;
+  /**
+   * Our engine's outputs folder: the directory it saves as the session's `outputs` folder artifact
+   * when a turn completes in a sandbox, and the most bytes one save stores. Each left out is its
+   * default (`DEFAULT_OUTPUTS_CONFIG`: `/workspace/outputs`, 1 GiB).
+   */
+  readonly outputs?: Partial<OutputsConfig>;
+  readonly name?: string;
+  readonly version?: string;
+  /** What `hello` declares: `workspace` when this harness serves the Tenant's workspaces. */
+  readonly features?: { readonly workspace?: unknown };
+  /** Sees core's answer to `hello` (the Tenant, the sandbox backend preference). */
+  onHello?(answer: ResultOf<"hello">): void;
+  /** Sees every grant a run gets: when it is leased, and each renewal with a new run token. */
+  onGrant?(grant: RunGrant): void;
+  /**
+   * Sees each run's `turn.start` when it is leased: the Runtime limits in force
+   * (`start.limits`) among the rest.
+   */
+  onStart?(grant: RunGrant, start: TurnStart): void;
+}
+
+export interface Harness {
+  /** Says `hello` and starts leasing. Resolves once `hello` is answered. */
+  start(): Promise<void>;
+  /**
+   * Stops leasing, aborts the runs with `shutdown`, and waits for them to give their leases
+   * back, at most `waitMs` (default: as long as they take). A run that ignores its abort is
+   * left behind: its lease lapses.
+   */
+  stop(waitMs?: number): Promise<void>;
+  /** Runs held now. */
+  readonly runs: number;
+}
+
+/** The default of the harness's `artifactPageBytes` setting: one `read_artifact` page. */
+export const DEFAULT_ARTIFACT_PAGE_BYTES = 32 * 1024;
+
+interface Live extends HarnessRun {
+  grant: RunGrant;
+  readonly controller: AbortController;
+}
+
+export function createHarness(options: HarnessOptions): Harness {
+  const { channel, executors } = options;
+  const maxRuns = options.maxRuns ?? Infinity;
+  const cache = new TranscriptCache(
+    (options.transcriptCacheMb ?? DEFAULT_TRANSCRIPT_CACHE_MB) * 1024 * 1024,
+  );
+  const leaseRetryMs = options.leaseRetryMs ?? DEFAULT_LEASE_RETRY_MS;
+  const engine = {
+    artifactPageBytes: options.artifactPageBytes ?? DEFAULT_ARTIFACT_PAGE_BYTES,
+    sandboxTools: sandboxToolLimitsOf(options.sandboxTools),
+    skillReadBytes: options.skillReadBytes ?? DEFAULT_SKILL_READ_BYTES,
+    mcpTools: mcpToolConfigOf(options.mcpTools),
+    toolResults: toolResultConfigOf(options.toolResults),
+    outputs: outputsConfigOf(options.outputs),
+    loop: loopConfigOf({
+      ...(options.compaction ? { compaction: options.compaction } : {}),
+      ...(options.partialOutputChars === undefined
+        ? {}
+        : { partialOutputChars: options.partialOutputChars }),
+    }),
+    flowValueChars: options.flowValueChars ?? DEFAULT_FLOW_VALUE_CHARS,
+    resendDelaysMs: options.resendDelaysMs?.length
+      ? options.resendDelaysMs
+      : DEFAULT_RESEND_DELAYS_MS,
+  };
+  const live = new Map<string, Live>();
+  const finished = new Set<Promise<void>>();
+  const leasing = new AbortController();
+  // Core says how often to renew in its answer to `hello`; no run is leased before it.
+  let renewEveryMs: number | undefined;
+  let stopped = false;
+  let waiting = false;
+
+  const abort = (run: Live, kind: AbortReason, message?: string) => {
+    if (!run.controller.signal.aborted)
+      run.controller.abort(new RunAbort(kind, message ?? ABORT_MESSAGES[kind]));
+  };
+
+  channel.listen((method, params) => {
+    if (method !== "cancel") return;
+    const { runId, reason, message } = params as {
+      runId: string;
+      reason: AbortReason;
+      message?: string;
+    };
+    const run = live.get(runId);
+    if (run) abort(run, reason, message);
+  });
+
+  channel.onClose(() => {
+    for (const run of live.values()) abort(run, "shutdown", "The Harness API connection closed");
+  });
+
+  const renew = (run: Live) => {
+    const timer = setInterval(() => {
+      if (run.controller.signal.aborted) return clearInterval(timer);
+      channel.request("lease.renew", { runId: run.runId }).then(
+        (answer) => {
+          if (!answer.ok) abort(run, "ownership.lost");
+          else if (answer.token && answer.token !== run.grant.token) {
+            run.grant = {
+              ...run.grant,
+              token: answer.token,
+              tokenExpiresAt: answer.tokenExpiresAt,
+            };
+            options.onGrant?.(run.grant);
+          }
+        },
+        (error: unknown) => {
+          if (!run.controller.signal.aborted)
+            options.logger?.warn("harness lease renewal failed", {
+              runId: run.runId,
+              message: error instanceof Error ? error.message : String(error),
+            });
+        },
+      );
+    }, renewEveryMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  };
+
+  const begin = (grant: RunGrant, start: HarnessRun["start"]) => {
+    const controller = new AbortController();
+    const run: Live = {
+      runId: grant.runId,
+      grant,
+      start,
+      controller,
+      signal: controller.signal,
+    };
+    live.set(run.runId, run);
+    options.onGrant?.(grant);
+    options.onStart?.(grant, start);
+    const stopRenewing = renew(run);
+    const done = runTurn({ channel, executors, cache, engine }, run)
+      .catch((error: unknown) =>
+        options.logger?.warn("harness run failed", {
+          runId: run.runId,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      .finally(() => {
+        stopRenewing();
+        live.delete(run.runId);
+        finished.delete(done);
+        lease();
+      });
+    finished.add(done);
+  };
+
+  const lease = () => {
+    if (stopped || waiting || channel.closed || live.size >= maxRuns) return;
+    waiting = true;
+    channel.request("lease", {}, leasing.signal).then(
+      ({ run, input }) => {
+        waiting = false;
+        begin(run, input);
+        lease();
+      },
+      (error: unknown) => {
+        waiting = false;
+        if (stopped || channel.closed) return;
+        options.logger?.warn("harness lease failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+        setTimeout(lease, leaseRetryMs).unref?.();
+      },
+    );
+  };
+
+  return {
+    get runs() {
+      return live.size;
+    },
+    async start() {
+      const hello = await channel.request("hello", {
+        api: HARNESS_API_VERSION,
+        name: options.name ?? DEFAULT_HARNESS,
+        version: options.version ?? "0",
+        features:
+          options.features?.workspace === undefined
+            ? {}
+            : { workspace: options.features.workspace },
+      });
+      renewEveryMs = hello.renewEveryMs;
+      options.onHello?.(hello);
+      lease();
+    },
+    async stop(waitMs = Infinity) {
+      stopped = true;
+      leasing.abort(new RunAbort("shutdown", ABORT_MESSAGES.shutdown));
+      for (const run of live.values()) abort(run, "shutdown");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...finished]),
+        ...(Number.isFinite(waitMs)
+          ? [new Promise((resolve) => (timer = setTimeout(resolve, waitMs)))]
+          : []),
+      ]);
+      clearTimeout(timer);
+    },
+  };
+}
