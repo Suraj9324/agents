@@ -26,7 +26,7 @@
     "@nylorun/core": "file:../core"
   },
   "devDependencies": {
-    "@types/node": "^22.18.0",
+    "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "nylorun": "file:../cli/nylorun",
